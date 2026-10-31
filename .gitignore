@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venvs/
+data/processed/
+artifacts/
+experiments/*.sqlite
+experiments/*.sqlite-*
