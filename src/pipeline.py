@@ -26,7 +26,8 @@ from .model_factory import train_encoder_fold, train_qwen_lora_fold, train_svc
 from .registry import Registry
 
 MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert380": "configs/models/ultrabert380.yaml",
-    "qwen06": "configs/models/qwen06.yaml", "qwen17": "configs/models/qwen17.yaml", "qwen4": "configs/models/qwen4.yaml"}
+    "qwen06": "configs/models/qwen06.yaml", "qwen17": "configs/models/qwen17.yaml", "qwen4": "configs/models/qwen4.yaml",
+    "llama32_3b": "configs/models/llama32_3b.yaml"}
 DEFAULT_MVP_MODELS = ["svc", "ultrabert380", "qwen06"]
 
 
@@ -45,7 +46,7 @@ def _sha(value):
 
 def _ensemble_member_labels(members):
     display_names = {"svc": "SVC", "ultrabert380": "UltraBERT-380M", "qwen06": "Qwen3-0.6B",
-        "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B"}
+        "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B", "llama32_3b": "Llama-3.2-3B"}
     return [display_names.get(name.split("_", 1)[0], name.split("_", 1)[0]) for name in members]
 
 
@@ -116,7 +117,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             learning_rate=cfg.get("learning_rate", 2e-5), seed=seed,
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1))
         result["checkpoint"] = str(checkpoint)
-    elif model in {"qwen06", "qwen17", "qwen4"}:
+    elif model in {"qwen06", "qwen17", "qwen4", "llama32_3b"}:
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_qwen_lora_fold(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
             checkpoint=cfg["checkpoint"], revision=cfg["revision"], output_dir=checkpoint,
@@ -125,7 +126,10 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
             lora_rank=cfg.get("lora_rank", 16), lora_alpha=cfg.get("lora_alpha", 32),
             lora_target_modules=cfg.get("lora_target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]),
-            save_merged=final, validation_labels=None if final else valid.model.tolist())
+            learning_rate_decay=cfg.get("learning_rate_decay", 1.0),
+            save_merged=final, validation_labels=None if final else valid.model.tolist(),
+            gradient_checkpointing=cfg.get("gradient_checkpointing", False),
+            local_files_only=cfg.get("local_files_only", False))
         result["checkpoint"] = str(checkpoint)
     else: raise ValueError(f"unknown model: {model}")
     return result
@@ -192,6 +196,8 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"), "checkpoint_size_bytes": artifact_size,
         "calibration_method": "sigmoid train-only CV" if model == "svc" else "train-only scalar temperature",
         "calibration_temperature": result.get("calibration_temperature"),
+        "validation_metrics_by_epoch": result.get("validation_metrics_by_epoch", []),
+        "epoch_checkpoints": result.get("epoch_checkpoints", []),
         "feature_cache_key": result.get("cache_key"), "checkpoint_path": str(checkpoint),
         "prediction_path": str(prediction_path), "prediction_sha256": hashlib.sha256(prediction_path.read_bytes()).hexdigest(),
         "metrics": metrics, "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat()}
@@ -263,6 +269,7 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
         "code_revision":code_revision,"model_revision":cfg["revision"],"checkpoint_id":cfg["checkpoint"],"seed":seed,
         "fit_seconds":result["fit_seconds"],"inference_seconds":result["inference_seconds"],
         "calibration_temperature":result["calibration_temperature"],"validation_metrics_by_epoch":result["validation_metrics_by_epoch"],
+        "epoch_checkpoints":result.get("epoch_checkpoints",[]),
         "checkpoint_path":str(checkpoint),"prediction_path":str(prediction_path),"metrics":metrics,
         "created_at_utc":pd.Timestamp.now(tz="UTC").isoformat()}
     manifest_path=pred_dir/f"{experiment_id}_manifest.json";manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")

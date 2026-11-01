@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -134,11 +135,13 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          max_length=384, learning_rate=1e-4, seed=2026, gradient_accumulation_steps=1,
                          lora_rank=16, lora_alpha=32,
                          lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"), save_merged=False,
-                         resume_checkpoint=None, validation_labels=None):
+                         resume_checkpoint=None, validation_labels=None, gradient_checkpointing=False,
+                         local_files_only=False, learning_rate_decay=1.0):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
     torch, tr = _require_neural()
     try:
         from peft import LoraConfig, TaskType, PeftModel, get_peft_model
+        from transformers import TrainerCallback
     except ImportError as exc:
         raise RuntimeError("Qwen LoRA training needs the project's optional neural dependencies") from exc
     from torch import nn
@@ -147,11 +150,12 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     start = time.perf_counter(); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
-    tokenizer = tr.AutoTokenizer.from_pretrained(checkpoint, revision=revision)
+    tokenizer = tr.AutoTokenizer.from_pretrained(checkpoint, revision=revision, local_files_only=local_files_only)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
     model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16 if torch.cuda.is_available() else torch.float32
-    backbone = tr.AutoModel.from_pretrained(checkpoint, revision=revision, torch_dtype=model_dtype)
+    backbone = tr.AutoModel.from_pretrained(checkpoint, revision=revision, torch_dtype=model_dtype,
+                                             local_files_only=local_files_only)
     if resume_checkpoint:
         backbone = PeftModel.from_pretrained(backbone, resume_checkpoint, is_trainable=True, local_files_only=True)
     else:
@@ -159,6 +163,10 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                           lora_dropout=.05, target_modules=list(lora_target_modules))
         backbone = get_peft_model(backbone, lora)
     backbone.config.use_cache = False
+    if gradient_checkpointing:
+        backbone.gradient_checkpointing_enable()
+        if hasattr(backbone, "enable_input_require_grads"):
+            backbone.enable_input_require_grads()
     label_map = {label: i for i, label in enumerate(classes)}
     class Head(nn.Module):
         def __init__(self):
@@ -192,21 +200,58 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         predicted = np.asarray(logits).argmax(axis=1)
         return {"accuracy": float(accuracy_score(labels, predicted)),
                 "balanced_accuracy": float(balanced_accuracy_score(labels, predicted))}
+    out=Path(output_dir)
+    class EpochSnapshotCallback(TrainerCallback):
+        def __init__(self): self.checkpoints=[]
+        def on_evaluate(self,args,state,control,metrics=None,**kwargs):
+            epoch=int(round(state.epoch or len(self.checkpoints)+1))
+            epoch_dir=out/f"epoch-{epoch:02d}"
+            epoch_dir.mkdir(parents=True,exist_ok=True)
+            model.backbone.save_pretrained(epoch_dir,safe_serialization=True)
+            tokenizer.save_pretrained(epoch_dir)
+            torch.save({k:v.detach().cpu() for k,v in model.classifier.state_dict().items()},epoch_dir/"classifier.pt")
+            (epoch_dir/"validation_metrics.json").write_text(json.dumps(metrics or {},indent=2)+"\n")
+            self.checkpoints.append(str(epoch_dir))
+            return control
+    snapshot_callback=EpochSnapshotCallback()
     eval_each_epoch = validation_labels is not None
+    if not 0 < float(learning_rate_decay) <= 1:
+        raise ValueError("learning_rate_decay must be in (0, 1]")
     args=tr.TrainingArguments(output_dir=str(output_dir),num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,learning_rate=learning_rate,
         seed=seed,data_seed=seed,save_strategy="no",eval_strategy="epoch" if eval_each_epoch else "no",report_to=[],
+        logging_strategy="epoch",
         fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         remove_unused_columns=False,dataloader_num_workers=0)
-    trainer=tr.Trainer(model=model,args=args,train_dataset=Rows(train_text,y_train),
+    train_dataset=Rows(train_text,y_train)
+    steps_per_epoch=max(1,math.ceil(len(train_dataset)/(batch_size*gradient_accumulation_steps)))
+    class EpochDecayTrainer(tr.Trainer):
+        def create_scheduler(self,num_training_steps,optimizer=None):
+            if self.lr_scheduler is None:
+                optimizer=optimizer or self.optimizer
+                decay=float(learning_rate_decay)
+                self.lr_scheduler=torch.optim.lr_scheduler.LambdaLR(
+                    optimizer,lr_lambda=lambda step: decay ** min(epochs, step // steps_per_epoch))
+            return self.lr_scheduler
+    trainer=EpochDecayTrainer(model=model,args=args,train_dataset=train_dataset,
         eval_dataset=Rows(validation_text,validation_labels) if eval_each_epoch else None,
-        compute_metrics=compute_metrics if eval_each_epoch else None)
+        compute_metrics=compute_metrics if eval_each_epoch else None,
+        callbacks=[snapshot_callback] if eval_each_epoch else None)
     trainer.train()
-    out=Path(output_dir);out.mkdir(parents=True,exist_ok=True)
+    out.mkdir(parents=True,exist_ok=True)
     (out/"training_log.json").write_text(json.dumps(trainer.state.log_history, indent=2)+"\n")
-    validation_metrics_by_epoch = [entry for entry in trainer.state.log_history if "eval_balanced_accuracy" in entry]
+    eval_history = [entry for entry in trainer.state.log_history if "eval_balanced_accuracy" in entry]
+    train_history = {int(round(float(entry["epoch"]))): entry for entry in trainer.state.log_history
+                     if "loss" in entry and "epoch" in entry}
+    validation_metrics_by_epoch = []
+    for epoch, entry in enumerate(eval_history, start=1):
+        epoch_number=int(round(float(entry.get("epoch", epoch))))
+        train_entry=train_history.get(epoch_number,{})
+        validation_metrics_by_epoch.append({**entry,
+            "train_loss": train_entry.get("loss"),
+            "learning_rate_used": float(learning_rate) * float(learning_rate_decay) ** (epoch_number-1)})
     train_logits=np.asarray(trainer.predict(Rows(train_text,y_train)).predictions)
     temperature=_fit_temperature(train_logits,list(y_train),classes)
     pred_start=time.perf_counter(); logits=np.asarray(trainer.predict(Rows(validation_text)).predictions)
@@ -225,4 +270,5 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "classes":list(classes),"trainable_parameters":trainable,"calibration_temperature":temperature,
         "calibration_method":"train-only scalar temperature",
         "validation_metrics_by_epoch":validation_metrics_by_epoch,
+        "epoch_checkpoints":snapshot_callback.checkpoints,
         "peak_gpu_memory_bytes":int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None}
