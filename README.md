@@ -17,37 +17,26 @@ Before neural training, set an immutable Hugging Face checkpoint revision in the
 
 ## V0 workflow
 
-Prepare the canonical dataset, a frozen prompt-grouped 20% holdout, five development folds, and the data profile:
+Run the complete clean restart from raw CSVs. It removes generated processed data, model artifacts, and the experiment registry, then rebuilds the frozen prompt-grouped 80/20 split, features, all configured models, and equal/weighted ensemble comparisons. It preserves `data/raw/` and the Hugging Face model cache.
+
+```bash
+python -m src.pipeline restart
+```
+
+The default run trains `svc`, `ultrabert380`, and `qwen06` on the same 80% train rows and evaluates each on the same 20% validation rows. To run a subset, pass `--models svc ultrabert380`; to change the split seed, pass `--seed 2027`. The registry is recreated, so sequence numbers start at 0001.
+
+For individual factory runs:
 
 ```bash
 python -m src.pipeline data prepare --config configs/data/official_v0.yaml
-```
-
-Build and cache fold-fitted features, then train each model on the same folds:
-
-```bash
 python -m src.pipeline features build --dataset v0
 python -m src.pipeline models train --model svc --dataset v0
 python -m src.pipeline models train --model ultrabert380 --dataset v0
 python -m src.pipeline models train --model qwen06 --dataset v0
-```
-
-Feature ablations use `--features-config configs/features/formatting.yaml` or `configs/features/stylometry.yaml`; every recipe receives a separate experiment ID. The SVC defaults to character 3–5 gram and word 1–2 gram TF-IDF. All vectorizers and scalers are fit inside each training fold.
-
-Evaluate aligned model outputs and ensembles on development OOF predictions:
-
-```bash
 python -m src.pipeline ensemble evaluate --dataset v0
 ```
 
-After selecting a frozen recipe, run the untouched holdout once, then fit the selected model on all labelled rows for inference:
-
-```bash
-python -m src.pipeline models evaluate-holdout --model svc --dataset v0
-python -m src.pipeline models fit-final --model svc --dataset v0
-```
-
-The holdout command writes a dataset-wide guard and refuses subsequent holdout evaluation runs. Do not use holdout results to tune models.
+The split is grouped on `prompt_id` and selected from deterministic candidates to stay near 20% of rows and the full dataset class proportions. All fitted features, classifiers, calibrators, and ensemble weights use train rows only. The ensemble report compares equal weights with train-fitted, equal-share-regularized weights on the validation rows; those weights are frozen before validation scoring. Treat model selection on the validation results as exploratory, not as an independent final estimate.
 
 Export generic offline predictions using the observed `test.csv` schema (`id,text`) and `id,model` output:
 
@@ -69,4 +58,4 @@ Attach `model_package.zip` and the competition input data as Kaggle input datase
 
 Run tests with `python -m unittest discover -s tests -v`. Neural adapter tests create tiny local models and skip when the optional neural dependencies are absent. Run the dashboard with `streamlit run dashboard/app.py`.
 
-Raw competition inputs are in `data/raw/`. Processed Parquet data, feature caches, model checkpoints, predictions, manifests, and the SQLite registry are generated under `data/processed/`, `artifacts/`, and `experiments/`; generated outputs are ignored by Git. Each experiment manifest records input and split hashes, model revision, configuration, code revision, fold IDs, calibrated probabilities, raw scores, runtime, and artifact sizes.
+Raw competition inputs are in `data/raw/`. Processed Parquet data, feature caches, model checkpoints, predictions, manifests, and the SQLite registry are generated under `data/processed/`, `artifacts/`, and `experiments/`; generated outputs are ignored by Git. Each experiment manifest records input and split hashes, model revision, configuration, code revision, train/validation row counts, calibrated probabilities, raw scores, runtime, and artifact sizes.

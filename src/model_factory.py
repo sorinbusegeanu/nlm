@@ -133,11 +133,12 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          revision, output_dir="artifacts/checkpoints/qwen", epochs=3, batch_size=4,
                          max_length=384, learning_rate=1e-4, seed=2026, gradient_accumulation_steps=1,
                          lora_rank=16, lora_alpha=32,
-                         lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"), save_merged=False):
+                         lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"), save_merged=False,
+                         resume_checkpoint=None, validation_labels=None):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
     torch, tr = _require_neural()
     try:
-        from peft import LoraConfig, TaskType, get_peft_model
+        from peft import LoraConfig, TaskType, PeftModel, get_peft_model
     except ImportError as exc:
         raise RuntimeError("Qwen LoRA training needs the project's optional neural dependencies") from exc
     from torch import nn
@@ -151,9 +152,12 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
     model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16 if torch.cuda.is_available() else torch.float32
     backbone = tr.AutoModel.from_pretrained(checkpoint, revision=revision, torch_dtype=model_dtype)
-    lora = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION, r=lora_rank, lora_alpha=lora_alpha,
-                      lora_dropout=.05, target_modules=list(lora_target_modules))
-    backbone = get_peft_model(backbone, lora)
+    if resume_checkpoint:
+        backbone = PeftModel.from_pretrained(backbone, resume_checkpoint, is_trainable=True, local_files_only=True)
+    else:
+        lora = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION, r=lora_rank, lora_alpha=lora_alpha,
+                          lora_dropout=.05, target_modules=list(lora_target_modules))
+        backbone = get_peft_model(backbone, lora)
     backbone.config.use_cache = False
     label_map = {label: i for i, label in enumerate(classes)}
     class Head(nn.Module):
@@ -177,17 +181,32 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             if self.ys is not None: item["labels"]=torch.tensor(label_map[self.ys[i]],dtype=torch.long)
             return item
     model=Head()
+    if resume_checkpoint:
+        classifier_path = Path(resume_checkpoint)/"classifier.pt"
+        if not classifier_path.is_file(): raise FileNotFoundError(f"continuation checkpoint has no classifier head: {classifier_path}")
+        model.classifier.load_state_dict(torch.load(classifier_path, map_location="cpu", weights_only=True))
+    def compute_metrics(eval_prediction):
+        from sklearn.metrics import accuracy_score, balanced_accuracy_score
+        logits = eval_prediction.predictions[0] if isinstance(eval_prediction.predictions, tuple) else eval_prediction.predictions
+        labels = np.asarray(eval_prediction.label_ids)
+        predicted = np.asarray(logits).argmax(axis=1)
+        return {"accuracy": float(accuracy_score(labels, predicted)),
+                "balanced_accuracy": float(balanced_accuracy_score(labels, predicted))}
+    eval_each_epoch = validation_labels is not None
     args=tr.TrainingArguments(output_dir=str(output_dir),num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,learning_rate=learning_rate,
-        seed=seed,data_seed=seed,save_strategy="no",eval_strategy="no",report_to=[],
+        seed=seed,data_seed=seed,save_strategy="no",eval_strategy="epoch" if eval_each_epoch else "no",report_to=[],
         fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         remove_unused_columns=False,dataloader_num_workers=0)
-    trainer=tr.Trainer(model=model,args=args,train_dataset=Rows(train_text,y_train))
+    trainer=tr.Trainer(model=model,args=args,train_dataset=Rows(train_text,y_train),
+        eval_dataset=Rows(validation_text,validation_labels) if eval_each_epoch else None,
+        compute_metrics=compute_metrics if eval_each_epoch else None)
     trainer.train()
     out=Path(output_dir);out.mkdir(parents=True,exist_ok=True)
     (out/"training_log.json").write_text(json.dumps(trainer.state.log_history, indent=2)+"\n")
+    validation_metrics_by_epoch = [entry for entry in trainer.state.log_history if "eval_balanced_accuracy" in entry]
     train_logits=np.asarray(trainer.predict(Rows(train_text,y_train)).predictions)
     temperature=_fit_temperature(train_logits,list(y_train),classes)
     pred_start=time.perf_counter(); logits=np.asarray(trainer.predict(Rows(validation_text)).predictions)
@@ -205,4 +224,5 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "fit_seconds":time.perf_counter()-start,"inference_seconds":inference_seconds,
         "classes":list(classes),"trainable_parameters":trainable,"calibration_temperature":temperature,
         "calibration_method":"train-only scalar temperature",
+        "validation_metrics_by_epoch":validation_metrics_by_epoch,
         "peak_gpu_memory_bytes":int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None}
