@@ -23,8 +23,10 @@ def evaluate(y_true, scores, classes, probabilities=None):
     }
     if probabilities is not None:
         probabilities = np.asarray(probabilities)
-        if probabilities.shape != scores.shape or not np.isfinite(probabilities).all():
+        if probabilities.shape != scores.shape or not np.isfinite(probabilities).all() or np.any(probabilities < 0):
             raise ValueError("invalid probability matrix")
+        if not np.allclose(probabilities.sum(axis=1), 1, atol=1e-5):
+            raise ValueError("probability rows must sum to one")
         result["log_loss"] = float(log_loss(y_true, probabilities, labels=classes))
         result["multiclass_brier"] = float(np.mean(np.sum((probabilities - np.eye(len(classes))[[classes.index(y) for y in y_true]]) ** 2, axis=1)))
     return result
@@ -71,11 +73,36 @@ def complementarity(y_true, predictions):
         ca = pred[a] == y
         for b in names[i + 1:]:
             cb = pred[b] == y
+            ea, eb = (~ca).astype(float), (~cb).astype(float)
+            error_corr = float(np.corrcoef(ea, eb)[0, 1]) if ea.std() and eb.std() else None
             result[f"{a}__{b}"] = {
                 "disagreement": float(np.mean(pred[a] != pred[b])),
+                "error_correlation": error_corr,
                 "error_overlap": int(np.sum(~ca & ~cb)),
                 "a_unique_correct": int(np.sum(ca & ~cb)),
                 "b_unique_correct": int(np.sum(cb & ~ca)),
                 "oracle_accuracy": float(np.mean(ca | cb)),
             }
     return result
+
+
+def paired_group_bootstrap(y_true, pred_a, pred_b, groups, *, n_bootstrap=2000, seed=2026, confidence=.95):
+    """Paired percentile interval for balanced-accuracy delta, resampling groups."""
+    y, a, b, g = map(np.asarray, (y_true, pred_a, pred_b, groups))
+    if not (len(y) == len(a) == len(b) == len(g)):
+        raise ValueError("truth, predictions, and groups must have equal lengths")
+    unique = np.unique(g)
+    if len(unique) < 2 or n_bootstrap < 1 or not 0 < confidence < 1:
+        raise ValueError("bootstrap requires >=2 groups, positive replicates, and confidence in (0,1)")
+    rng = np.random.default_rng(seed)
+    by_group = {k: np.flatnonzero(g == k) for k in unique}
+    deltas = np.empty(n_bootstrap, dtype=float)
+    for i in range(n_bootstrap):
+        sampled = rng.choice(unique, size=len(unique), replace=True)
+        idx = np.concatenate([by_group[k] for k in sampled])
+        deltas[i] = balanced_accuracy_score(y[idx], b[idx]) - balanced_accuracy_score(y[idx], a[idx])
+    alpha = (1 - confidence) / 2
+    return {"delta_balanced_accuracy": float(balanced_accuracy_score(y, b) - balanced_accuracy_score(y, a)),
+            "confidence": confidence, "lower": float(np.quantile(deltas, alpha)),
+            "upper": float(np.quantile(deltas, 1 - alpha)), "bootstrap_replicates": n_bootstrap,
+            "resampling_unit": "prompt_id"}

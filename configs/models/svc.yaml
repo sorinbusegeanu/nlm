@@ -1,0 +1,7 @@
+model: svc
+C: 0.5
+class_weight: balanced
+calibration: sigmoid
+calibration_cv: 3
+features:
+  views: [char, word]

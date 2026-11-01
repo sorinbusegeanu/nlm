@@ -4,3 +4,4 @@ output_dir: data/processed
 seed: 2026
 holdout_fraction: 0.2
 n_splits: 5
+expected_classes: 18
