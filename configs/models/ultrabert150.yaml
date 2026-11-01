@@ -1,0 +1,9 @@
+model: ultrabert150
+# Set checkpoint and immutable Hugging Face commit revision after confirming availability.
+checkpoint: null
+revision: null
+epochs: 3
+batch_size: 16
+gradient_accumulation_steps: 1
+learning_rate: 0.00002
+max_length: 384

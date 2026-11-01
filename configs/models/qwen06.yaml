@@ -1,0 +1,11 @@
+model: qwen06
+checkpoint: Qwen/Qwen3-0.6B-Base
+# Supply an immutable Hugging Face commit revision before training.
+revision: null
+epochs: 3
+batch_size: 4
+gradient_accumulation_steps: 1
+learning_rate: 0.0001
+max_length: 384
+lora_rank: 16
+lora_alpha: 32

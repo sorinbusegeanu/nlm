@@ -1,0 +1,2 @@
+version: features-v1
+views: [char, word, punctuation, shape]

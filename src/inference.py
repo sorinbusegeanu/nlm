@@ -1,0 +1,99 @@
+"""Network-free prediction and submission export helpers."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+
+from .data_factory import REQUIRED_TEST
+
+
+def predict_svc_bundle(bundle, texts):
+    features, model, classes = bundle["features"], bundle["model"], list(bundle["classes"])
+    matrix = features.transform([str(t) for t in texts])
+    predicted = model.predict_proba(matrix)
+    aligned = np.zeros((len(texts), len(classes)), dtype=float)
+    indexes = {label: i for i, label in enumerate(classes)}
+    for col, label in enumerate(model.classes_): aligned[:, indexes[label]] = predicted[:, col]
+    if not np.isfinite(aligned).all() or not np.allclose(aligned.sum(1), 1, atol=1e-5):
+        raise ValueError("model returned invalid probabilities")
+    return aligned, classes
+
+
+def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max_length=384, temperature=1.0):
+    try:
+        import torch
+        from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError("Offline neural inference requires the project's [neural] dependencies") from exc
+    checkpoint = Path(checkpoint)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True)
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    if model_name == "ultrabert150":
+        network = AutoModelForSequenceClassification.from_pretrained(checkpoint, local_files_only=True)
+    elif model_name == "qwen06":
+        network = AutoModel.from_pretrained(checkpoint / "merged_backbone", local_files_only=True)
+        classifier = torch.nn.Linear(network.config.hidden_size, len(classes))
+        state = torch.load(checkpoint / "classifier.pt", map_location="cpu", weights_only=True)
+        classifier.load_state_dict(state)
+        class Readout(torch.nn.Module):
+            def __init__(self): super().__init__(); self.backbone=network; self.classifier=classifier
+            def forward(self, input_ids, attention_mask):
+                hidden=self.backbone(input_ids=input_ids,attention_mask=attention_mask).last_hidden_state
+                mask=attention_mask.unsqueeze(-1).to(hidden.dtype)
+                pooled=(hidden*mask).sum(1)/mask.sum(1).clamp_min(1)
+                return self.classifier(pooled.float())
+        network = Readout()
+    else: raise ValueError(f"unsupported neural model: {model_name}")
+    network.to(device).eval(); batches=[]
+    with torch.inference_mode():
+        for start in range(0, len(texts), batch_size):
+            enc=tokenizer(list(texts[start:start+batch_size]),truncation=True,max_length=max_length,padding=True,return_tensors="pt")
+            if model_name == "qwen06": enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
+            enc={k:v.to(device) for k,v in enc.items()}; logits=network(**enc)
+            if hasattr(logits,"logits"): logits=logits.logits
+            batches.append(torch.softmax(logits.float()/float(temperature),dim=-1).cpu().numpy())
+    matrix=np.concatenate(batches,axis=0) if batches else np.empty((0,len(classes)))
+    if matrix.shape != (len(texts),len(classes)) or not np.isfinite(matrix).all(): raise ValueError("neural model returned invalid probabilities")
+    return matrix, list(classes)
+
+
+def export_submission(model, checkpoint, test_path, output_path):
+    """Write generic offline id,model predictions for observed test.csv schema."""
+    checkpoint, test_path, output_path = Path(checkpoint), Path(test_path), Path(output_path)
+    manifest = {}
+    if checkpoint.suffix.lower() == ".json":
+        manifest = json.loads(checkpoint.read_text())
+        checkpoint = Path(manifest["checkpoint"])
+    frame = pd.read_csv(test_path, dtype={"id": "string"})
+    missing = REQUIRED_TEST - set(frame.columns)
+    if missing: raise ValueError(f"test input is missing columns: {sorted(missing)}")
+    if frame.id.isna().any() or frame.id.duplicated().any(): raise ValueError("test IDs must be present and unique")
+    if frame.text.isna().any() or frame.text.astype(str).str.strip().eq("").any(): raise ValueError("test passages must be nonempty")
+    if model == "svc":
+        bundle=joblib.load(checkpoint); probabilities, classes=predict_svc_bundle(bundle,frame.text.tolist())
+    else:
+        classes=manifest.get("classes")
+        if not classes: raise ValueError("neural final manifest must include canonical classes")
+        probabilities, classes=_predict_neural(model,checkpoint,frame.text.tolist(),classes,
+            max_length=manifest.get("config",{}).get("max_length",384),temperature=manifest.get("calibration_temperature",1.0))
+    output = pd.DataFrame({"id": frame.id, "model": np.asarray(classes)[probabilities.argmax(1)]})
+    if output.id.astype(str).tolist() != frame.id.astype(str).tolist(): raise RuntimeError("output row order does not match input")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.suffix.lower() == ".parquet": output.to_parquet(output_path, index=False)
+    elif output_path.suffix.lower() == ".csv": output.to_csv(output_path, index=False)
+    else: raise ValueError("output must use .parquet or .csv")
+    report = {"model": model, "checkpoint": str(checkpoint), "test_path": str(test_path), "output_path": str(output_path),
+        "rows": len(output), "classes": list(classes), "schema": ["id", "model"],
+        "offline_local_files_only": True, "network_required": False,
+        "note": "Generic offline export. Validate against competition rules before submission."}
+    output_path.with_suffix(output_path.suffix + ".json").write_text(json.dumps(report, indent=2)+"\n")
+    return report
+
+
+def export_svc_submission(checkpoint, test_path, output_path):
+    return export_submission("svc", checkpoint, test_path, output_path)
