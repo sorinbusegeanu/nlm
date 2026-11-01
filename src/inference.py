@@ -36,18 +36,20 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
         raise RuntimeError("Offline neural inference requires the project's [neural] dependencies") from exc
     checkpoint = Path(checkpoint)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float16 if device.type == "cuda" else torch.float32
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True, trust_remote_code=True)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     if model_name == "ultrabert380":
         network = AutoModelForSequenceClassification.from_pretrained(checkpoint, local_files_only=True, trust_remote_code=True)
-    elif model_name in {"qwen06", "qwen17", "qwen4"}:
+    elif model_name in {"qwen06", "qwen17", "qwen4", "llama32_3b"}:
         backbone_path = checkpoint / "merged_backbone"
         if backbone_path.exists():
-            network = AutoModel.from_pretrained(backbone_path, local_files_only=True)
+            network = AutoModel.from_pretrained(backbone_path, local_files_only=True, torch_dtype=model_dtype)
         else:
             if not base_checkpoint:
                 raise ValueError("Qwen adapter inference requires the configured base checkpoint")
-            network = AutoModel.from_pretrained(base_checkpoint, revision=revision, local_files_only=True)
+            network = AutoModel.from_pretrained(base_checkpoint, revision=revision, local_files_only=True,
+                                                torch_dtype=model_dtype)
             network = PeftModel.from_pretrained(network, checkpoint, local_files_only=True)
         classifier = torch.nn.Linear(network.config.hidden_size, len(classes))
         state = torch.load(checkpoint / "classifier.pt", map_location="cpu", weights_only=True)
@@ -65,7 +67,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     with torch.inference_mode():
         for start in range(0, len(texts), batch_size):
             enc=tokenizer(list(texts[start:start+batch_size]),truncation=True,max_length=max_length,padding=True,return_tensors="pt")
-            if model_name in {"qwen06", "qwen17", "qwen4"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
+            if model_name in {"qwen06", "qwen17", "qwen4", "llama32_3b"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
             enc={k:v.to(device) for k,v in enc.items()}; logits=network(**enc)
             if hasattr(logits,"logits"): logits=logits.logits
             batches.append(torch.softmax(logits.float()/float(temperature),dim=-1).cpu().numpy())

@@ -1,0 +1,13 @@
+model: qwen17
+checkpoint: Qwen/Qwen3-1.7B-Base
+revision: ea980cb0a6c2ae4b936e82123acc929f1cec04c1
+epochs: 10
+batch_size: 2
+gradient_accumulation_steps: 4
+learning_rate: 0.0001
+max_length: 384
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+gradient_checkpointing: false
+local_files_only: true

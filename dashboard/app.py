@@ -33,7 +33,7 @@ def blend_label(name):
     train_weighted = name.startswith("train_weighted:")
     if train_weighted: name = name.removeprefix("train_weighted:")
     labels = {"svc": "SVC", "ultrabert380": "UltraBERT-380M", "qwen06": "Qwen3-0.6B",
-              "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B"}
+              "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B", "llama32_3b": "Llama-3.2-3B"}
     members = [labels.get(part.split("_", 1)[0], part.split("_", 1)[0]) for part in name.split("+")]
     kind = "Train-fitted weighted blend" if train_weighted else "Equal-weight blend"
     return f"{kind}: {' + '.join(members)}"
@@ -136,6 +136,17 @@ with tabs[3]:
             if manifest: manifests.append({"Experiment": f"{int(row['sequence_number']):04d}", "Description": row.get("description", ""), "Fit seconds": manifest.get("fit_seconds"),
                 "Inference seconds": manifest.get("inference_seconds"), "Checkpoint": manifest.get("checkpoint_path")})
         if manifests: st.json(manifests)
+        epoch_runs = [row for row in records if manifest_for(row).get("validation_metrics_by_epoch")]
+        if epoch_runs:
+            chosen_run = st.selectbox("Validation accuracy by epoch", epoch_runs,
+                format_func=lambda row: f"{int(row['sequence_number']):04d} · {row['model']}", key="epoch_validation_run")
+            history = manifest_for(chosen_run).get("validation_metrics_by_epoch", [])
+            history_frame = pd.DataFrame([{"Epoch": item.get("epoch"),
+                "Accuracy": item.get("eval_accuracy"), "Balanced accuracy": item.get("eval_balanced_accuracy"),
+                "Validation loss": item.get("eval_loss")} for item in history])
+            if not history_frame.empty:
+                st.dataframe(history_frame, use_container_width=True, hide_index=True)
+                st.plotly_chart(px.line(history_frame, x="Epoch", y="Balanced accuracy", markers=True), use_container_width=True)
 
 with tabs[4]:
     if not profile_path.exists(): st.info("Run dataset preparation to create the V0 profile.")

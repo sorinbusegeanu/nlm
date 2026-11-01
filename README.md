@@ -33,10 +33,17 @@ python -m src.pipeline features build --dataset v0
 python -m src.pipeline models train --model svc --dataset v0
 python -m src.pipeline models train --model ultrabert380 --dataset v0
 python -m src.pipeline models train --model qwen06 --dataset v0
+python -m src.pipeline models train --model qwen17 --dataset v0
+python -m src.pipeline models train --model qwen4 --dataset v0
+python -m src.pipeline models train --model llama32_3b --dataset v0
 python -m src.pipeline ensemble evaluate --dataset v0
 ```
 
 The split is grouped on `prompt_id` and selected from deterministic candidates to stay near 20% of rows and the full dataset class proportions. All fitted features, classifiers, calibrators, and ensemble weights use train rows only. The ensemble report compares equal weights with train-fitted, equal-share-regularized weights on the validation rows; those weights are frozen before validation scoring. Treat model selection on the validation results as exploratory, not as an independent final estimate.
+
+`qwen17` and `qwen4` use pinned Base checkpoints, run for 10 epochs, and record validation accuracy after each epoch. Their weights download into the Hugging Face cache via `python scripts/download_qwen_candidates.py`. The default clean restart continues to run only the three MVP baselines; add candidate IDs explicitly with `--models` when intentionally running those longer experiments.
+
+`llama32_3b` uses Meta's gated `meta-llama/Llama-3.2-3B` Base checkpoint with the same LoRA classifier path. Accept the model terms and authenticate with `hf auth login`, then download the pinned revision with `python scripts/download_llama32_3b.py` before training; its training config uses `local_files_only: true`.
 
 Export generic offline predictions using the observed `test.csv` schema (`id,text`) and `id,model` output:
 
