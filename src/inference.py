@@ -34,10 +34,10 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
         raise RuntimeError("Offline neural inference requires the project's [neural] dependencies") from exc
     checkpoint = Path(checkpoint)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True, trust_remote_code=True)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    if model_name == "ultrabert150":
-        network = AutoModelForSequenceClassification.from_pretrained(checkpoint, local_files_only=True)
+    if model_name == "ultrabert380":
+        network = AutoModelForSequenceClassification.from_pretrained(checkpoint, local_files_only=True, trust_remote_code=True)
     elif model_name == "qwen06":
         network = AutoModel.from_pretrained(checkpoint / "merged_backbone", local_files_only=True)
         classifier = torch.nn.Linear(network.config.hidden_size, len(classes))

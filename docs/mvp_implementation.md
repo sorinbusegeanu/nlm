@@ -25,7 +25,7 @@ CLI contract:
 python -m src.pipeline data prepare --config configs/data/official_v0.yaml
 python -m src.pipeline features build --dataset v0
 python -m src.pipeline models train --model svc --dataset v0
-python -m src.pipeline models train --model ultrabert150 --dataset v0
+python -m src.pipeline models train --model ultrabert380 --dataset v0
 python -m src.pipeline models train --model qwen06 --dataset v0
 python -m src.pipeline ensemble evaluate --dataset v0
 streamlit run dashboard/app.py
@@ -71,13 +71,13 @@ These are **target commands to implement**, not existing executable commands.
 
 **Deliverables:** Feature caches, evaluator module, SQLite schema and regression tests.
 
-## 3. Milestone M3 — UltraBERT-150M trainer (1–2 days)
+## 3. Milestone M3 — UltraBERT-380M trainer (1–2 days)
 
 ### Build
 
-- Resolve exact supported pretrained checkpoint and Transformers integration; pin the revision.
-- Implement tokenizer, 18-class head, deterministic seed and data collator.
-- Start at max 384 tokens, 3 epochs, learning rate 2e-5, batch 16, mixed precision where supported. Add gradient accumulation when required.
+- Use `dmis-lab/UltraBERT-380M`; pin its full Hugging Face commit revision and load its custom architecture with the supported Transformers integration.
+- Implement tokenizer, 18-class head, deterministic seed and data collator; pass `trust_remote_code=True` only with the pinned revision.
+- Start at max 384 tokens, 3 epochs, learning rate 8e-6, batch 8 with gradient accumulation 2, mixed precision where supported. Adjust for available VRAM based on a one-fold smoke run.
 - Train one fold as a smoke test; then all five grouped development folds.
 - Write checkpoints, OOF logits/probabilities, training curves, peak VRAM and latency.
 
@@ -90,13 +90,13 @@ These are **target commands to implement**, not existing executable commands.
 
 **Deliverables:** Encoder training adapter, 5-fold OOF probabilities and checkpoint manifests.
 
-## 4. Milestone M4 — Qwen3-0.6B LoRA trainer (1–2 days)
+## 4. Milestone M4 — Configurable causal-LM LoRA trainer (1–2 days)
 
 ### Build
 
-- Pin `Qwen3-0.6B-Base` checkpoint/revision and tokenizer.
+- Default to [`Qwen/Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B), pin its immutable revision, and keep the checkpoint ID in `configs/models/qwen06.yaml` so another compatible causal LM can be selected without changing the pipeline.
 - Implement causal-backbone 18-class readout with a **specified, saved pooling definition** (for example, masked mean of selected hidden layers) and consistent end-token handling.
-- Add LoRA with starting rank 16, alpha 32, learning rate 1e-4 and 3 epochs; start with max 384 tokens and batch 4–8, adjusting for 16 GB VRAM.
+- Add LoRA with starting rank 16, alpha 32, learning rate 1e-4 and 3 epochs; configure target module names per selected architecture. Start with max 384 tokens and batch 4–8, adjusting for 16 GB VRAM.
 - Train one fold and inspect learning curves; execute five folds once stable.
 - Log trainable parameter count, memory, checkpoint size and inference throughput.
 
@@ -178,12 +178,12 @@ Run the smallest useful set of comparisons on fixed **dataset V0**:
 |---|---|---|---|
 | E01 | Statistical baseline | Char + word SVC | Grouped OOF balanced accuracy |
 | E02 | Do formatting cues help? | Add punctuation/shape view | Δ balanced accuracy vs E01 |
-| E03 | Does a small encoder help? | UltraBERT-150M | Standalone score and unique corrections |
+| E03 | Does the encoder help? | UltraBERT-380M | Standalone score and unique corrections |
 | E04 | Does small causal LM help? | Qwen3-0.6B LoRA | Standalone score and unique corrections |
 | E05 | Does ensemble diversity help? | Each pair and all three | Δ ensemble balanced accuracy |
 | E06 | Do learned weights help? | Cross-fitted regularized blend | Δ vs equal-weight blend |
 
-Optional after MVP: UltraBERT-380M, Qwen3-1.7B, additional stylometry and a comparison with published public checkpoints. A new model should enter the ensemble only after evaluating its marginal contribution.
+Optional after MVP: Qwen3-1.7B, additional stylometry and a comparison with published public checkpoints. A new model should enter the ensemble only after evaluating its marginal contribution.
 
 ## 9. Data-version experiments after V0
 
@@ -202,7 +202,7 @@ Do not automatically reject good-quality data solely because a cheap proxy class
 
 - All four factories operate end-to-end from official CSV to aligned OOF predictions.
 - Fixed prompt-grouped folds and leakage checks pass.
-- SVC, UltraBERT-150M and Qwen3-0.6B each produce reproducible 18-class probabilities.
+- SVC, UltraBERT-380M and Qwen3-0.6B each produce reproducible 18-class probabilities.
 - Dashboard shows real measurements, model complementarity, ablations and runtime.
 - Selected ensemble uses leakage-safe evaluation of learned weights, if enabled.
 - Offline Kaggle notebook runs and produces a valid competition submission artifact.
