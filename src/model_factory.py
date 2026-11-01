@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 import json
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -72,10 +73,18 @@ def _require_neural():
     return torch, transformers
 
 
+def _force_huggingface_offline():
+    """Prevent model training processes from making any Hugging Face Hub requests."""
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
 def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpoint, revision, output_dir,
                        epochs=3, batch_size=16, max_length=384, learning_rate=2e-5, seed=2026,
-                       gradient_accumulation_steps=1):
+                       gradient_accumulation_steps=1, local_files_only=True):
     """Fine-tune a pinned AutoModelForSequenceClassification checkpoint."""
+    _force_huggingface_offline()
+    local_files_only = True
     torch, tr = _require_neural()
     start = time.perf_counter()
     torch.manual_seed(seed)
@@ -83,10 +92,12 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
     label_map = {label: i for i, label in enumerate(classes)}
     y_indices = np.asarray([label_map[y] for y in y_train], dtype=np.int64)
-    tokenizer = tr.AutoTokenizer.from_pretrained(checkpoint, revision=revision, trust_remote_code=True)
+    tokenizer = tr.AutoTokenizer.from_pretrained(checkpoint, revision=revision, trust_remote_code=True,
+                                                  local_files_only=local_files_only)
     model = tr.AutoModelForSequenceClassification.from_pretrained(
         checkpoint, revision=revision, num_labels=len(classes),
-        id2label=dict(enumerate(classes)), label2id=label_map, trust_remote_code=True)
+        id2label=dict(enumerate(classes)), label2id=label_map, trust_remote_code=True,
+        local_files_only=local_files_only)
     train = _TextDataset(train_text, y_indices, tokenizer, max_length)
     val = _TextDataset(validation_text, None, tokenizer, max_length)
     args = tr.TrainingArguments(output_dir=str(output_dir), num_train_epochs=epochs,
@@ -130,20 +141,119 @@ class _TextDataset:
         return Dataset()
 
 
+def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_size,
+                         safety_fraction=0.9, use_bf16=False, use_fp16=False):
+    """Find the largest batch that survives a real GPU forward/backward pass."""
+    torch, _ = _require_neural()
+    requested = int(requested_batch_size)
+    maximum = max(1, min(int(max_batch_size or requested), len(dataset)))
+    report = {"enabled": True, "max_batch_size": maximum, "attempts": []}
+    if not torch.cuda.is_available():
+        report.update({"status": "gpu_unavailable", "selected_batch_size": requested})
+        return requested, report
+    if not 0 < float(safety_fraction) <= 1:
+        raise ValueError("batch_probe_safety_fraction must be in (0, 1]")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    base_allocated = torch.cuda.memory_allocated(device)
+    max_allowed = base_allocated + int(free_bytes * float(safety_fraction))
+    report.update({"status": "probing", "device": str(device),
+                   "free_memory_bytes_before_probe": int(free_bytes),
+                   "total_memory_bytes": int(total_bytes),
+                   "safety_fraction": float(safety_fraction),
+                   "memory_limit_bytes": max_allowed})
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all()
+
+    def attempt(size):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        model.zero_grad(set_to_none=True)
+        batch = None
+        try:
+            batch = {key: torch.stack([dataset[i][key] for i in range(size)]).to(device)
+                     for key in dataset[0]}
+            autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=use_bf16 or use_fp16):
+                loss = model(**batch).loss
+            if loss is None:
+                raise RuntimeError("batch size probe needs labeled training examples")
+            loss.backward()
+            torch.cuda.synchronize(device)
+            peak = int(torch.cuda.max_memory_allocated(device))
+            fits_headroom = peak <= max_allowed
+            report["attempts"].append({"batch_size": size, "fits": fits_headroom,
+                                       "peak_allocated_bytes": peak,
+                                       "reason": None if fits_headroom else "safety_margin"})
+            return fits_headroom
+        except RuntimeError as exc:
+            oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
+            is_oom = (oom_type is not None and isinstance(exc, oom_type)) or "out of memory" in str(exc).lower()
+            if not is_oom:
+                raise
+            report["attempts"].append({"batch_size": size, "fits": False, "reason": "cuda_oom"})
+            return False
+        finally:
+            model.zero_grad(set_to_none=True)
+            del batch
+            torch.cuda.empty_cache()
+
+    try:
+        model.to(device)
+        model.train()
+        successful = 0
+        failed = None
+        candidate = 1
+        while candidate <= maximum:
+            if not attempt(candidate):
+                failed = candidate
+                break
+            successful = candidate
+            if candidate == maximum:
+                break
+            candidate = min(candidate * 2, maximum)
+        if successful == 0:
+            raise MemoryError("GPU batch-size probe could not fit batch size 1; reduce max_length or use a smaller model")
+        if failed is not None:
+            low, high = successful + 1, failed - 1
+            while low <= high:
+                mid = (low + high) // 2
+                if attempt(mid):
+                    successful = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+        report.update({"status": "selected", "selected_batch_size": successful,
+                       "peak_probe_allocated_bytes": max(
+                           (x.get("peak_allocated_bytes", 0) for x in report["attempts"]), default=0)})
+        return successful, report
+    finally:
+        model.zero_grad(set_to_none=True)
+        model.train()
+        torch.set_rng_state(cpu_rng)
+        torch.cuda.set_rng_state_all(cuda_rng)
+        torch.cuda.empty_cache()
+
+
 def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, checkpoint="Qwen/Qwen3-0.6B",
                          revision, output_dir="artifacts/checkpoints/qwen", epochs=3, batch_size=4,
                          max_length=384, learning_rate=1e-4, seed=2026, gradient_accumulation_steps=1,
                          lora_rank=16, lora_alpha=32,
                          lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"), save_merged=False,
                          resume_checkpoint=None, validation_labels=None, gradient_checkpointing=False,
-                         local_files_only=False, learning_rate_decay=1.0):
+                         local_files_only=False, learning_rate_decay=1.0, auto_batch_size=False,
+                         max_batch_size=None, batch_probe_safety_fraction=0.9):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
+    _force_huggingface_offline()
     torch, tr = _require_neural()
     try:
         from peft import LoraConfig, TaskType, PeftModel, get_peft_model
         from transformers import TrainerCallback
     except ImportError as exc:
         raise RuntimeError("Qwen LoRA training needs the project's optional neural dependencies") from exc
+    # Training is deliberately cache-only, even if a caller supplies a false config value.
+    local_files_only = True
     from torch import nn
     from torch.utils.data import Dataset
     from transformers.modeling_outputs import SequenceClassifierOutput
@@ -217,16 +327,31 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     eval_each_epoch = validation_labels is not None
     if not 0 < float(learning_rate_decay) <= 1:
         raise ValueError("learning_rate_decay must be in (0, 1]")
+    train_dataset=Rows(train_text,y_train)
+    use_bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16=torch.cuda.is_available() and not use_bf16
+    effective_batch_size=int(batch_size)
+    batch_probe={"enabled": False, "selected_batch_size": effective_batch_size}
+    if auto_batch_size:
+        effective_batch_size, batch_probe = _probe_max_batch_size(
+            model, train_dataset, requested_batch_size=batch_size,
+            max_batch_size=max_batch_size or batch_size,
+            safety_fraction=batch_probe_safety_fraction, use_bf16=use_bf16, use_fp16=use_fp16)
+    out.mkdir(parents=True,exist_ok=True)
+    batch_probe.update({"requested_batch_size":int(batch_size),
+                        "effective_batch_size":effective_batch_size,
+                        "gradient_accumulation_steps":int(gradient_accumulation_steps)})
+    (out/"batch_size_probe.json").write_text(json.dumps(batch_probe,indent=2)+"\n")
+    print(f"LoRA batch-size selection: {json.dumps(batch_probe,sort_keys=True)}",flush=True)
     args=tr.TrainingArguments(output_dir=str(output_dir),num_train_epochs=epochs,
-        per_device_train_batch_size=batch_size,per_device_eval_batch_size=batch_size,
+        per_device_train_batch_size=effective_batch_size,per_device_eval_batch_size=effective_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,learning_rate=learning_rate,
         seed=seed,data_seed=seed,save_strategy="no",eval_strategy="epoch" if eval_each_epoch else "no",report_to=[],
         logging_strategy="epoch",
-        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
-        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+        fp16=use_fp16,
+        bf16=use_bf16,
         remove_unused_columns=False,dataloader_num_workers=0)
-    train_dataset=Rows(train_text,y_train)
-    steps_per_epoch=max(1,math.ceil(len(train_dataset)/(batch_size*gradient_accumulation_steps)))
+    steps_per_epoch=max(1,math.ceil(len(train_dataset)/(effective_batch_size*gradient_accumulation_steps)))
     class EpochDecayTrainer(tr.Trainer):
         def create_scheduler(self,num_training_steps,optimizer=None):
             if self.lr_scheduler is None:
@@ -271,4 +396,6 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "calibration_method":"train-only scalar temperature",
         "validation_metrics_by_epoch":validation_metrics_by_epoch,
         "epoch_checkpoints":snapshot_callback.checkpoints,
+        "requested_batch_size":int(batch_size),"effective_batch_size":effective_batch_size,
+        "batch_size_probe":batch_probe,
         "peak_gpu_memory_bytes":int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None}

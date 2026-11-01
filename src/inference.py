@@ -41,7 +41,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     if model_name == "ultrabert380":
         network = AutoModelForSequenceClassification.from_pretrained(checkpoint, local_files_only=True, trust_remote_code=True)
-    elif model_name in {"qwen06", "qwen17", "qwen4", "llama32_3b"}:
+    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "llama32_3b"}:
         backbone_path = checkpoint / "merged_backbone"
         if backbone_path.exists():
             network = AutoModel.from_pretrained(backbone_path, local_files_only=True, torch_dtype=model_dtype)
@@ -67,7 +67,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     with torch.inference_mode():
         for start in range(0, len(texts), batch_size):
             enc=tokenizer(list(texts[start:start+batch_size]),truncation=True,max_length=max_length,padding=True,return_tensors="pt")
-            if model_name in {"qwen06", "qwen17", "qwen4", "llama32_3b"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
+            if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "llama32_3b"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
             enc={k:v.to(device) for k,v in enc.items()}; logits=network(**enc)
             if hasattr(logits,"logits"): logits=logits.logits
             batches.append(torch.softmax(logits.float()/float(temperature),dim=-1).cpu().numpy())

@@ -6,3 +6,4 @@ batch_size: 8
 gradient_accumulation_steps: 2
 learning_rate: 0.000008
 max_length: 384
+local_files_only: true

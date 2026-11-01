@@ -46,8 +46,14 @@ def _sha(value):
 
 def _ensemble_member_labels(members):
     display_names = {"svc": "SVC", "ultrabert380": "UltraBERT-380M", "qwen06": "Qwen3-0.6B",
+        "qwen06_best_epoch03": "Qwen3-0.6B best checkpoint (epoch 3)",
         "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B", "llama32_3b": "Llama-3.2-3B"}
-    return [display_names.get(name.split("_", 1)[0], name.split("_", 1)[0]) for name in members]
+    model_ids = sorted(display_names, key=len, reverse=True)
+    labels = []
+    for name in members:
+        model_id = next((item for item in model_ids if name == item or name.startswith(item + "_")), None)
+        labels.append(display_names.get(model_id, name.split("_", 1)[0]))
+    return labels
 
 
 def _ensemble_model_label(members):
@@ -96,6 +102,9 @@ def _model_cfg(model, config_path=None):
         raise ValueError(f"SVC config {path} needs C > 0 and calibration_cv >= 2")
     if model != "svc" and (int(cfg.get("epochs", 1)) < 1 or int(cfg.get("batch_size", 1)) < 1 or int(cfg.get("max_length", 1)) < 1):
         raise ValueError(f"model config {path} needs positive epochs, batch_size, and max_length")
+    if cfg.get("auto_batch_size") and (int(cfg.get("max_batch_size", cfg.get("batch_size", 1))) < 1
+            or not 0 < float(cfg.get("batch_probe_safety_fraction", 0.9)) <= 1):
+        raise ValueError(f"model config {path} needs max_batch_size >= 1 and batch_probe_safety_fraction in (0, 1]")
     return cfg
 
 
@@ -115,7 +124,8 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             checkpoint=cfg["checkpoint"], revision=cfg["revision"], output_dir=checkpoint,
             epochs=cfg.get("epochs", 3), batch_size=cfg.get("batch_size", 16), max_length=cfg.get("max_length", 384),
             learning_rate=cfg.get("learning_rate", 2e-5), seed=seed,
-            gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1))
+            gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
+            local_files_only=cfg.get("local_files_only", True))
         result["checkpoint"] = str(checkpoint)
     elif model in {"qwen06", "qwen17", "qwen4", "llama32_3b"}:
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
@@ -127,9 +137,12 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             lora_rank=cfg.get("lora_rank", 16), lora_alpha=cfg.get("lora_alpha", 32),
             lora_target_modules=cfg.get("lora_target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]),
             learning_rate_decay=cfg.get("learning_rate_decay", 1.0),
+            auto_batch_size=cfg.get("auto_batch_size", False),
+            max_batch_size=cfg.get("max_batch_size", cfg.get("batch_size", 4)),
+            batch_probe_safety_fraction=cfg.get("batch_probe_safety_fraction", 0.9),
             save_merged=final, validation_labels=None if final else valid.model.tolist(),
             gradient_checkpointing=cfg.get("gradient_checkpointing", False),
-            local_files_only=cfg.get("local_files_only", False))
+            local_files_only=cfg.get("local_files_only", True))
         result["checkpoint"] = str(checkpoint)
     else: raise ValueError(f"unknown model: {model}")
     return result
@@ -196,6 +209,9 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"), "checkpoint_size_bytes": artifact_size,
         "calibration_method": "sigmoid train-only CV" if model == "svc" else "train-only scalar temperature",
         "calibration_temperature": result.get("calibration_temperature"),
+        "requested_batch_size": result.get("requested_batch_size"),
+        "effective_batch_size": result.get("effective_batch_size"),
+        "batch_size_probe": result.get("batch_size_probe"),
         "validation_metrics_by_epoch": result.get("validation_metrics_by_epoch", []),
         "epoch_checkpoints": result.get("epoch_checkpoints", []),
         "feature_cache_key": result.get("cache_key"), "checkpoint_path": str(checkpoint),
@@ -253,7 +269,13 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps",1),
         lora_rank=cfg.get("lora_rank",16),lora_alpha=cfg.get("lora_alpha",32),
         lora_target_modules=cfg.get("lora_target_modules",["q_proj","k_proj","v_proj","o_proj"]),
-        resume_checkpoint=source_checkpoint,validation_labels=valid.model.tolist())
+        auto_batch_size=cfg.get("auto_batch_size",False),
+        max_batch_size=cfg.get("max_batch_size",cfg.get("batch_size",4)),
+        batch_probe_safety_fraction=cfg.get("batch_probe_safety_fraction",0.9),
+        resume_checkpoint=source_checkpoint,validation_labels=valid.model.tolist(),
+        local_files_only=True,
+        gradient_checkpointing=cfg.get("gradient_checkpointing",False),
+        learning_rate_decay=cfg.get("learning_rate_decay",1.0))
     classes=sorted(rows.model.astype(str).unique())
     metrics=evaluate(valid.model.astype(str),result["scores"],classes,result["probabilities"])
     metrics["validation_metrics_by_epoch"]=result["validation_metrics_by_epoch"]
@@ -269,6 +291,9 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
         "code_revision":code_revision,"model_revision":cfg["revision"],"checkpoint_id":cfg["checkpoint"],"seed":seed,
         "fit_seconds":result["fit_seconds"],"inference_seconds":result["inference_seconds"],
         "calibration_temperature":result["calibration_temperature"],"validation_metrics_by_epoch":result["validation_metrics_by_epoch"],
+        "requested_batch_size":result.get("requested_batch_size"),
+        "effective_batch_size":result.get("effective_batch_size"),
+        "batch_size_probe":result.get("batch_size_probe"),
         "epoch_checkpoints":result.get("epoch_checkpoints",[]),
         "checkpoint_path":str(checkpoint),"prediction_path":str(prediction_path),"metrics":metrics,
         "created_at_utc":pd.Timestamp.now(tz="UTC").isoformat()}
@@ -359,10 +384,19 @@ def evaluate_ensembles(dataset="v0", artifact_dir="artifacts", registry_path="ex
     started = time.perf_counter()
     base, classes, y, groups, models, manifests, dataset_hash, split_hash = _load_validation(dataset, artifact_dir)
     if model_names:
-        requested = set(model_names); available = {name.split("_", 1)[0]: name for name in models}
-        missing = requested - set(available)
+        requested = list(model_names)
+        available = {}
+        for model_id in requested:
+            if model_id in models:
+                available[model_id] = model_id
+                continue
+            matches = [name for name in models if manifests[name].get("model") == model_id]
+            if matches:
+                available[model_id] = max(matches, key=lambda name: manifests[name].get("created_at_utc", ""))
+        missing = set(requested) - set(available)
         if missing: raise ValueError(f"requested models have no validation artifacts: {sorted(missing)}")
-        models = {name: p for name, p in models.items() if name.split("_", 1)[0] in requested}
+        selected = [available[model_id] for model_id in requested]
+        models = {name: models[name] for name in selected}
     names = list(models)
     if len(names) < 2: raise ValueError("ensemble evaluation requires at least two model validation files")
     manifests = {name: manifests[name] for name in names}
@@ -405,11 +439,12 @@ def evaluate_ensembles(dataset="v0", artifact_dir="artifacts", registry_path="ex
         record["marginal_contribution"] = marginal
         record["inference_cost_seconds"] = sum((model_costs[n]["inference_seconds"] or 0) for n in members)
     pred_dir = Path(artifact_dir)/"predictions"; pred_dir.mkdir(parents=True, exist_ok=True)
-    output = base[["id", "prompt_id", "y_true"]].copy()
+    output_columns = {column: base[column].to_numpy() for column in ("id", "prompt_id", "y_true")}
     for label, record in reports.items():
         for i, cls in enumerate(classes):
-            output[f"{label}::score::{cls}"] = np.log(np.clip(record["probabilities"][:, i], 1e-12, 1))
-            output[f"{label}::prob::{cls}"] = record["probabilities"][:, i]
+            output_columns[f"{label}::score::{cls}"] = np.log(np.clip(record["probabilities"][:, i], 1e-12, 1))
+            output_columns[f"{label}::prob::{cls}"] = record["probabilities"][:, i]
+    output = pd.DataFrame(output_columns)
     serializable = {k: {kk: vv for kk, vv in v.items() if kk != "probabilities"} for k, v in reports.items()}
     best = max(reports, key=lambda n: reports[n]["metrics"]["balanced_accuracy"])
     best_metrics = reports[best]["metrics"]; code_revision = _revision()

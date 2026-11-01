@@ -3,6 +3,9 @@ checkpoint: Qwen/Qwen3-4B-Base
 revision: 906bfd4b4dc7f14ee4320094d8b41684abff8539
 epochs: 10
 batch_size: 1
+auto_batch_size: true
+max_batch_size: 8
+batch_probe_safety_fraction: 0.9
 gradient_accumulation_steps: 8
 learning_rate: 0.0001
 max_length: 384
