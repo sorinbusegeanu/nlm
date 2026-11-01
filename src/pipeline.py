@@ -366,6 +366,7 @@ def main(argv=None):
     ft=m.add_parser("fit-final");ft.add_argument("--model",choices=MODEL_CONFIGS,default="svc");ft.add_argument("--dataset",default="v0");ft.add_argument("--config");ft.add_argument("--registry",default="experiments/registry.sqlite")
     e=sub.add_parser("ensemble").add_subparsers(dest="action",required=True);q=e.add_parser("evaluate");q.add_argument("--dataset",default="v0");q.add_argument("--artifact-dir",default="artifacts");q.add_argument("--bootstrap-replicates",type=int,default=2000)
     x=sub.add_parser("export");x.add_argument("--model",choices=MODEL_CONFIGS,default="svc");x.add_argument("--checkpoint",default="artifacts/checkpoints/svc_v0_final.json");x.add_argument("--test",default="data/raw/test.csv");x.add_argument("--output",default="submission.parquet")
+    k=sub.add_parser("package-kaggle");k.add_argument("--manifest",default="artifacts/checkpoints/svc_v0_final.json");k.add_argument("--output",default="artifacts/kaggle/model_package.zip")
     a=parser.parse_args(argv)
     if a.command=="data": result=prepare_data(a.config)
     elif a.command=="features": result=build_features(a.dataset,a.data_dir,a.config)
@@ -376,6 +377,9 @@ def main(argv=None):
     elif a.command=="export":
         from .inference import export_submission
         result=export_submission(a.model,a.checkpoint,a.test,a.output)
+    elif a.command=="package-kaggle":
+        from .inference import package_offline_model
+        result=package_offline_model(a.manifest,a.output)
     print(json.dumps(result,indent=2,default=str))
 
 if __name__=="__main__":main()

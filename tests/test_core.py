@@ -1,5 +1,7 @@
 import unittest
 import json
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 import numpy as np
@@ -11,7 +13,7 @@ from src.ensemble_factory import cross_fitted_weights, fit_weights
 from src.registry import Registry
 from src.model_factory import train_svc
 from src.pipeline import _load_oof, evaluate_ensembles, _model_cfg
-from src.inference import export_svc_submission
+from src.inference import export_svc_submission, package_offline_model
 import joblib
 from unittest.mock import patch
 
@@ -52,9 +54,10 @@ class DataTests(unittest.TestCase):
 class EvaluationTests(unittest.TestCase):
     def test_metrics_and_probability_validation(self):
         y=["a","b","a"]
-        p=np.array([[.9,.1],[.2,.8],[.4,.6]])
-        result=evaluate(y,np.log(p),["a","b"],p)
+        p=np.array([[.9,.1],[.2,.8],[.7,.3]])
+        result=evaluate(y,np.array([[2.,1.],[1.,2.],[1.,2.]]),["a","b"],p)
         self.assertAlmostEqual(result["balanced_accuracy"],.75)
+        self.assertAlmostEqual(result["calibrated_balanced_accuracy"],1.0)
         self.assertIn("log_loss",result)
 
     def test_alignment_rejects_missing_and_duplicate_ids(self):
@@ -153,6 +156,23 @@ class FeatureAndModelTests(unittest.TestCase):
             self.assertEqual(result_frame.columns.tolist(),["id","model"])
             self.assertEqual(result_frame.id.tolist(),["002","001"])
             self.assertTrue(set(result_frame.model).issubset({"a","b","c"}))
+            manifest=Path(td)/"manifest.json"
+            manifest.write_text(json.dumps({"model":"svc","checkpoint":str(checkpoint),"classes":["a","b","c"],"experiment_id":"test"}))
+            package=Path(td)/"model_package.zip"
+            package_offline_model(manifest,package)
+            unpacked=Path(td)/"unpacked";unpacked.mkdir()
+            import zipfile
+            with zipfile.ZipFile(package) as archive:archive.extractall(unpacked)
+            portable_out=Path(td)/"portable.csv"
+            subprocess.run([sys.executable,"-c","from src.inference import export_submission; export_submission('svc','manifest.json',r'%s',r'%s')"%(test,portable_out)],cwd=unpacked,check=True,capture_output=True,text=True)
+            self.assertEqual(pd.read_csv(portable_out,dtype={"id":"string"}).id.tolist(),["002","001"])
+
+    def test_kaggle_notebook_is_valid_and_explicit_about_paths(self):
+        notebook=json.loads(Path("notebooks/kaggle_inference.ipynb").read_text())
+        source="\n".join("".join(cell.get("source",[])) for cell in notebook["cells"])
+        self.assertEqual(notebook["nbformat"],4)
+        self.assertIn("MODEL_PACKAGE",source);self.assertIn("TEST_CSV",source)
+        self.assertIn("submission.parquet",source);self.assertIn("TRANSFORMERS_OFFLINE",source)
 
 
 if __name__=="__main__":unittest.main()

@@ -57,6 +57,14 @@ python -m src.pipeline export --model svc --checkpoint artifacts/checkpoints/svc
 
 For neural exports, pass the final manifest JSON as `--checkpoint` and choose the matching model. Neural inference loads local model files only. Competition-specific schema, internet-off Kaggle packaging, and runtime limits must be checked against competition rules before submission.
 
+Build a portable model/code bundle for the included generic Kaggle notebook:
+
+```bash
+python -m src.pipeline package-kaggle --manifest artifacts/checkpoints/svc_v0_final.json --output artifacts/kaggle/model_package.zip
+```
+
+Attach `model_package.zip` and the competition input data as Kaggle input datasets. Open [`notebooks/kaggle_inference.ipynb`](notebooks/kaggle_inference.ipynb), update its input paths, and disable Internet in Kaggle notebook settings. The notebook writes `submission.parquet` using the observed `id,model` schema. Verify the actual competition schema, filenames, memory, and runtime limits before submitting.
+
 ## Results and tests
 
 Run tests with `python -m unittest discover -s tests -v`. Neural adapter tests create tiny local models and skip when the optional neural dependencies are absent. Run the dashboard with `streamlit run dashboard/app.py`.

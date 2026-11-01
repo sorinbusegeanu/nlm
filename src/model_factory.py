@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import json
 from pathlib import Path
 
 import numpy as np
@@ -96,6 +97,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         dataloader_num_workers=0)
     trainer = tr.Trainer(model=model, args=args, train_dataset=train, tokenizer=tokenizer)
     trainer.train()
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    (Path(output_dir)/"training_log.json").write_text(json.dumps(trainer.state.log_history, indent=2)+"\n")
     train_logits = np.asarray(trainer.predict(train).predictions)
     train_labels = list(y_train)
     temperature = _fit_temperature(train_logits, train_labels, classes)
@@ -182,11 +185,12 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         remove_unused_columns=False,dataloader_num_workers=0)
     trainer=tr.Trainer(model=model,args=args,train_dataset=Rows(train_text,y_train))
     trainer.train()
+    out=Path(output_dir);out.mkdir(parents=True,exist_ok=True)
+    (out/"training_log.json").write_text(json.dumps(trainer.state.log_history, indent=2)+"\n")
     train_logits=np.asarray(trainer.predict(Rows(train_text,y_train)).predictions)
     temperature=_fit_temperature(train_logits,list(y_train),classes)
     pred_start=time.perf_counter(); logits=np.asarray(trainer.predict(Rows(validation_text)).predictions)
     inference_seconds=time.perf_counter()-pred_start
-    out=Path(output_dir);out.mkdir(parents=True,exist_ok=True)
     backbone.save_pretrained(out,safe_serialization=True);tokenizer.save_pretrained(out)
     torch.save(model.classifier.state_dict(),out/"classifier.pt")
     if save_merged:

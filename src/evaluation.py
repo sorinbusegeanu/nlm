@@ -29,6 +29,11 @@ def evaluate(y_true, scores, classes, probabilities=None):
             raise ValueError("probability rows must sum to one")
         result["log_loss"] = float(log_loss(y_true, probabilities, labels=classes))
         result["multiclass_brier"] = float(np.mean(np.sum((probabilities - np.eye(len(classes))[[classes.index(y) for y in y_true]]) ** 2, axis=1)))
+        calibrated_pred = np.asarray(classes)[probabilities.argmax(axis=1)]
+        result["calibrated_balanced_accuracy"] = float(balanced_accuracy_score(y_true, calibrated_pred))
+        result["calibrated_macro_f1"] = float(f1_score(y_true, calibrated_pred, labels=classes, average="macro", zero_division=0))
+        result["calibrated_confusion_matrix"] = confusion_matrix(y_true, calibrated_pred, labels=classes).tolist()
+        result["calibrated_per_class_recall"] = {str(c): float(r) for c, r in zip(classes, recall_score(y_true, calibrated_pred, labels=classes, average=None, zero_division=0))}
     return result
 
 
