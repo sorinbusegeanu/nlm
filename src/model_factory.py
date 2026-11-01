@@ -82,20 +82,20 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
     label_map = {label: i for i, label in enumerate(classes)}
     y_indices = np.asarray([label_map[y] for y in y_train], dtype=np.int64)
-    tokenizer = tr.AutoTokenizer.from_pretrained(checkpoint, revision=revision)
+    tokenizer = tr.AutoTokenizer.from_pretrained(checkpoint, revision=revision, trust_remote_code=True)
     model = tr.AutoModelForSequenceClassification.from_pretrained(
         checkpoint, revision=revision, num_labels=len(classes),
-        id2label=dict(enumerate(classes)), label2id=label_map)
+        id2label=dict(enumerate(classes)), label2id=label_map, trust_remote_code=True)
     train = _TextDataset(train_text, y_indices, tokenizer, max_length)
     val = _TextDataset(validation_text, None, tokenizer, max_length)
     args = tr.TrainingArguments(output_dir=str(output_dir), num_train_epochs=epochs,
         per_device_train_batch_size=batch_size, per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps, learning_rate=learning_rate,
-        seed=seed, data_seed=seed, save_strategy="no", evaluation_strategy="no", report_to=[],
+        seed=seed, data_seed=seed, save_strategy="no", eval_strategy="no", report_to=[],
         logging_strategy="epoch", fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         dataloader_num_workers=0)
-    trainer = tr.Trainer(model=model, args=args, train_dataset=train, tokenizer=tokenizer)
+    trainer = tr.Trainer(model=model, args=args, train_dataset=train, processing_class=tokenizer)
     trainer.train()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     (Path(output_dir)/"training_log.json").write_text(json.dumps(trainer.state.log_history, indent=2)+"\n")
@@ -129,10 +129,11 @@ class _TextDataset:
         return Dataset()
 
 
-def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, checkpoint="Qwen/Qwen3-0.6B-Base",
+def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, checkpoint="Qwen/Qwen3-0.6B",
                          revision, output_dir="artifacts/checkpoints/qwen", epochs=3, batch_size=4,
                          max_length=384, learning_rate=1e-4, seed=2026, gradient_accumulation_steps=1,
-                         lora_rank=16, lora_alpha=32, save_merged=False):
+                         lora_rank=16, lora_alpha=32,
+                         lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"), save_merged=False):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
     torch, tr = _require_neural()
     try:
@@ -151,7 +152,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16 if torch.cuda.is_available() else torch.float32
     backbone = tr.AutoModel.from_pretrained(checkpoint, revision=revision, torch_dtype=model_dtype)
     lora = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION, r=lora_rank, lora_alpha=lora_alpha,
-                      lora_dropout=.05, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
+                      lora_dropout=.05, target_modules=list(lora_target_modules))
     backbone = get_peft_model(backbone, lora)
     backbone.config.use_cache = False
     label_map = {label: i for i, label in enumerate(classes)}
@@ -179,7 +180,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     args=tr.TrainingArguments(output_dir=str(output_dir),num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,learning_rate=learning_rate,
-        seed=seed,data_seed=seed,save_strategy="no",evaluation_strategy="no",report_to=[],
+        seed=seed,data_seed=seed,save_strategy="no",eval_strategy="no",report_to=[],
         fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         remove_unused_columns=False,dataloader_num_workers=0)

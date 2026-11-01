@@ -13,7 +13,7 @@ source .venv/bin/activate
 
 For transformer training and inference, install a PyTorch build suited to the local hardware using the official PyTorch selector. Then install the remaining locked neural dependencies with `uv sync --locked --extra neural --extra dev --extra dashboard --no-install-package torch`. The lock includes a generic torch package for resolution; skip it when installing so the hardware-specific build remains selected.
 
-Before neural training, edit the selected model config and set an immutable Hugging Face checkpoint revision. `ultrabert150` requires an UltraBERT model ID and revision; the pipeline intentionally fails with an actionable error while either is missing. Qwen defaults to `Qwen/Qwen3-0.6B-Base`, but also requires an immutable revision.
+Before neural training, set an immutable Hugging Face checkpoint revision in the selected model config. `ultrabert380` uses `dmis-lab/UltraBERT-380M` with pinned remote model code. The Qwen LoRA trainer defaults to [`Qwen/Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B); choose another compatible causal LM by changing `checkpoint` and `revision` in `configs/models/qwen06.yaml`. Adjust `lora_target_modules` when the selected architecture uses different attention projection names. The neural extra pins Transformers to 5.16–5.19 for compatibility with the CUDA environment's vLLM; UltraBERT loads its pinned custom code through `trust_remote_code=True`.
 
 ## V0 workflow
 
@@ -28,7 +28,7 @@ Build and cache fold-fitted features, then train each model on the same folds:
 ```bash
 python -m src.pipeline features build --dataset v0
 python -m src.pipeline models train --model svc --dataset v0
-python -m src.pipeline models train --model ultrabert150 --dataset v0
+python -m src.pipeline models train --model ultrabert380 --dataset v0
 python -m src.pipeline models train --model qwen06 --dataset v0
 ```
 

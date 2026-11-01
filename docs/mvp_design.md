@@ -8,7 +8,7 @@
 
 The MVP must:
 
-1. Train and evaluate three different classifiers on identical prompt-grouped folds: four-view TF-IDF + LinearSVC, UltraBERT-150M and Qwen3-0.6B-Base with LoRA.
+1. Train and evaluate three different classifiers on identical prompt-grouped folds: four-view TF-IDF + LinearSVC, UltraBERT-380M and a configurable causal language model, defaulting to Qwen3-0.6B, with LoRA.
 2. Produce aligned out-of-fold (OOF) scores for all 18 model labels, and a simple ensemble.
 3. Quantify each classifier's standalone accuracy, marginal ensemble contribution, errors and compute cost.
 4. Record all dataset, code, split, model and prediction versions.
@@ -31,7 +31,7 @@ Official train.csv
 [Feature Factory] --> fold-fitted TF-IDF + stylometry, cached
       |
       v
-[Model Factory] --> SVC / UltraBERT-150M / Qwen3-0.6B LoRA
+[Model Factory] --> SVC / UltraBERT-380M / Qwen3-0.6B LoRA
       |                     | checkpoints + aligned OOF probabilities
       v                     v
 [Ensemble Factory] --> equal / regularized weighted probability blends
@@ -89,10 +89,10 @@ All predictions must use the **same stable class order** and row IDs. Store raw 
 | Model | Training | Starting settings | Hardware |
 |---|---|---|---|
 | Four-view TF-IDF + LinearSVC | CPU supervised classification | C=0.5, balanced class weights; calibrate using training-only data | CPU |
-| UltraBERT-150M | Fine-tune 18-class encoder head | 384 tokens, 3 epochs, LR 2e-5, batch 16, BF16/FP16 as supported | RTX 5070 Ti 16 GB |
-| Qwen3-0.6B-Base | LoRA + 18-class readout | 384 tokens, 3 epochs, LoRA rank 16 / alpha 32 / LR 1e-4, batch 4–8 | RTX 5070 Ti 16 GB |
+| UltraBERT-380M (`dmis-lab/UltraBERT-380M`) | Fine-tune 18-class encoder head | 384 tokens, 3 epochs, LR 8e-6, batch 8, gradient accumulation 2, BF16/FP16 as supported | RTX 5070 Ti 16 GB |
+| Configurable causal LM (default `Qwen/Qwen3-0.6B`) | LoRA + 18-class readout | 384 tokens, 3 epochs, LoRA rank 16 / alpha 32 / LR 1e-4, batch 4–8; target modules configured per architecture | RTX 5070 Ti 16 GB |
 
-Settings are *initial hypotheses*, not optimized values. Pin exact model repos/revisions and compatible software versions after a smoke test. Confirm UltraBERT's actual checkpoint/API availability before implementing its trainer; use an equivalently small supported encoder if unavailable, documenting the substitution. For Qwen, select a deterministic pooling/readout method (e.g. masked mean of specified hidden layers) and log it; early/middle-layer truncation is a **later ablation**, not assumed superior.
+Settings are *initial hypotheses*, not optimized values. UltraBERT-380M is the selected encoder; its model card shows an 8e-6 classification learning rate for the 380M variant. This environment keeps Transformers below 5.20 for vLLM compatibility, so load UltraBERT's custom implementation through `trust_remote_code=True` and a pinned Hugging Face revision. For Qwen, select a deterministic pooling/readout method (e.g. masked mean of specified hidden layers) and log it; early/middle-layer truncation is a **later ablation**, not assumed superior.
 
 Train each fold independently, save OOF probabilities on its validation rows, and save inference-ready checkpoints. Train full-data models only after selecting a final experiment.
 
@@ -139,7 +139,7 @@ Report performance separately on grouped CV and the untouched holdout; do not co
 Ablations use **fixed V0 data and folds**:
 
 1. **Statistical features:** char+word SVC; add punctuation/shape; add handcrafted stylometry (as a separate classifier or supported sparse features).
-2. **Neural representations:** UltraBERT-150M vs UltraBERT-380M if resources permit; Qwen3-0.6B baseline vs a larger small Qwen (e.g. 1.7B) only after baseline works.
+2. **Neural representations:** UltraBERT-380M baseline; Qwen3-0.6B baseline vs a larger small Qwen (e.g. 1.7B) only after baseline works.
 3. **Ensemble complementarity:** SVC, UltraBERT, Qwen individually; all pairs; all three; equal vs cross-fitted learned weights.
 
 Predeclare one variable per experiment and save both positive and negative results. The 380M and 1.7B runs are **optional post-MVP ablations**.

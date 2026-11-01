@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import os
 import re
 import subprocess
 import time
@@ -23,7 +24,7 @@ from .feature_factory import load_or_fit
 from .model_factory import train_encoder_fold, train_qwen_lora_fold, train_svc
 from .registry import Registry
 
-MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert150": "configs/models/ultrabert150.yaml", "qwen06": "configs/models/qwen06.yaml"}
+MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert380": "configs/models/ultrabert380.yaml", "qwen06": "configs/models/qwen06.yaml"}
 
 
 def _revision():
@@ -85,8 +86,8 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump({"model": result["model"], "raw_model": result["raw_model"], "features": result["features"], "classes": classes, "config": cfg}, checkpoint)
         result["checkpoint"] = str(checkpoint)
-    elif model == "ultrabert150":
-        checkpoint = Path(output_dir) / "checkpoints" / f"ultrabert150_fold{fold}"
+    elif model == "ultrabert380":
+        checkpoint = Path(output_dir) / "checkpoints" / f"ultrabert380_fold{fold}"
         result = train_encoder_fold(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
             checkpoint=cfg["checkpoint"], revision=cfg["revision"], output_dir=checkpoint,
             epochs=cfg.get("epochs", 3), batch_size=cfg.get("batch_size", 16), max_length=cfg.get("max_length", 384),
@@ -100,7 +101,9 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             epochs=cfg.get("epochs", 3), batch_size=cfg.get("batch_size", 4), max_length=cfg.get("max_length", 384),
             learning_rate=cfg.get("learning_rate", 1e-4), seed=seed,
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
-            lora_rank=cfg.get("lora_rank", 16), lora_alpha=cfg.get("lora_alpha", 32), save_merged=final)
+            lora_rank=cfg.get("lora_rank", 16), lora_alpha=cfg.get("lora_alpha", 32),
+            lora_target_modules=cfg.get("lora_target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]),
+            save_merged=final)
         result["checkpoint"] = str(checkpoint)
     else: raise ValueError(f"unknown model: {model}")
     return result
@@ -186,7 +189,8 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
     Registry(registry_path).add(manifest["experiment_id"], model, "development_oof", manifest["config"], metrics,
         dataset_hash=manifest["dataset_sha256"], code_revision=manifest["code_revision"], seed=seed,
         fold_id=None, runtime_seconds=manifest["fit_seconds"], artifact_path=str(prediction_path), config_hash=manifest["config_sha256"],
-        split_hash=manifest["split_sha256"], model_revision=manifest["model_revision"])
+        split_hash=manifest["split_sha256"], model_revision=manifest["model_revision"],
+        description=f"{model} trained on {dataset} development folds; out-of-fold evaluation, seed {seed}.")
     (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -280,7 +284,9 @@ def evaluate_ensembles(dataset="v0", artifact_dir="artifacts", registry_path="ex
     member_key = _sha({name: str(Path(artifact_dir)/"predictions"/f"{name}_oof.parquet") for name in names})[:10]
     report = {"experiment_id": f"ensemble_{dataset}_seed{seed}_members{member_key}_code{code_revision[:7]}", "dataset": dataset, "split": "development_oof",
         "classes": classes, "members": names, "best_single": single_best, "best_ensemble": best_ensemble,
-        "balanced_accuracy": best_metrics["balanced_accuracy"], "macro_f1": best_metrics["macro_f1"],
+        "balanced_accuracy": best_metrics["balanced_accuracy"],
+        "calibrated_balanced_accuracy": best_metrics.get("calibrated_balanced_accuracy"),
+        "macro_f1": best_metrics["macro_f1"],
         "log_loss": best_metrics.get("log_loss"), "per_class_recall": best_metrics["per_class_recall"],
         "confusion_matrix": best_metrics["confusion_matrix"], "model_costs": model_costs, "models": base_metrics,
         "ensembles": serializable, "complementarity_all": complementarity(y, predictions),
@@ -292,7 +298,8 @@ def evaluate_ensembles(dataset="v0", artifact_dir="artifacts", registry_path="ex
     report["prediction_path"] = str(path)
     (pred_dir / f"{report['experiment_id']}_metrics.json").write_text(json.dumps(report, indent=2) + "\n")
     Registry(registry_path).add(report["experiment_id"], "ensemble", "development_oof", {"members": names, "seed": seed}, report,
-        dataset_hash=dataset_hash, split_hash=split_hash, code_revision=report["code_revision"], seed=seed, artifact_path=str(path))
+        dataset_hash=dataset_hash, split_hash=split_hash, code_revision=report["code_revision"], seed=seed, artifact_path=str(path),
+        description=f"Out-of-fold ensemble on {dataset}; members: {', '.join(names)}; seed {seed}.")
     return report
 
 
@@ -319,7 +326,8 @@ def evaluate_holdout(model="svc", dataset="v0", data_dir="data/processed", artif
     Registry(registry_path).add(report["experiment_id"], model, "holdout", cfg, metrics,
         dataset_hash=json.loads((data_dir/"dataset_profile.json").read_text())["dataset_sha256"],
         split_hash=json.loads((data_dir/"dataset_profile.json").read_text())["split_sha256"],
-        model_revision=cfg.get("revision"), code_revision=_revision(), seed=seed, runtime_seconds=result["fit_seconds"], artifact_path=str(report_path))
+        model_revision=cfg.get("revision"), code_revision=_revision(), seed=seed, runtime_seconds=result["fit_seconds"], artifact_path=str(report_path),
+        description=f"One-time evaluation of {model} on the untouched {dataset} holdout; seed {seed}.")
     return report
 
 
@@ -338,7 +346,11 @@ def fit_final(model="svc", dataset="v0", data_dir="data/processed", artifact_dir
     if model == "svc":
         path.parent.mkdir(parents=True,exist_ok=True)
         joblib.dump({"model": result["model"], "raw_model": result["raw_model"], "features": result["features"], "classes": classes, "config": cfg}, path)
-    manifest = {"experiment_id": run_name, "model": model, "dataset": dataset, "classes": classes, "checkpoint": str(path),
+    # Manifests are consumed by export/package code, which resolves relative
+    # checkpoint paths from the manifest directory. Store that relative path
+    # here so both the versioned manifest and stable alias resolve correctly.
+    checkpoint_for_manifest = os.path.relpath(path, final_manifest_path.parent)
+    manifest = {"experiment_id": run_name, "model": model, "dataset": dataset, "classes": classes, "checkpoint": checkpoint_for_manifest,
         "checkpoint_id": cfg.get("checkpoint"), "model_revision": cfg.get("revision"), "seed": seed,
         "trained_rows": len(train), "dataset_sha256": profile["dataset_sha256"], "config_sha256": config_hash,
         "code_revision": code_revision, "fit_seconds": result["fit_seconds"],
@@ -352,7 +364,8 @@ def fit_final(model="svc", dataset="v0", data_dir="data/processed", artifact_dir
         {"trained_rows":len(train),"fit_seconds":result["fit_seconds"]},
         dataset_hash=profile["dataset_sha256"], code_revision=code_revision,
         config_hash=config_hash, seed=seed, runtime_seconds=result["fit_seconds"],
-        artifact_path=str(final_manifest_path), model_revision=cfg.get("revision"))
+        artifact_path=str(final_manifest_path), model_revision=cfg.get("revision"),
+        description=f"Final {model} fit on all labelled {dataset} rows for inference; seed {seed}.")
     return manifest
 
 
