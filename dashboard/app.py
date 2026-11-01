@@ -28,13 +28,21 @@ profile_validation_rows = profile_data.get("validation_rows")
 
 def metrics(row): return json.loads(row["metrics_json"])
 
+def model_display(name):
+    return {"qwen06_best_epoch03": "Qwen3-0.6B best checkpoint (epoch 3)"}.get(name, name)
+
 def blend_label(name):
     if not name: return ""
     train_weighted = name.startswith("train_weighted:")
     if train_weighted: name = name.removeprefix("train_weighted:")
     labels = {"svc": "SVC", "ultrabert380": "UltraBERT-380M", "qwen06": "Qwen3-0.6B",
+              "qwen06_best_epoch03": "Qwen3-0.6B best checkpoint (epoch 3)",
               "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B", "llama32_3b": "Llama-3.2-3B"}
-    members = [labels.get(part.split("_", 1)[0], part.split("_", 1)[0]) for part in name.split("+")]
+    model_ids = sorted(labels, key=len, reverse=True)
+    members = []
+    for part in name.split("+"):
+        model_id = next((item for item in model_ids if part == item or part.startswith(item + "_")), None)
+        members.append(labels.get(model_id, part.split("_", 1)[0]))
     kind = "Train-fitted weighted blend" if train_weighted else "Equal-weight blend"
     return f"{kind}: {' + '.join(members)}"
 
@@ -59,7 +67,7 @@ for row in records:
     if row_validation_rows is None or pd.isna(row_validation_rows):
         row_validation_rows = profile_validation_rows
     comparison.append({"Experiment": f"{int(row['sequence_number']):04d}", "Description": row.get("description", ""),
-        "Model": row["model"], "Split": row["split"],
+        "Model": model_display(row["model"]), "Split": row["split"],
         "acc_raw": value.get("balanced_accuracy"), "acc_weighted": weighted_accuracy, "Macro F1": value.get("macro_f1"),
         "Log loss": value.get("log_loss"), "Runtime (s)": row.get("runtime_seconds"),
         "Validation rows": row_validation_rows,

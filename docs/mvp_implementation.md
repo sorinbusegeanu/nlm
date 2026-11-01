@@ -29,6 +29,8 @@ python -m src.pipeline ensemble evaluate --dataset v0
 
 All model configs must point to the intended model and an immutable Hugging Face revision. The Qwen model remains configurable through `configs/models/qwen06.yaml`; LoRA target module names must match the chosen architecture. The ensemble factory predicts the train partition with each fitted checkpoint, chooses a regularized weight vector using only those train labels/predictions, freezes it, and reports its validation score alongside the equal-weight score. Those train predictions are in-sample, so the train score is descriptive; only the validation rows compare transfer of the weights.
 
+LoRA model configs can enable a GPU batch-size probe before training. It exercises candidate per-device batches with a forward/backward pass up to `max_batch_size`, preserving a configurable memory reserve. The largest successful size is used for training and validation, with the attempts and selected size recorded in the experiment manifest. If CUDA is unavailable, the configured `batch_size` is used.
+
 ## Artifacts and dashboard
 
 - `data/processed/dataset_v0.parquet`: canonical sorted train data.

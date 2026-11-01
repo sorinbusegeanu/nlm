@@ -3,6 +3,9 @@ checkpoint: meta-llama/Llama-3.2-3B
 revision: 13afe5124825b4f3751f836b40dafda64c1ed062
 epochs: 10
 batch_size: 1
+auto_batch_size: true
+max_batch_size: 16
+batch_probe_safety_fraction: 0.9
 gradient_accumulation_steps: 8
 learning_rate: 0.0001
 max_length: 384
