@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
+import tempfile
+import zipfile
 
 import joblib
 import numpy as np
@@ -68,7 +71,9 @@ def export_submission(model, checkpoint, test_path, output_path):
     manifest = {}
     if checkpoint.suffix.lower() == ".json":
         manifest = json.loads(checkpoint.read_text())
+        manifest_dir = checkpoint.parent
         checkpoint = Path(manifest["checkpoint"])
+        if not checkpoint.is_absolute(): checkpoint = manifest_dir / checkpoint
     frame = pd.read_csv(test_path, dtype={"id": "string"})
     missing = REQUIRED_TEST - set(frame.columns)
     if missing: raise ValueError(f"test input is missing columns: {sorted(missing)}")
@@ -97,3 +102,45 @@ def export_submission(model, checkpoint, test_path, output_path):
 
 def export_svc_submission(checkpoint, test_path, output_path):
     return export_submission("svc", checkpoint, test_path, output_path)
+
+
+def package_offline_model(manifest_path, output_zip):
+    """Package a final model and required project inference code for offline use."""
+    manifest_path, output_zip = Path(manifest_path), Path(output_zip)
+    source = json.loads(manifest_path.read_text())
+    model_name = source["model"]
+    checkpoint = Path(source["checkpoint"])
+    if not checkpoint.is_absolute(): checkpoint = manifest_path.parent / checkpoint
+    if model_name == "svc" and (not checkpoint.is_file() or checkpoint.suffix != ".joblib"):
+        raise FileNotFoundError(f"SVC model checkpoint not found: {checkpoint}")
+    if model_name != "svc" and not checkpoint.is_dir():
+        raise FileNotFoundError(f"Neural model checkpoint directory not found: {checkpoint}")
+    source_root = Path(__file__).resolve().parent
+    output_zip.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="nlm-offline-") as temp:
+        root = Path(temp)
+        (root / "src").mkdir()
+        for module in ("__init__.py", "data_factory.py", "feature_factory.py", "inference.py"):
+            shutil.copy2(source_root / module, root / "src" / module)
+        if model_name == "svc":
+            shutil.copy2(checkpoint, root / "model.joblib")
+            packaged_checkpoint = "model.joblib"
+        else:
+            shutil.copytree(checkpoint, root / "model")
+            packaged_checkpoint = "model"
+        portable = {"experiment_id": source.get("experiment_id"), "model": model_name,
+            "checkpoint": packaged_checkpoint, "classes": source["classes"],
+            "calibration_temperature": source.get("calibration_temperature", 1.0),
+            "config": source.get("config", {}), "dataset_sha256": source.get("dataset_sha256"),
+            "model_revision": source.get("model_revision"),
+            "submission_schema": ["id", "model"],
+            "requirements": ["numpy", "pandas", "scipy", "scikit-learn", "pyarrow", "joblib"] +
+                (["torch", "transformers", "peft", "safetensors"] if model_name != "svc" else []),
+            "note": "Use with the repository Kaggle notebook and competition internet disabled; verify competition-specific rules separately."}
+        (root / "manifest.json").write_text(json.dumps(portable, indent=2) + "\n")
+        with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_STORED) as archive:
+            for file in sorted(root.rglob("*")):
+                if file.is_file(): archive.write(file, file.relative_to(root))
+    return {"package": str(output_zip), "model": model_name, "checkpoint": packaged_checkpoint,
+            "experiment_id": source.get("experiment_id"), "bytes": output_zip.stat().st_size,
+            "network_required": False, "competition_rules_verified": False}

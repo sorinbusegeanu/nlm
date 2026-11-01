@@ -33,7 +33,7 @@ comparison = []
 for row in records:
     value = metrics(row)
     comparison.append({"Experiment": row["experiment_id"], "Model": row["model"], "Split": row["split"],
-        "Balanced accuracy": value.get("balanced_accuracy"), "Macro F1": value.get("macro_f1"),
+        "Balanced accuracy (raw)": value.get("balanced_accuracy"), "Balanced accuracy (calibrated)": value.get("calibrated_balanced_accuracy"), "Macro F1": value.get("macro_f1"),
         "Log loss": value.get("log_loss"), "Runtime (s)": row.get("runtime_seconds"),
         "Seed": row.get("seed"), "Created": row.get("created_at")})
 frame = pd.DataFrame(comparison)
@@ -59,10 +59,13 @@ with tabs[1]:
     if not options: st.info("No confusion matrices are recorded yet.")
     else:
         chosen = st.selectbox("Experiment", options, format_func=lambda r: f"{r['experiment_id']} · {r['split']}", key="error_exp")
-        data = metrics(chosen); classes = data.get("classes", []); cm = data.get("confusion_matrix", [])
+        data = metrics(chosen); classes = data.get("classes", [])
+        metric_view=st.radio("Prediction view",["Raw scores","Calibrated probabilities"],horizontal=True)
+        calibrated=metric_view=="Calibrated probabilities"
+        cm=data.get("calibrated_confusion_matrix",[]) if calibrated else data.get("confusion_matrix",[])
         st.caption(f"Source split: {chosen['split']} · Experiment ID: {chosen['experiment_id']}")
         st.plotly_chart(px.imshow(cm, x=classes, y=classes, labels={"x":"Predicted class", "y":"Actual class", "color":"Rows"}, aspect="auto"), use_container_width=True)
-        recalls = data.get("per_class_recall", {})
+        recalls = data.get("calibrated_per_class_recall", {}) if calibrated else data.get("per_class_recall", {})
         if recalls: st.plotly_chart(px.bar(pd.DataFrame({"Class": list(recalls), "Recall": list(recalls.values())}), x="Class", y="Recall"), use_container_width=True)
         reports = sorted(Path("artifacts/predictions").glob("ensemble_v0_*_metrics.json"))
         if reports:
