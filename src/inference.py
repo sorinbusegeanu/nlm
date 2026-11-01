@@ -26,10 +26,12 @@ def predict_svc_bundle(bundle, texts):
     return aligned, classes
 
 
-def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max_length=384, temperature=1.0):
+def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max_length=384, temperature=1.0,
+                    base_checkpoint=None, revision=None):
     try:
         import torch
         from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
+        from peft import PeftModel
     except ImportError as exc:
         raise RuntimeError("Offline neural inference requires the project's [neural] dependencies") from exc
     checkpoint = Path(checkpoint)
@@ -38,8 +40,15 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     if model_name == "ultrabert380":
         network = AutoModelForSequenceClassification.from_pretrained(checkpoint, local_files_only=True, trust_remote_code=True)
-    elif model_name == "qwen06":
-        network = AutoModel.from_pretrained(checkpoint / "merged_backbone", local_files_only=True)
+    elif model_name in {"qwen06", "qwen17", "qwen4"}:
+        backbone_path = checkpoint / "merged_backbone"
+        if backbone_path.exists():
+            network = AutoModel.from_pretrained(backbone_path, local_files_only=True)
+        else:
+            if not base_checkpoint:
+                raise ValueError("Qwen adapter inference requires the configured base checkpoint")
+            network = AutoModel.from_pretrained(base_checkpoint, revision=revision, local_files_only=True)
+            network = PeftModel.from_pretrained(network, checkpoint, local_files_only=True)
         classifier = torch.nn.Linear(network.config.hidden_size, len(classes))
         state = torch.load(checkpoint / "classifier.pt", map_location="cpu", weights_only=True)
         classifier.load_state_dict(state)
@@ -56,7 +65,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     with torch.inference_mode():
         for start in range(0, len(texts), batch_size):
             enc=tokenizer(list(texts[start:start+batch_size]),truncation=True,max_length=max_length,padding=True,return_tensors="pt")
-            if model_name == "qwen06": enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
+            if model_name in {"qwen06", "qwen17", "qwen4"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
             enc={k:v.to(device) for k,v in enc.items()}; logits=network(**enc)
             if hasattr(logits,"logits"): logits=logits.logits
             batches.append(torch.softmax(logits.float()/float(temperature),dim=-1).cpu().numpy())
@@ -85,7 +94,8 @@ def export_submission(model, checkpoint, test_path, output_path):
         classes=manifest.get("classes")
         if not classes: raise ValueError("neural final manifest must include canonical classes")
         probabilities, classes=_predict_neural(model,checkpoint,frame.text.tolist(),classes,
-            max_length=manifest.get("config",{}).get("max_length",384),temperature=manifest.get("calibration_temperature",1.0))
+            max_length=manifest.get("config",{}).get("max_length",384),temperature=manifest.get("calibration_temperature",1.0),
+            base_checkpoint=manifest.get("config",{}).get("checkpoint"),revision=manifest.get("model_revision"))
     output = pd.DataFrame({"id": frame.id, "model": np.asarray(classes)[probabilities.argmax(1)]})
     if output.id.astype(str).tolist() != frame.id.astype(str).tolist(): raise RuntimeError("output row order does not match input")
     output_path.parent.mkdir(parents=True, exist_ok=True)

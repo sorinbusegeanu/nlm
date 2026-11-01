@@ -2,6 +2,6 @@ train_path: data/raw/train.csv
 test_path: data/raw/test.csv
 output_dir: data/processed
 seed: 2026
-holdout_fraction: 0.2
-n_splits: 5
+validation_fraction: 0.2
+split_candidates: 1000
 expected_classes: 18
