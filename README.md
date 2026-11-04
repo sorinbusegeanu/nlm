@@ -1,5 +1,19 @@
 # Name That LLM
 
+## Project overview
+
+**Name That LLM** is an experimental classification and evaluation pipeline for identifying which LLM generated a text passage. Its emphasis is **reproducible model comparisons and ensemble ablations**, not a claimed leaderboard result.
+
+- **Data:** Official labelled competition passages with a frozen, prompt-grouped train/validation split.
+- **Models:** TF-IDF/SVC baseline, UltraBERT-380M classifier and LoRA-tuned Qwen; configurations also cover larger Qwen variants and Llama 3.2.
+- **Evaluation:** Aligned per-example predictions, calibrated scores, ensemble weights, class-level errors, runtime and experiment provenance.
+- **Engineering:** Data, feature, model and ensemble factories; versioned artifacts; SQLite experiment registry; Streamlit dashboard; Kaggle packaging/inference workflow.
+- **Status:** Iterative research system with runnable training/evaluation commands and tests. The README does not report a verified competition leaderboard position.
+
+**Start here:** [MVP design](docs/mvp_design.md) · [Implementation plan](docs/mvp_implementation.md) · [Dashboard](dashboard/) · [Model configurations](configs/models/).
+
+
+
 Reproducible experiments for identifying the model that generated a passage. The MVP specification is in [`docs/mvp_design.md`](docs/mvp_design.md) and [`docs/mvp_implementation.md`](docs/mvp_implementation.md).
 
 ## Local setup
