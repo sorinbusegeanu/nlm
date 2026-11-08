@@ -14,6 +14,5 @@ learning_rate_decay: 0.7
 optimizer: adamw_torch
 weight_decay: 0.0
 warmup_ratio: 0.0
-max_length: 384
 local_files_only: true
 checkpoint_selection: highest_validation_accuracy

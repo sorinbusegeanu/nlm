@@ -10,6 +10,7 @@ gpt_traces_path: data/raw/external_candidates/gpt56_sol_luna/data/train.parquet
 output_dir: data/processed
 validation_dataset: v0
 expected_classes: 3
+max_response_chars: 1900
 seed: 2026
 minhash_permutations: 64
 compact_char_similarity: 0.92

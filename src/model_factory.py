@@ -156,6 +156,66 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
 
 
 FROZEN_BACKBONE_MODELS = {"embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b"}
+EMBEDDINGGEMMA2_TASK_PREFIX = "task: classification | query: "
+
+
+def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
+                               task_prefix="", use_processor=False,
+                               trust_remote_code=False, fix_mistral_regex=False,
+                               local_files_only=True, batch_size=256):
+    """Return the uncapped maximum encoded length and reject context overflow."""
+    _force_huggingface_offline()
+    _, tr = _require_neural()
+    load_kwargs = {"local_files_only": local_files_only}
+    if revision is not None:
+        load_kwargs["revision"] = revision
+    if not use_processor and trust_remote_code:
+        load_kwargs["trust_remote_code"] = True
+    if use_processor and model_name == "ministral3_3b" and fix_mistral_regex:
+        load_kwargs["fix_mistral_regex"] = True
+    tokenizer = (tr.AutoProcessor.from_pretrained(checkpoint, **load_kwargs) if use_processor
+                 else tr.AutoTokenizer.from_pretrained(checkpoint, **load_kwargs))
+    config = tr.AutoConfig.from_pretrained(checkpoint, **{
+        key: value for key, value in load_kwargs.items() if key != "fix_mistral_regex"})
+
+    context_fields = ("max_position_embeddings", "n_positions", "max_sequence_length",
+                      "max_seq_len", "max_seq_length", "seq_length")
+    context_limits = []
+    configs = [config]
+    for field in ("text_config", "language_config"):
+        nested = getattr(config, field, None)
+        if nested is not None:
+            configs.append(nested)
+    for item in configs:
+        for field in context_fields:
+            value = getattr(item, field, None)
+            if isinstance(value, int) and 0 < value < 10_000_000:
+                context_limits.append(value)
+    tokenizer_obj = getattr(tokenizer, "tokenizer", tokenizer)
+    tokenizer_limit = getattr(tokenizer_obj, "model_max_length", None)
+    if not context_limits and isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 10_000_000:
+        context_limits.append(tokenizer_limit)
+    if not context_limits:
+        raise ValueError(f"could not determine supported context window for {model_name} ({checkpoint})")
+    context_window = min(context_limits)
+
+    prefix = (EMBEDDINGGEMMA2_TASK_PREFIX if use_processor and model_name == "embeddinggemma2"
+              else "" if use_processor else str(task_prefix or ""))
+    all_texts = [prefix + str(text) for text in texts]
+    maximum = 0
+    for start in range(0, len(all_texts), max(1, int(batch_size))):
+        batch_texts = all_texts[start:start + max(1, int(batch_size))]
+        encoded = (tokenizer(text=batch_texts, truncation=False, padding=False,
+                             add_special_tokens=True)
+                   if use_processor else tokenizer(batch_texts, truncation=False, padding=False,
+                                                   add_special_tokens=True))
+        lengths = [len(ids) for ids in encoded["input_ids"]]
+        if lengths:
+            maximum = max(maximum, max(lengths))
+    if maximum > context_window:
+        raise ValueError(f"{model_name} dataset requires {maximum} tokens (including special tokens and task prefix), "
+                         f"exceeding the model context window of {context_window}")
+    return maximum
 
 
 def _load_frozen_backbone(model_name, checkpoint, revision, *, fix_mistral_regex=False):
@@ -199,7 +259,7 @@ def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *,
         fix_mistral_regex=fix_mistral_regex)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    prefix = "task: classification | query: " if model_name == "embeddinggemma2" else ""
+    prefix = EMBEDDINGGEMMA2_TASK_PREFIX if model_name == "embeddinggemma2" else ""
     prepared = [prefix + str(text) for text in texts]
     outputs = []
     started = time.perf_counter()
@@ -405,12 +465,12 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        epochs=3, batch_size=16, max_length=384, learning_rate=2e-5, seed=2026,
                        gradient_accumulation_steps=1, local_files_only=True, validation_labels=None,
                        resume_checkpoint=None, learning_rate_decay=None,
-                       validate_before_training=False, select_best_checkpoint=False,
+                       select_best_checkpoint=False,
                        optimizer="adamw_torch", weight_decay=0.0, lr_scheduler_type=None,
                        warmup_ratio=0.0, warmup_epochs=None, early_stopping_patience=3,
                        auto_batch_size=False, max_batch_size=1024,
                        batch_probe_safety_fraction=0.95):
-    """Fine-tune an encoder, optionally resuming and recording a pre-train baseline."""
+    """Fine-tune or continue an encoder after recording its validation baseline."""
     _force_huggingface_offline()
     local_files_only = True
     torch, tr = _require_neural()
@@ -466,8 +526,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     live_callback = _live_training_progress_callback(TrainerCallback, out)
     if learning_rate_decay is not None and not 0 < float(learning_rate_decay) <= 1:
         raise ValueError("learning_rate_decay must be in (0, 1]")
-    if validate_before_training and validation_labels is None:
-        raise ValueError("validate_before_training requires validation_labels")
+    if validation_labels is None:
+        raise ValueError("encoder training requires validation_labels for baseline and epoch validation")
     best_dir = out / "best_checkpoint"
     best_state = {"accuracy": -1.0, "epoch": None}
 
@@ -553,20 +613,17 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 chunks.append(output.logits.float().cpu().numpy())
         return np.concatenate(chunks, axis=0) if chunks else np.empty((0, len(classes)))
 
-    baseline_logits = None
-    baseline_metrics = None
-    if validate_before_training:
-        baseline_logits = predict_in_input_order(validation_text)
-        baseline_predictions = np.asarray(classes)[baseline_logits.argmax(axis=1)]
-        from sklearn.metrics import accuracy_score, balanced_accuracy_score, log_loss
-        baseline_metrics = {
-            "accuracy": float(accuracy_score(validation_labels, baseline_predictions)),
-            "balanced_accuracy": float(balanced_accuracy_score(validation_labels, baseline_predictions)),
-            "validation_loss": float(log_loss(validation_labels, softmax(baseline_logits, axis=1), labels=classes)),
-            "checkpoint": str(resume_checkpoint or checkpoint),
-        }
-        (out / "baseline_validation.json").write_text(json.dumps(baseline_metrics, indent=2) + "\n")
-        live_callback.set_baseline(baseline_metrics)
+    baseline_logits = predict_in_input_order(validation_text)
+    baseline_predictions = np.asarray(classes)[baseline_logits.argmax(axis=1)]
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score, log_loss
+    baseline_metrics = {
+        "accuracy": float(accuracy_score(validation_labels, baseline_predictions)),
+        "balanced_accuracy": float(balanced_accuracy_score(validation_labels, baseline_predictions)),
+        "validation_loss": float(log_loss(validation_labels, softmax(baseline_logits, axis=1), labels=classes)),
+        "checkpoint": str(resume_checkpoint or checkpoint),
+    }
+    (out / "baseline_validation.json").write_text(json.dumps(baseline_metrics, indent=2) + "\n")
+    live_callback.set_baseline(baseline_metrics)
     trainer.train()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     (Path(output_dir)/"training_log.json").write_text(json.dumps(trainer.state.log_history, indent=2)+"\n")
@@ -774,7 +831,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          revision, output_dir="artifacts/checkpoints/qwen", epochs=3, batch_size=4,
                          max_length=384, learning_rate=1e-4, seed=2026, gradient_accumulation_steps=1,
                          lora_rank=16, lora_alpha=32,
-                         lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"), save_merged=False,
+                         lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
                          resume_checkpoint=None, validation_labels=None, gradient_checkpointing=False,
                          local_files_only=False, learning_rate_decay=1.0, auto_batch_size=False,
                          max_batch_size=1024, batch_probe_safety_fraction=0.95,
@@ -1043,10 +1100,6 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     inference_seconds = time.perf_counter() - pred_start
     backbone.save_pretrained(out,safe_serialization=True);tokenizer.save_pretrained(out)
     torch.save(model.classifier.state_dict(),out/"classifier.pt")
-    if save_merged:
-        merged = backbone.merge_and_unload()
-        merged.config.use_cache = True
-        merged.save_pretrained(out/"merged_backbone", safe_serialization=True)
     if not np.isfinite(logits).all(): raise ValueError("Qwen adapter produced non-finite scores")
     probs=softmax(logits/temperature,axis=1)
     trainable=sum(p.numel() for p in model.parameters() if p.requires_grad)

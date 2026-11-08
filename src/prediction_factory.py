@@ -619,7 +619,7 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
         "selection_tiebreak": ["higher_group_oof_accuracy", "lower_group_oof_log_loss", "fewer_models", "strategy_name", "candidate_id_order"],
         "forward_steps_path": str(steps_path), "summary_path": str(summary_path),
         "validation_predictions_path": str(row_path),
-        "validation_selection_note": "Group out-of-fold metrics hold out prompt groups during each fold's model selection and weight fitting. Base checkpoint and roster selection may already have used the full validation set, and the previous champion was selected on it; strategy selection among these metrics can also be optimistic. The final full-data fit metrics are exploratory. Only a separate untouched test score is an independent final estimate.",
+        "validation_selection_note": "Group out-of-fold metrics hold out prompt groups during each fold's model selection and weight fitting. Base checkpoint and roster selection may already have used the full validation set, and the previous champion was selected on it; strategy selection among these metrics can also be optimistic. Training-row metrics are descriptive. Only a separate untouched test score is an independent final estimate.",
         "oof_scope_note": "Meta-level cross-fitting only; it does not undo prior checkpoint, roster, or historical champion selection on this validation set.",
     }
     summary_path.write_text(json.dumps({"available_models": len(candidates),

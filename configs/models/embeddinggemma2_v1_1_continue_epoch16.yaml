@@ -20,7 +20,6 @@ weight_decay: 0.0
 lr_scheduler_type: epoch_decay
 warmup_ratio: 0.02
 warmup_epochs: 10
-max_length: 384
 readout_hidden_size: 768
 lora_rank: 16
 lora_alpha: 32

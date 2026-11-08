@@ -107,6 +107,6 @@ python -m src.pipeline models train --model ultrabert380 --dataset v1.5
 
 Run the dashboard with `streamlit run dashboard/app.py`. It reports the source split and experiment sequence; model validation metrics should not be interpreted as an independent final estimate after repeated comparisons.
 
-## Final inference model
+## Kaggle inference from a selected checkpoint
 
-After selecting a recipe, `python -m src.pipeline models fit-final --model <name> --dataset v0` trains that recipe on all labelled rows and writes an inference checkpoint/manifest. This full-data fit is separate from validation scoring and does not create another validation result.
+Training and continuation runs retain their checkpoints and manifests. Compare those runs using their recorded validation metrics, select the desired checkpoint, and use that exact artifact for inference; there is no separate all-rows retraining stage. Pass the selected training or continuation manifest explicitly to `export --checkpoint` and `package-kaggle --manifest`. The export path accepts the manifest's `checkpoint` or `checkpoint_path` field, while the package path preserves support for saved checkpoint formats and prediction bundles.

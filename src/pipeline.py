@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import itertools
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -25,7 +24,7 @@ from .data_factory import (assemble_openpool_mix, assemble_v1_5, build_v1_3_exte
 from .evaluation import (align_predictions, complementarity, evaluate, paired_group_bootstrap)
 from .ensemble_factory import ensemble_probabilities
 from .feature_factory import load_or_fit
-from .model_factory import (FROZEN_BACKBONE_MODELS, train_encoder_fold,
+from .model_factory import (FROZEN_BACKBONE_MODELS, calculate_max_token_length, train_encoder_fold,
                             train_frozen_backbone_fold, train_qwen_lora_fold,
                             train_catboost_stylometry, train_svc)
 from .registry import Registry
@@ -168,7 +167,8 @@ def build_v1_3_external_data(config):
         cfg.get("glm_provenance_path", "data/raw/external_candidates/glm53_flash/data/provenance_r34.parquet"),
         cfg.get("gpt_traces_path", "data/raw/external_candidates/gpt56_sol_luna/data/train.parquet"),
         output_dir, dataset_version=dataset_version,
-        validation_dataset=cfg.get("validation_dataset", "v0"))
+        validation_dataset=cfg.get("validation_dataset", "v0"),
+        max_response_chars=cfg.get("max_response_chars", 1900))
     clean_result = curate_v1_all_clean_compact(
         Path(output_dir) / f"dataset_{dataset_version}.parquet", output_dir,
         dataset_version=dataset_version,
@@ -179,6 +179,7 @@ def build_v1_3_external_data(config):
         compact_char_similarity=cfg.get("compact_char_similarity", 0.92),
         compact_word_similarity=cfg.get("compact_word_similarity", 0.85),
         tfidf_diagnostic_sample=cfg.get("tfidf_diagnostic_sample", 3000))
+    clean_result["source_dataset_profile"] = base_profile
     report_path = Path(cfg.get("report_path", "docs/v1_3_clean_compact.md"))
     display_name = cfg.get("display_name", "V1.3")
     _write_v1_all_clean_compact_report(clean_result, report_path, output_dir,
@@ -198,7 +199,7 @@ def _write_v1_all_clean_compact_report(result, path, data_dir, *,
     clean_label, compact_label = f"{display_name} clean", f"{display_name} compact"
     input_path = f"{data_dir}/dataset_{dataset_version}.parquet"
     lines = [f"# {display_name} Clean and Compact Datasets", "",
-        f"Input: `{input_path}`. Clean removes only explicit defects; compact starts from clean and removes verified same-label near duplicates. Neither pass uses source caps, class quotas, classifier outputs, or validation scores.", "",
+        f"Input: `{input_path}`. The source build may apply its configured response-length limit; clean removes only explicit defects; compact starts from clean and removes verified same-label near duplicates. Neither clean nor compact uses class quotas, classifier outputs, or validation scores.", "",
         "## Dataset overview", "",
         f"| Metric | {display_name} | Clean | Compact |", "|---|---:|---:|---:|"]
     for label, key in [("Total rows", "rows"), ("Unique prompts", "prompt_groups"), ("Unique sources", "unique_sources")]:
@@ -208,6 +209,10 @@ def _write_v1_all_clean_compact_report(result, path, data_dir, *,
         f"| Verified near-duplicate pairs | — | — | {result['verified_near_duplicate_pairs']:,} |",
         f"| Model-label conflict rows removed in Clean | — | {clean_profile['removals_by_reason'].get('conflicting_labels_for_identical_response', 0):,} | — |", "",
         "## Per-model row counts", "", f"| Model | {display_name} | Clean | Compact | Clean retained | Compact retained from Clean |", "|---|---:|---:|---:|---:|---:|"])
+    source_profile = result.get("source_dataset_profile", {})
+    if source_profile.get("max_response_chars") is not None:
+        lines.insert(3, f"Before this table, the data factory removed {source_profile['response_length_filter_removed_rows']:,} source rows with responses longer than {source_profile['max_response_chars']:,} characters; per-label removals: " +
+                     ", ".join(f"`{label}` {count:,}" for label, count in source_profile.get("response_length_filter_removed_by_model", {}).items()) + ".")
     for model in sorted(result["class_counts_before"]):
         a = result["class_counts_before"][model]; b = result["class_counts_clean"][model]; c = result["class_counts_compact"][model]
         lines.append(f"| {model} | {a:,} | {b:,} | {c:,} | {b/max(1,a):.1%} | {c/max(1,b):.1%} |")
@@ -456,15 +461,15 @@ def _model_cfg(model, config_path=None):
     if model == "catboost_stylometry" and (int(cfg.get("iterations", 0)) < 1
             or not 1 <= int(cfg.get("depth", 0)) <= 16 or int(cfg.get("thread_count", 0)) < 1):
         raise ValueError(f"CatBoost config {path} needs positive iterations/thread_count and depth in [1, 16]")
-    if model not in {"svc", "catboost_stylometry"} and (int(cfg.get("epochs", 1)) < 1 or int(cfg.get("batch_size", 1)) < 1 or int(cfg.get("max_length", 1)) < 1):
-        raise ValueError(f"model config {path} needs positive epochs, batch_size, and max_length")
+    if model not in {"svc", "catboost_stylometry"} and (int(cfg.get("epochs", 1)) < 1 or int(cfg.get("batch_size", 1)) < 1):
+        raise ValueError(f"model config {path} needs positive epochs and batch_size")
     if cfg.get("auto_batch_size") and (int(cfg.get("max_batch_size", cfg.get("batch_size", 1))) < 1
             or not 0 < float(cfg.get("batch_probe_safety_fraction", 0.95)) <= 1):
         raise ValueError(f"model config {path} needs max_batch_size >= 1 and batch_probe_safety_fraction in (0, 1]")
     return cfg
 
 
-def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache_dir, *, final=False, cache_fold=None):
+def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache_dir, *, cache_fold=None):
     if model == "svc":
         result = train_svc(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
                            c=cfg.get("C", .5), calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
@@ -490,7 +495,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             learning_rate=cfg.get("learning_rate", .05), l2_leaf_reg=cfg.get("l2_leaf_reg", 5),
             thread_count=cfg.get("thread_count", 8), seed=seed,
             temperature_calibration=cfg.get("temperature_calibration", True),
-            validation_labels=None if final else valid.model.tolist(),
+            validation_labels=valid.model.tolist(),
             early_stopping_rounds=cfg.get("early_stopping_rounds", 100),
             feature_recipe=feature_config.get("stylometry_recipe"),
             feature_matrices=(x_train.toarray(), x_valid.toarray(),
@@ -501,12 +506,11 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_encoder_fold(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
             checkpoint=cfg["checkpoint"], revision=cfg["revision"], output_dir=checkpoint,
-            epochs=cfg.get("epochs", 3), batch_size=cfg.get("batch_size", 16), max_length=cfg.get("max_length", 384),
+            epochs=cfg.get("epochs", 3), batch_size=cfg.get("batch_size", 16), max_length=cfg["max_length"],
             learning_rate=cfg.get("learning_rate", 2e-5), seed=seed,
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
             local_files_only=cfg.get("local_files_only", True),
-            validation_labels=None if final else valid.model.tolist(),
-            validate_before_training=not final,
+            validation_labels=valid.model.tolist(),
             learning_rate_decay=cfg.get("learning_rate_decay"),
             optimizer=cfg.get("optimizer", "adamw_torch"),
             weight_decay=cfg.get("weight_decay", 0.0),
@@ -517,13 +521,13 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             auto_batch_size=cfg.get("auto_batch_size", False),
             max_batch_size=cfg.get("max_batch_size", 1024),
             batch_probe_safety_fraction=cfg.get("batch_probe_safety_fraction", 0.95),
-            select_best_checkpoint=(not final and cfg.get("checkpoint_selection") == "highest_validation_accuracy"))
+            select_best_checkpoint=cfg.get("checkpoint_selection") == "highest_validation_accuracy")
         result["checkpoint"] = str(checkpoint)
     elif model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen":
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_frozen_backbone_fold(model, train.text.tolist(), train.model.tolist(),
             valid.text.tolist(), classes, checkpoint=cfg["checkpoint"], revision=cfg["revision"],
-            output_dir=checkpoint, max_length=cfg.get("max_length", 384),
+            output_dir=checkpoint, max_length=cfg["max_length"],
             batch_size=cfg.get("batch_size", 8), c=cfg.get("C", .5),
             calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
             fix_mistral_regex=cfg.get("fix_mistral_regex", False))
@@ -533,7 +537,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_qwen_lora_fold(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
             checkpoint=cfg["checkpoint"], revision=cfg["revision"], output_dir=checkpoint,
-            epochs=cfg.get("epochs", 3), batch_size=cfg.get("batch_size", 4), max_length=cfg.get("max_length", 384),
+            epochs=cfg.get("epochs", 3), batch_size=cfg.get("batch_size", 4), max_length=cfg["max_length"],
             learning_rate=cfg.get("learning_rate", 1e-4), seed=seed,
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
             lora_rank=cfg.get("lora_rank", 16), lora_alpha=cfg.get("lora_alpha", 32),
@@ -543,7 +547,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             max_batch_size=cfg.get("max_batch_size", 1024),
             batch_probe_safety_fraction=cfg.get("batch_probe_safety_fraction", 0.95),
             resume_checkpoint=cfg.get("resume_checkpoint"),
-            save_merged=final, validation_labels=None if final else valid.model.tolist(),
+            validation_labels=valid.model.tolist(),
             gradient_checkpointing=cfg.get("gradient_checkpointing", False),
             local_files_only=cfg.get("local_files_only", True),
             readout_hidden_size=cfg.get("readout_hidden_size"),
@@ -561,6 +565,18 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
         result["checkpoint"] = str(checkpoint)
     else: raise ValueError(f"unknown model: {model}")
     return result
+
+
+def _dataset_max_length(model, cfg, rows, *, checkpoint=None, revision=None):
+    """Count all training and validation responses with the training tokenizer."""
+    frozen = model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen"
+    return calculate_max_token_length(
+        model, rows.text.astype(str).tolist(), checkpoint=checkpoint or cfg["checkpoint"],
+        revision=revision if revision is not None else cfg.get("revision"),
+        task_prefix=cfg.get("task_prefix", ""), use_processor=frozen,
+        trust_remote_code=cfg.get("trust_remote_code", model == "ultrabert380"),
+        fix_mistral_regex=cfg.get("fix_mistral_regex", False),
+        local_files_only=cfg.get("local_files_only", True))
 
 
 def build_features(dataset="v0", data_dir="data/processed", config_path="configs/features/default.yaml", cache_dir="artifacts/features"):
@@ -587,6 +603,8 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
     if model in {"svc", "catboost_stylometry"} and feature_config_path:
         cfg["features"] = _read_yaml(feature_config_path)
     rows, data_dir = _load_dataset(dataset, data_dir)
+    if model not in {"svc", "catboost_stylometry"}:
+        cfg["max_length"] = _dataset_max_length(model, cfg, rows)
     profile = _effective_profile(data_dir, dataset, rows)
     code_revision = _revision()
     config_snapshot = {k: v for k, v in cfg.items() if not k.startswith("_")}
@@ -674,7 +692,7 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
 
 TRAINING_OVERRIDE_FIELDS = (
     "epochs", "early_stopping_patience", "learning_rate", "learning_rate_decay", "lr_scheduler_type", "warmup_ratio",
-    "optimizer", "weight_decay", "batch_size", "gradient_accumulation_steps", "max_length",
+    "optimizer", "weight_decay", "batch_size", "gradient_accumulation_steps",
     "lora_rank", "lora_alpha", "lora_target_modules", "C", "calibration_cv",
     "iterations", "depth", "l2_leaf_reg", "early_stopping_rounds",
 )
@@ -684,7 +702,7 @@ def _validate_training_overrides(model, cfg):
     for name in ("learning_rate", "weight_decay", "warmup_ratio", "learning_rate_decay"):
         if name in cfg and cfg[name] is not None and float(cfg[name]) < 0:
             raise ValueError(f"{name} must not be negative")
-    for name in ("epochs", "early_stopping_patience", "batch_size", "gradient_accumulation_steps", "max_length", "lora_rank", "lora_alpha"):
+    for name in ("epochs", "early_stopping_patience", "batch_size", "gradient_accumulation_steps", "lora_rank", "lora_alpha"):
         if name in cfg and int(cfg[name]) < 1:
             raise ValueError(f"{name} must be positive")
     if cfg.get("lr_scheduler_type") not in {None, "linear", "cosine", "constant", "epoch_decay"}:
@@ -750,6 +768,7 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
     source_checkpoint = Path(source["checkpoint_path"])
     if not source_checkpoint.is_absolute() and not source_checkpoint.exists(): source_checkpoint = Path(artifact_dir)/source_checkpoint
     if not source_checkpoint.is_dir(): raise FileNotFoundError(f"Qwen continuation checkpoint not found: {source_checkpoint}")
+    cfg["max_length"] = _dataset_max_length("qwen06", cfg, rows)
     if epochs < 1: raise ValueError("additional epochs must be positive")
     cfg["epochs"] = epochs
     snapshot = {k:v for k,v in cfg.items() if not k.startswith("_")}
@@ -766,7 +785,7 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
     checkpoint = run_dir/"checkpoints"/"qwen06_continued"
     result = train_qwen_lora_fold(train.text.tolist(),train.model.tolist(),valid.text.tolist(),
         sorted(rows.model.astype(str).unique()),checkpoint=cfg["checkpoint"],revision=cfg["revision"],
-        output_dir=checkpoint,epochs=epochs,batch_size=cfg.get("batch_size",4),max_length=cfg.get("max_length",384),
+        output_dir=checkpoint,epochs=epochs,batch_size=cfg.get("batch_size",4),max_length=cfg["max_length"],
         learning_rate=cfg.get("learning_rate",1e-4),seed=seed,
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps",1),
         lora_rank=cfg.get("lora_rank",16),lora_alpha=cfg.get("lora_alpha",32),
@@ -878,7 +897,10 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         "max_batch_size": int(source.get("config", {}).get("max_batch_size", 1024)),
         "batch_probe_safety_fraction": float(source.get("config", {}).get("batch_probe_safety_fraction", 0.95)),
         "gradient_accumulation_steps": int(source.get("config", {}).get("gradient_accumulation_steps", 1)),
-        "max_length": int(source.get("config", {}).get("max_length", 384)),
+        "max_length": _dataset_max_length(model, {
+            **cfg, "checkpoint": str(source_checkpoint), "revision": None,
+            "task_prefix": "", "training_mode": "full", "trust_remote_code": True,
+        }, rows, checkpoint=str(source_checkpoint), revision=None),
         "warmup_ratio": float(source.get("config", {}).get("warmup_ratio", 0.0)),
         "lr_scheduler_type": source.get("config", {}).get("lr_scheduler_type", "linear"),
         "baseline_validation_before_training": True,
@@ -909,7 +931,7 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         learning_rate_decay=learning_rate_decay, seed=seed,
         optimizer=optimizer, weight_decay=weight_decay,
         gradient_accumulation_steps=config_snapshot["gradient_accumulation_steps"],
-        validation_labels=valid.model.tolist(), validate_before_training=True,
+        validation_labels=valid.model.tolist(),
         select_best_checkpoint=True, local_files_only=True,
         early_stopping_patience=cfg.get("early_stopping_patience", 3))
     metrics = evaluate(valid.model.astype(str), result["scores"], classes, result["probabilities"])
@@ -1133,48 +1155,6 @@ def evaluate_ensembles(dataset="v0", artifact_dir="artifacts", registry_path="ex
     return report
 
 
-def fit_final(model="svc", dataset="v0", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, seed=2026, config_overrides=None):
-    """Fit selected recipe on all labelled official rows for offline inference."""
-    cfg = _model_cfg(model, config_path)
-    if config_overrides:
-        cfg.update(config_overrides)
-        _validate_training_overrides(model, cfg)
-    rows, data_dir = _load_dataset(dataset, data_dir)
-    profile = _effective_profile(data_dir, dataset, rows)
-    config_snapshot = {k:v for k,v in cfg.items() if not k.startswith("_")}
-    config_hash = _sha(config_snapshot); code_revision = _revision()
-    run_name = f"{model}_{dataset}_final_data{profile['dataset_sha256'][:8]}_cfg{config_hash[:8]}_code{code_revision[:7]}"
-    final_manifest_path = Path(artifact_dir,"checkpoints",f"{run_name}.json")
-    if final_manifest_path.exists(): return json.loads(final_manifest_path.read_text())
-    classes = sorted(rows.model.astype(str).unique()); train = rows.sort_values("id", kind="stable")
-    result = _train_fold(model, train, train, classes, cfg, Path(artifact_dir)/"final_runs"/run_name, seed, "final", Path(artifact_dir)/"features", final=True)
-    path = Path(result["checkpoint"]) if model != "svc" else Path(artifact_dir)/"checkpoints"/"final"/run_name/"model.joblib"
-    if model == "svc":
-        path.parent.mkdir(parents=True,exist_ok=True)
-        joblib.dump({"model": result["model"], "raw_model": result["raw_model"], "features": result["features"], "classes": classes, "config": cfg}, path)
-    # Manifests are consumed by export/package code, which resolves relative
-    # checkpoint paths from the manifest directory. Store that relative path
-    # here so both the versioned manifest and stable alias resolve correctly.
-    checkpoint_for_manifest = os.path.relpath(path, final_manifest_path.parent)
-    manifest = {"experiment_id": run_name, "model": model, "dataset": dataset, "classes": classes, "checkpoint": checkpoint_for_manifest,
-        "checkpoint_id": cfg.get("checkpoint"), "model_revision": cfg.get("revision"), "seed": seed,
-        "trained_rows": len(train), "dataset_sha256": profile["dataset_sha256"], "config_sha256": config_hash,
-        "code_revision": code_revision, "fit_seconds": result["fit_seconds"],
-        "calibration_temperature": result.get("calibration_temperature"),
-        "calibration_method": result.get("calibration_method", "sigmoid train-only CV" if model == "svc" else "train-only scalar temperature"), "config": cfg}
-    path.parent.mkdir(parents=True,exist_ok=True)
-    checkpoints_dir=Path(artifact_dir,"checkpoints");checkpoints_dir.mkdir(parents=True,exist_ok=True)
-    final_manifest_path.write_text(json.dumps(manifest, indent=2, default=str)+"\n")
-    (checkpoints_dir/f"{model}_{dataset}_final.json").write_text(json.dumps(manifest, indent=2, default=str)+"\n")
-    Registry(registry_path).add(run_name, model, "full_train", config_snapshot,
-        {"trained_rows":len(train),"fit_seconds":result["fit_seconds"]},
-        dataset_hash=profile["dataset_sha256"], code_revision=code_revision,
-        config_hash=config_hash, seed=seed, runtime_seconds=result["fit_seconds"],
-        artifact_path=str(final_manifest_path), model_revision=cfg.get("revision"),
-        description=f"Final {model} fit on all labelled {dataset} rows for inference; seed {seed}.")
-    return manifest
-
-
 def restart_mvp(*, models=None, seed=2026, bootstrap_replicates=2000, data_config="configs/data/official_v0.yaml",
                 feature_config="configs/features/default.yaml", registry_path="experiments/registry.sqlite"):
     """Clear generated experiment state and rebuild the complete MVP from raw CSVs."""
@@ -1269,7 +1249,6 @@ def main(argv=None):
     ccs.add_argument("--output",default="docs/checkpoint_comparison.md")
     ccs.add_argument("--bootstrap-replicates",type=int,default=2000)
     ccs.add_argument("--seed",type=int,default=2026)
-    ft=m.add_parser("fit-final");ft.add_argument("--model",choices=MODEL_CONFIGS,default="svc");ft.add_argument("--dataset",default="v0");ft.add_argument("--config");ft.add_argument("--registry",default="experiments/registry.sqlite");ft.add_argument("--accept-config-defaults",action="store_true")
     e=sub.add_parser("ensemble").add_subparsers(dest="action",required=True);q=e.add_parser("evaluate");q.add_argument("--dataset",default="v0");q.add_argument("--artifact-dir",default="artifacts");q.add_argument("--bootstrap-replicates",type=int,default=2000);q.add_argument("--models",nargs="+",choices=ENSEMBLE_MODEL_CHOICES);q.add_argument("--force",action="store_true")
     pred=sub.add_parser("prediction").add_subparsers(dest="action",required=True)
     pe=pred.add_parser("evaluate",help="compare active model champions with equal and train-fitted reliability blends")
@@ -1293,8 +1272,14 @@ def main(argv=None):
     px.add_argument("--bundle",required=True)
     px.add_argument("--test",default="data/raw/test.csv")
     px.add_argument("--output",default="submission.parquet")
-    x=sub.add_parser("export");x.add_argument("--model",choices=MODEL_CONFIGS,default="svc");x.add_argument("--checkpoint",default="artifacts/checkpoints/svc_v0_final.json");x.add_argument("--test",default="data/raw/test.csv");x.add_argument("--output",default="submission.parquet")
-    k=sub.add_parser("package-kaggle");k.add_argument("--manifest",default="artifacts/checkpoints/svc_v0_final.json");k.add_argument("--output",default="artifacts/kaggle/model_package.zip")
+    x=sub.add_parser("export",help="export predictions from an explicitly selected saved checkpoint")
+    x.add_argument("--model",choices=MODEL_CONFIGS,default="svc")
+    x.add_argument("--checkpoint",required=True,
+        help="selected SVC bundle file or training manifest JSON (required for CatBoost/neural models)")
+    x.add_argument("--test",default="data/raw/test.csv");x.add_argument("--output",default="submission.parquet")
+    k=sub.add_parser("package-kaggle",help="package an explicitly selected saved checkpoint manifest for Kaggle")
+    k.add_argument("--manifest",required=True,help="selected checkpoint's training manifest JSON")
+    k.add_argument("--output",default="artifacts/kaggle/model_package.zip")
     analysis = sub.add_parser("analysis").add_subparsers(dest="action", required=True)
     ua = analysis.add_parser("ultrabert-four-checkpoints", help="run grouped OOF fusion analysis for saved UltraBERT checkpoints A-D")
     ua.add_argument("--artifact-dir", default="artifacts/predictions")
@@ -1317,6 +1302,12 @@ def main(argv=None):
     za.add_argument("--minimum-support", type=int, default=10)
     za.add_argument("--prior-alpha", type=float, default=1.0)
     za.add_argument("--prior-beta", type=float, default=1.0)
+    zs = analysis.add_parser("zod01-specialist-discovery", help="rank per-label precision specialists across saved model checkpoints")
+    zs.add_argument("--artifact-dir", default="artifacts/predictions")
+    zs.add_argument("--data-dir", default="data/processed")
+    zs.add_argument("--output-dir", default="artifacts/analysis/zod01_specialist_discovery")
+    zs.add_argument("--report", default="docs/zod01_specialist_discovery.md")
+    zs.add_argument("--minimum-support", type=int, default=10)
     a=parser.parse_args(argv)
     if a.command=="restart": result=restart_mvp(models=a.models,seed=a.seed,bootstrap_replicates=a.bootstrap_replicates)
     elif a.command=="data" and a.action=="prepare": result=prepare_data(a.config)
@@ -1377,6 +1368,10 @@ def main(argv=None):
         result=run_ultrabert_zod01(artifact_dir=a.artifact_dir,data_dir=a.data_dir,
             output_dir=a.output_dir,report_path=a.report,minimum_support=a.minimum_support,
             prior_alpha=a.prior_alpha,prior_beta=a.prior_beta)
+    elif a.command=="analysis" and a.action=="zod01-specialist-discovery":
+        from .zod01_specialist_discovery import run_zod01_specialist_discovery
+        result=run_zod01_specialist_discovery(artifact_dir=a.artifact_dir,data_dir=a.data_dir,
+            output_dir=a.output_dir,report_path=a.report,minimum_support=a.minimum_support)
     elif a.command=="models" and a.action=="continue-qwen":
         cfg = _model_cfg("qwen06", a.config); cfg["epochs"] = a.epochs
         overrides = _confirm_training_config("qwen06", cfg, accept_defaults=a.accept_config_defaults)
@@ -1393,11 +1388,6 @@ def main(argv=None):
             learning_rate_decay=float(overrides.get("learning_rate_decay",a.learning_rate_decay)),seed=a.seed,
             optimizer=overrides.get("optimizer",cfg.get("optimizer","adamw_torch")),
             weight_decay=float(overrides.get("weight_decay",cfg.get("weight_decay",0.0))))
-    elif a.command=="models" and a.action=="fit-final":
-        cfg = _model_cfg(a.model, a.config)
-        overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
-        result=fit_final(a.model,a.dataset,registry_path=a.registry,config_path=a.config,
-                         config_overrides=overrides)
     elif a.command=="ensemble": result=evaluate_ensembles(a.dataset,a.artifact_dir,bootstrap_replicates=a.bootstrap_replicates,model_names=a.models,force=a.force)
     elif a.command=="prediction":
         if a.action=="evaluate":

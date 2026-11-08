@@ -3,6 +3,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import io
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -12,8 +14,8 @@ from src.feature_factory import FoldFeatures, load_or_fit
 from src.ensemble_factory import cross_fitted_weights, fit_weights
 from src.registry import Registry
 from src.model_factory import train_svc
-from src.pipeline import _load_oof, evaluate_ensembles, _model_cfg
-from src.inference import export_svc_submission, package_offline_model
+from src.pipeline import _load_oof, evaluate_ensembles, _model_cfg, main
+from src.inference import export_svc_submission, export_submission, package_offline_model
 import joblib
 from unittest.mock import patch
 
@@ -49,6 +51,22 @@ class DataTests(unittest.TestCase):
                 self.assertEqual(first["split_sha256"],second["split_sha256"])
                 with self.assertRaises(FileExistsError):
                     prepare(source,Path(td)/"out",seed=8,holdout_fraction=.2,n_splits=3,expected_classes=3)
+
+
+class PipelineCliTests(unittest.TestCase):
+    def test_export_and_package_require_explicit_saved_artifacts(self):
+        for args in (["export"], ["package-kaggle"]):
+            with self.subTest(args=args), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    main(list(args))
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_removed_training_action_is_not_advertised(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaises(SystemExit):
+                main(["models", "--help"])
+        self.assertNotIn("fit-final", output.getvalue())
 
 
 class EvaluationTests(unittest.TestCase):
@@ -156,6 +174,12 @@ class FeatureAndModelTests(unittest.TestCase):
             self.assertEqual(result_frame.columns.tolist(),["id","model"])
             self.assertEqual(result_frame.id.tolist(),["002","001"])
             self.assertTrue(set(result_frame.model).issubset({"a","b","c"}))
+            train_manifest=Path(td)/"training_manifest.json"
+            train_manifest.write_text(json.dumps({"model":"svc","checkpoint_path":str(checkpoint),
+                "classes":["a","b","c"],"experiment_id":"selected-training-run"}))
+            manifest_out=Path(td)/"manifest_submission.csv"
+            export_submission("svc",train_manifest,test,manifest_out)
+            self.assertEqual(pd.read_csv(manifest_out,dtype={"id":"string"}).id.tolist(),["002","001"])
             manifest=Path(td)/"manifest.json"
             manifest.write_text(json.dumps({"model":"svc","checkpoint":str(checkpoint),"classes":["a","b","c"],"experiment_id":"test"}))
             package=Path(td)/"model_package.zip"

@@ -40,8 +40,9 @@ each validation epoch, the trainer compares ordinary validation accuracy with
 the best seen so far; ties count as no improvement. It stops after three
 consecutive non-improving validation epochs and retains the best-accuracy
 checkpoint. SVC is a single fit with no epoch loop. CatBoost keeps its separate
-`early_stopping_rounds` setting, measured in boosting iterations. Final fits
-without validation labels cannot use validation-accuracy early stopping.
+`early_stopping_rounds` setting, measured in boosting iterations. Training and
+continuation runs use their validation split for checkpoint selection; preserve
+the selected checkpoint and its manifest for inference.
 
 ## Why the settings differ from upstream recipes
 

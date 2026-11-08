@@ -50,7 +50,7 @@ Frozen official corpus V0 + frozen prompt-group assignments
                         |
                [One-shot holdout]
                         |
-             [Final training + Kaggle packager]
+             [Select saved checkpoint + Kaggle packager]
 ```
 
 The existing CLI, SQLite registry, Parquet OOF predictions, Streamlit dashboard and Kaggle offline exporter remain the foundation. Introduce generic model-adapter registration rather than separate hard-coded branches for every new model.

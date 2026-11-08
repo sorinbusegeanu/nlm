@@ -154,8 +154,15 @@ def export_submission(model, checkpoint, test_path, output_path):
     if checkpoint.suffix.lower() == ".json":
         manifest = json.loads(checkpoint.read_text())
         manifest_dir = checkpoint.parent
-        checkpoint = Path(manifest["checkpoint"])
-        if not checkpoint.is_absolute(): checkpoint = manifest_dir / checkpoint
+        checkpoint_key = "checkpoint" if manifest.get("checkpoint") else "checkpoint_path"
+        checkpoint_value = manifest.get(checkpoint_key)
+        if not checkpoint_value:
+            raise ValueError("checkpoint manifest needs a checkpoint or checkpoint_path")
+        checkpoint = Path(checkpoint_value)
+        if not checkpoint.is_absolute():
+            project_root = Path(__file__).resolve().parents[1]
+            checkpoint = (manifest_dir / checkpoint if checkpoint_key == "checkpoint"
+                          else project_root / checkpoint)
     frame = pd.read_csv(test_path, dtype={"id": "string"})
     missing = REQUIRED_TEST - set(frame.columns)
     if missing: raise ValueError(f"test input is missing columns: {sorted(missing)}")
@@ -526,7 +533,7 @@ def export_prediction_submission(probability_by_candidate, classes, trust_rows, 
 
 
 def package_offline_model(manifest_path, output_zip):
-    """Package a final or validation experiment model for offline inference."""
+    """Package a saved training or continuation checkpoint for offline inference."""
     manifest_path, output_zip = Path(manifest_path), Path(output_zip)
     source = json.loads(manifest_path.read_text())
     model_name = source["model"]

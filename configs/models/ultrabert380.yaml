@@ -12,6 +12,5 @@ optimizer: adamw_torch
 weight_decay: 0.0
 lr_scheduler_type: linear
 warmup_ratio: 0.0
-max_length: 384
 local_files_only: true
 batch_probe_safety_fraction: 0.95

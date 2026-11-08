@@ -231,7 +231,8 @@ def _stable_prompt_id(prompt: str, fallback: str) -> str:
 def build_v1_3_external_dataset(glm_files: list[str | Path],
                                 glm_provenance_path: str | Path, gpt_traces_path: str | Path,
                                 output_dir: str | Path, *, dataset_version: str = "v1.3",
-                                validation_dataset: str = "v0") -> dict:
+                                validation_dataset: str = "v0",
+                                max_response_chars: int | None = None) -> dict:
     """Build V1.3 from only the downloaded GLM-5.3-Flash and GPT-5.6 Sol/Luna rows.
 
     The source files are normalized into the training row schema, with row-level
@@ -241,6 +242,8 @@ def build_v1_3_external_dataset(glm_files: list[str | Path],
     """
     if validation_dataset != "v0":
         raise ValueError("V1.3 currently reuses the frozen V0 validation set")
+    if max_response_chars is not None and max_response_chars < 1:
+        raise ValueError("max_response_chars must be positive when set")
     output_dir = Path(output_dir)
     glm_files = [Path(path) for path in glm_files]
     glm_provenance_path, gpt_traces_path = Path(glm_provenance_path), Path(gpt_traces_path)
@@ -367,6 +370,18 @@ def build_v1_3_external_dataset(glm_files: list[str | Path],
             "glm-5.3-flash", "gpt-5.6-sol", "gpt-5.6-luna"}:
         raise ValueError("external source labels did not include the expected GLM Flash, GPT Sol, and GPT Luna classes")
     labels = set(external.model.dropna().astype(str).unique())
+    rows_before_length_filter = len(external)
+    length_filter_audit = pd.DataFrame()
+    if max_response_chars is not None:
+        response_lengths = external.text.fillna("").astype(str).str.len()
+        too_long = response_lengths.gt(max_response_chars)
+        audit_columns = [column for column in (
+            "id", "model", "source_dataset", "source_file", "source_row_id", "prompt_id")
+            if column in external]
+        length_filter_audit = external.loc[too_long, audit_columns].copy()
+        length_filter_audit["response_chars"] = response_lengths.loc[too_long].to_numpy()
+        length_filter_audit["max_response_chars"] = max_response_chars
+        external = external.loc[~too_long].reset_index(drop=True)
 
     validation_profile_path = output_dir / "dataset_profile.json"
     validation_split_path = output_dir / "splits_v0.parquet"
@@ -399,6 +414,8 @@ def build_v1_3_external_dataset(glm_files: list[str | Path],
 
     output_path = output_dir / f"dataset_{dataset_version}.parquet"
     profile_path = output_dir / f"dataset_profile_{dataset_version}.json"
+    length_audit_path = (output_dir / f"{dataset_version}_over_{max_response_chars}_chars_removals.csv"
+                         if max_response_chars is not None else None)
     if output_path.exists() or profile_path.exists():
         if not (output_path.is_file() and profile_path.is_file()):
             raise FileExistsError(f"partial {dataset_version} artifacts exist; refusing to overwrite")
@@ -407,6 +424,7 @@ def build_v1_3_external_dataset(glm_files: list[str | Path],
         if (old_profile.get("dataset_sha256") == hashlib.sha256(
                 old_data.to_csv(index=False, lineterminator="\n").encode("utf-8")).hexdigest()
                 and old_profile.get("source_hashes") == {str(path): _hash_file(path) for path in required_files}
+                and old_profile.get("max_response_chars") == max_response_chars
                 and old_profile.get("validation_split_sha256") == validation_profile.get("split_sha256")):
             return old_profile
         raise FileExistsError(f"{dataset_version} artifacts exist for different source data; choose a new version")
@@ -414,6 +432,8 @@ def build_v1_3_external_dataset(glm_files: list[str | Path],
     combined = combined.sort_values("id", kind="stable").reset_index(drop=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(output_path, index=False)
+    if length_audit_path is not None:
+        length_filter_audit.to_csv(length_audit_path, index=False, lineterminator="\n")
     source_hashes = {str(path): _hash_file(path) for path in required_files}
     dataset_hash = hashlib.sha256(combined.to_csv(index=False, lineterminator="\n").encode("utf-8")).hexdigest()
     profile = {
@@ -426,6 +446,12 @@ def build_v1_3_external_dataset(glm_files: list[str | Path],
         "external_added_rows": int(len(external)),
         "external_added_rows_by_model": {str(k): int(v) for k, v in external.model.value_counts().sort_index().items()},
         "external_input_rows": {"glm53_flash": int(glm_input_rows), "gpt56_sol_luna": int(len(gpt))},
+        "rows_before_response_length_filter": int(rows_before_length_filter),
+        "max_response_chars": max_response_chars,
+        "response_length_filter_removed_rows": int(len(length_filter_audit)),
+        "response_length_filter_removed_by_model": ({str(k): int(v) for k, v in
+            length_filter_audit.model.value_counts().sort_index().items()} if len(length_filter_audit) else {}),
+        "response_length_filter_audit_path": str(length_audit_path) if length_audit_path else None,
         "gpt_trace_parse_errors": int(parse_errors),
         "validation_prompt_overlap_rows_removed": overlap_count,
         "source_hashes": source_hashes,

@@ -70,18 +70,18 @@ The split is grouped on `prompt_id` and selected from deterministic candidates t
 
 LoRA configs enable a pre-training CUDA batch-size probe. The factory tries actual forward/backward batches, selects the largest size that fits within the configured GPU-memory safety fraction, and uses it for both training and validation. `max_batch_size` is the per-device ceiling; `batch_size` remains the fallback when auto probing is disabled or CUDA is unavailable. The chosen size, attempted sizes, and measured memory are recorded in the experiment manifest.
 
-Export generic offline predictions using the observed `test.csv` schema (`id,text`) and `id,model` output:
+Export generic offline predictions using the observed `test.csv` schema (`id,text`) and `id,model` output. Select a checkpoint from a completed training or continuation run, then pass its checkpoint path or manifest explicitly. For example, use the path to the selected SVC training manifest:
 
 ```bash
-python -m src.pipeline export --model svc --checkpoint artifacts/checkpoints/svc_v0_final.json --test data/raw/test.csv --output submission.parquet
+python -m src.pipeline export --model svc --checkpoint /path/to/selected_svc_manifest.json --test data/raw/test.csv --output submission.parquet
 ```
 
-For neural exports, pass the final manifest JSON as `--checkpoint` and choose the matching model. Neural inference loads local model files only. Competition-specific schema, internet-off Kaggle packaging, and runtime limits must be checked against competition rules before submission.
+For CatBoost and neural exports, pass the selected training or continuation manifest JSON as `--checkpoint` and choose the matching model; those manifests provide the class order and calibration metadata. SVC also accepts its saved `.joblib` bundle directly. The exporter accepts manifests containing either `checkpoint` or `checkpoint_path`. Neural inference loads local model files only. Competition-specific schema, internet-off Kaggle packaging, and runtime limits must be checked against competition rules before submission.
 
-Build a portable model/code bundle for the included generic Kaggle notebook:
+Build a portable model/code bundle for the included generic Kaggle notebook from that same selected checkpoint manifest:
 
 ```bash
-python -m src.pipeline package-kaggle --manifest artifacts/checkpoints/svc_v0_final.json --output artifacts/kaggle/model_package.zip
+python -m src.pipeline package-kaggle --manifest /path/to/selected_model_manifest.json --output artifacts/kaggle/model_package.zip
 ```
 
 Attach `model_package.zip` and the competition input data as Kaggle input datasets. Open [`notebooks/kaggle_inference.ipynb`](notebooks/kaggle_inference.ipynb), update its input paths, and disable Internet in Kaggle notebook settings. The notebook writes `submission.parquet` using the observed `id,model` schema. Verify the actual competition schema, filenames, memory, and runtime limits before submitting.
