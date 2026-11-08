@@ -110,19 +110,23 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
                                 evaluate_if_unchanged=True, registry_path="docs/ensembles.md",
                                 roster_path="artifacts/predictions/active_model_roster.json"):
     """Update one checkpoint per model, evaluate the pool, and append a version on change."""
-    from .prediction_factory import (_align_candidates, _read_candidates,
+    from .prediction_factory import (_align_candidates, _read_candidates, _reference_candidate,
                                      evaluate_prediction_strategies)
 
     artifact_dir = Path(artifact_dir)
     predictions_dir = artifact_dir / "predictions"
-    all_candidates, read_problems = _read_candidates(predictions_dir)
+    all_candidates, read_problems = _read_candidates(predictions_dir, deduplicate=False)
     if read_problems:
         # Ignore malformed unrelated history, but do not hide missing candidates from the active pool.
         read_problems = [item for item in read_problems if "invalid probabilities" in item]
     if not all_candidates:
         raise FileNotFoundError(f"no readable validation prediction manifests in {predictions_dir}")
+    active = read_active_roster(roster_path)
+    preferred_ids = [item["candidate_id"] for item in active["candidates"]] if active else []
+    reference = _reference_candidate(all_candidates, reference_dataset, preferred_ids)
+    all_candidates.sort(key=lambda item: (item["candidate_id"] != reference["candidate_id"], item["candidate_id"]))
     _, _, _, aligned, excluded, _ = _align_candidates(
-        all_candidates, reference_dataset=reference_dataset)
+        all_candidates, reference_dataset=reference_dataset, reference_frame=reference["frame"])
     if excluded and completed_manifest:
         completed_id = json.loads(Path(completed_manifest).read_text()).get("experiment_id")
         excluded_ids = {item["candidate_id"] for item in excluded}
@@ -137,7 +141,6 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
                 prior["validation_score"], prior["candidate_id"]):
             best_by_model[key] = candidate
 
-    active = read_active_roster(roster_path)
     if active is None:
         active_candidates = {model: candidate for model, candidate in best_by_model.items()}
     else:
@@ -166,9 +169,6 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
         "last_prediction_experiment_id": active.get("last_prediction_experiment_id") if active else None,
         "last_recorded_roster_hash": active.get("last_recorded_roster_hash") if active else None,
     }
-    if changed:
-        write_active_roster(roster, roster_path)
-
     latest_registry = read_ensemble_registry(registry_path)
     latest_entries = latest_registry["ensembles"]
     last_hash = latest_registry.get("last_recorded_active_roster_hash")
@@ -185,8 +185,23 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
         data_dir=data_dir,
         previous_champion=latest_entries[-1] if latest_entries else None)
     roster["last_prediction_experiment_id"] = report["experiment_id"]
-    candidate_by_id = {item["candidate_id"]: item for item in candidate_records}
+    candidate_by_id = {item["candidate_id"]: _candidate_record(item) for item in aligned}
+    if latest_entries:
+        previous = latest_entries[-1]
+        old_members = [str(item.get("candidate_id") if isinstance(item, dict) else item)
+                       for item in previous.get("selected_members", [])]
+        old_rule = previous.get("selected_strategy", "equal_probability_blend")
+        if old_rule == "previous_champion":
+            old_rule = "equal_probability_blend"
+        old_weights = previous.get("selected_weights") or {}
+        if old_rule == "equal_probability_blend" and old_members:
+            old_weights = {item: 1.0 / len(old_members) for item in old_members}
+        if (old_rule != report["selected_strategy"] or old_members != report["selected_members"]
+                or old_weights != report["selected_weights"]):
+            record_needed = True
 
+    registry_file = Path(registry_path)
+    previous_registry = registry_file.read_text(encoding="utf-8") if registry_file.exists() else None
     if record_needed:
         next_number = 1 + max((int(str(item.get("version", "v0")).lstrip("v"))
                                for item in latest_entries), default=0)
@@ -205,6 +220,8 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
             "selected_members": selected,
             "predicted_balanced_accuracy": float(report["selected_validation_balanced_accuracy"]),
             "validation_accuracy": float(report["selected_validation_accuracy"]),
+            "validation_metric_scope": report["selected_validation_metric_scope"],
+            "full_data_metrics_exploratory": report["selected_full_data_exploratory_metrics"],
             "group_oof_metrics": report["strategy_metrics"],
             "selected_weights": report["selected_weights"],
             "individual_accuracy": report["individual_accuracy"],
@@ -232,32 +249,16 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
         roster["last_recorded_roster_hash"] = roster_hash
     elif latest_entries:
         roster["last_recorded_roster_hash"] = last_hash or roster_hash
-        latest = latest_entries[-1]
-        if (latest.get("candidate_roster_hash") == roster_hash and
-                latest.get("optimizer_protocol", optimizer_protocol) == optimizer_protocol):
-            latest.update({
-                "selected_strategy": report["selected_strategy"],
-                "selected_comparison": report.get("selected_comparison", report["selected_strategy"]),
-                "selected_members": [candidate_by_id[item] for item in report["selected_members"]],
-                "predicted_balanced_accuracy": float(report["selected_validation_balanced_accuracy"]),
-                "validation_accuracy": float(report["selected_validation_accuracy"]),
-                "group_oof_metrics": report["strategy_metrics"],
-                "selected_weights": report["selected_weights"],
-                "individual_accuracy": report["individual_accuracy"],
-                "forward_selection_steps": [{key: step[key] for key in
-                    ("step", "added_candidate_id", "accuracy", "log_loss")}
-                    for step in report["selection_steps"]],
-                "optimization_summary": report["summary_path"],
-                "forward_steps_artifact": report["forward_steps_path"],
-                "prediction_experiment_id": report["experiment_id"],
-                "prediction_manifest": report["manifest_path"],
-                "optimizer_protocol": optimizer_protocol,
-            })
-            metadata = {key: value for key, value in latest_registry.items() if key != "ensembles"}
-            metadata["optimizer_protocol"] = optimizer_protocol
-            write_ensemble_registry(latest_entries, registry_path, metadata=metadata)
 
-    write_active_roster(roster, roster_path)
+    try:
+        write_active_roster(roster, roster_path)
+    except Exception:
+        if record_needed:
+            if previous_registry is None:
+                registry_file.unlink(missing_ok=True)
+            else:
+                _atomic_write(registry_file, previous_registry)
+        raise
     return {"status": "recorded" if record_needed else "evaluated",
             "roster_changed": changed, "candidate_count": len(candidate_records),
             "ensemble_version": latest_entries[-1]["version"] if record_needed else None,

@@ -437,7 +437,8 @@ def package_prediction_bundle(selection_manifest, output_zip, *, include_base_mo
             "selected_strategy": strategy, "selected_members": report["selected_members"],
             "selected_weights": report.get("selected_weights", {}),
             "required_candidates": required, "candidate_models": candidates,
-            "trust_table": trust_rows, "minimum_support": report["reliability_rule"]["minimum_support"],
+            "trust_table": trust_rows, "minimum_support": (report["reliability_rule"]["minimum_support"]
+                                                       if strategy == "per_response_reliability" else None),
             "fallback_candidate": fallback_candidate,
             "validation_accuracy": report["selected_validation_accuracy"],
             "validation_balanced_accuracy": report["selected_validation_balanced_accuracy"],

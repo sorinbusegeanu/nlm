@@ -31,6 +31,8 @@ The factory loads saved validation probabilities and does not load model checkpo
 
 After selection, it compares an equal-weight blend and a nonnegative weighted blend. Weight fitting reuses `fit_weights()`: multiclass log loss is minimized with weights summing to one and L2 regularization toward equal weights. The previous champion is evaluated as a fixed comparison.
 
+Champion comparison supports saved equal and optimized-weight blends, including checkpoints no longer in the active roster. A reliability champion is rejected explicitly during optimization; existing reliability bundles remain supported for inference. The selected validation accuracy in newly generated reports is the prompt-group out-of-fold score; the separately recorded full-data score is exploratory.
+
 Selection and weight fitting are evaluated using five prompt-group folds over saved validation probabilities. Each fold holds out complete prompt groups from both selection and weight fitting. Ordinary accuracy is the primary metric; log loss and ensemble size break ties. The selected final weights are then fitted on all available validation rows for inference. Full-data scores are recorded as exploratory; the grouped out-of-fold scores are the development estimate. The saved checkpoints and active roster may themselves have been selected using this validation set, so these folds do not make the entire comparison independent. Only an untouched competition test score is an independent final estimate.
 
 The existing per-response reliability implementation remains available to read historical manifests and prediction bundles, but new optimization runs do not generate in-sample training predictions or select that strategy.

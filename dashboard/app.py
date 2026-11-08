@@ -362,20 +362,26 @@ def render_prediction_factory():
             report = json.loads(report_path.read_text())
             metrics = report.get("strategy_metrics", {})
             summary = st.columns(4)
-            summary[0].metric("Predicted balanced accuracy",
+            grouped = report.get("selected_validation_metric_scope") == "prompt_group_out_of_fold"
+            summary[0].metric("Group OOF balanced accuracy" if grouped else "Predicted balanced accuracy",
                               f"{float(report.get('selected_validation_balanced_accuracy', 0)):.4f}")
-            summary[1].metric("Validation accuracy",
+            summary[1].metric("Group OOF accuracy" if grouped else "Validation accuracy",
                               f"{float(report.get('selected_validation_accuracy', 0)):.4f}")
             summary[2].metric("Candidate checkpoints", report.get("candidate_count", "—"))
             summary[3].metric("Validation rows", report.get("validation_rows", "—"))
             st.caption(f"Run: {report.get('experiment_id', report_path.stem)} · "
                        f"Selected strategy: {report.get('selected_strategy', '—')}")
+            if grouped:
+                st.caption("Group OOF scores evaluate the selection procedure. Fold members can differ from the final full-data ensemble; earlier checkpoint and champion selection may have used these validation rows.")
 
             candidate_by_id = {item.get("candidate_id"): item
                                for item in report.get("candidates", [])}
             strategy_rows = []
             for name, value in metrics.items():
-                member_ids = value.get("members", [])
+                member_ids = value.get("members")
+                if member_ids is None:
+                    member_ids = (report.get("previous_champion_candidate_ids", []) if name == "previous_champion"
+                                  else report.get("forward_selected_candidate_ids", []))
                 member_names = []
                 for candidate_id in member_ids:
                     item = candidate_by_id.get(candidate_id, {})
@@ -388,7 +394,7 @@ def render_prediction_factory():
                     "Accuracy": value.get("accuracy"),
                     "Balanced accuracy": value.get("balanced_accuracy"),
                     "Log loss": value.get("log_loss"),
-                    "Members": "; ".join(member_names),
+                    "Full-data members": "; ".join(member_names),
                 })
             if strategy_rows:
                 st.markdown("**Strategy comparison**")

@@ -27,7 +27,7 @@ def _resolve_artifact_path(value, root):
     return root / "artifacts" / path
 
 
-def _read_candidates(artifact_dir, *, min_validation_rows=1, candidate_ids=None):
+def _read_candidates(artifact_dir, *, min_validation_rows=1, candidate_ids=None, deduplicate=True):
     """Read validation runs, optionally restricting to an explicit champion roster."""
     artifact_dir = Path(artifact_dir)
     root = Path.cwd()
@@ -86,7 +86,7 @@ def _read_candidates(artifact_dir, *, min_validation_rows=1, candidate_ids=None)
             candidate_id = str(manifest.get("experiment_id", manifest_path.stem.removesuffix("_manifest")))
             if candidate_ids is not None and candidate_id not in candidate_ids:
                 continue
-            key = (model, dataset_version)
+            key = (model, dataset_version) if deduplicate and candidate_ids is None else candidate_id
             candidate = {
                 "candidate_id": candidate_id,
                 "model": model,
@@ -107,12 +107,26 @@ def _read_candidates(artifact_dir, *, min_validation_rows=1, candidate_ids=None)
     return sorted(by_key.values(), key=lambda item: (item["model"], item["dataset"], item["candidate_id"])), problems
 
 
+def _reference_candidate(candidates, reference_dataset="v0", preferred_ids=None):
+    preferred = set(preferred_ids or [])
+    pool = [item for item in candidates if item["candidate_id"] in preferred]
+    if pool:
+        return next((item for item in pool if item["dataset"] == reference_dataset), pool[0])
+    pool = [item for item in candidates if item["dataset"] == reference_dataset] or candidates
+    if not pool:
+        raise ValueError("no usable validation model predictions found")
+    signatures = [_sha({"classes": item["classes"],
+                        "rows": item["frame"][["id", "prompt_id", "y_true"]].values.tolist()})
+                  for item in pool]
+    counts = {key: signatures.count(key) for key in set(signatures)}
+    best = min(range(len(pool)), key=lambda index: (-counts[signatures[index]], pool[index]["candidate_id"]))
+    return pool[best]
+
+
 def _align_candidates(candidates, *, reference_dataset="v0", reference_frame=None):
     if not candidates:
         raise ValueError("no usable validation model predictions found")
     classes = candidates[0]["classes"]
-    if any(candidate["classes"] != classes for candidate in candidates):
-        raise ValueError("candidate model classes do not share one canonical class order")
     references = [item for item in candidates if item["dataset"] == reference_dataset]
     if reference_frame is not None:
         reference = reference_frame
@@ -128,12 +142,18 @@ def _align_candidates(candidates, *, reference_dataset="v0", reference_frame=Non
     excluded = []
     for candidate in candidates:
         frame = candidate["frame"]
+        if candidate["classes"] != classes:
+            excluded.append({"candidate_id": candidate["candidate_id"], "reason": "validation classes differ from frozen reference"})
+            continue
         if set(frame.id) != reference_set:
             excluded.append({"candidate_id": candidate["candidate_id"], "reason": "validation IDs differ from frozen reference"})
             continue
         frame = frame.set_index("id").loc[reference_ids].reset_index()
         if not np.array_equal(frame.y_true.astype(str).to_numpy(), y):
             excluded.append({"candidate_id": candidate["candidate_id"], "reason": "validation labels differ from frozen reference"})
+            continue
+        if not np.array_equal(frame.prompt_id.astype(str).to_numpy(), groups):
+            excluded.append({"candidate_id": candidate["candidate_id"], "reason": "validation prompt groups differ from frozen reference"})
             continue
         order = frame.id.map({value: index for index, value in enumerate(candidate["frame"].id)}).to_numpy(dtype=int)
         aligned_candidate = dict(candidate)
@@ -271,16 +291,18 @@ def _weighted_probabilities(candidates, weights):
                      np.stack([item["probabilities"] for item in candidates]))
 
 
-def _grouped_strategy_comparison(candidates, y_true, groups, classes, champion_ids=None,
+def _grouped_strategy_comparison(candidates, y_true, groups, classes, champion_probabilities=None,
                                  *, folds=5, l2=.05):
     """Out-of-fold evaluation of selection and weight fitting, grouped by prompt."""
     unique_groups = np.unique(np.asarray(groups, dtype=str))
     n_splits = min(int(folds), len(unique_groups))
     if n_splits < 2:
         raise ValueError("at least two prompt groups are required for grouped comparison")
-    outputs = {"previous_champion": np.zeros((len(y_true), len(classes)), dtype=float),
-               "equal_probability_blend": np.zeros((len(y_true), len(classes)), dtype=float),
-               "optimized_probability_blend": np.zeros((len(y_true), len(classes)), dtype=float)}
+    outputs = {"equal_probability_blend": np.zeros((len(y_true), len(classes)), dtype=float),
+               "optimized_probability_blend": np.zeros((len(y_true), len(classes)), dtype=float),
+               "all_candidate_weighted_blend": np.zeros((len(y_true), len(classes)), dtype=float)}
+    if champion_probabilities is not None:
+        outputs["previous_champion"] = np.asarray(champion_probabilities).copy()
     fold_records = []
     splitter = GroupKFold(n_splits=n_splits)
     for fold_index, (train_idx, valid_idx) in enumerate(splitter.split(np.zeros(len(y_true)), y_true, groups), 1):
@@ -295,16 +317,16 @@ def _grouped_strategy_comparison(candidates, y_true, groups, classes, champion_i
                               y_true[train_idx], classes, l2=l2)
         weighted = np.einsum("m,mnc->nc", weights,
                              np.stack([item["probabilities"][valid_idx] for item in selected_valid]))
-        champion = [lookup[item] for item in (champion_ids or []) if item in lookup]
-        if champion:
-            champion_probs = np.mean(np.stack([item["probabilities"][valid_idx] for item in champion]), axis=0)
-        else:
-            champion_probs = equal
-        outputs["previous_champion"][valid_idx] = champion_probs
+        all_weights = fit_weights([item["probabilities"] for item in fold_candidates],
+                                  y_true[train_idx], classes, l2=l2)
+        all_candidate_weighted = np.einsum("m,mnc->nc", all_weights,
+            np.stack([item["probabilities"][valid_idx] for item in candidates]))
         outputs["equal_probability_blend"][valid_idx] = equal
         outputs["optimized_probability_blend"][valid_idx] = weighted
+        outputs["all_candidate_weighted_blend"][valid_idx] = all_candidate_weighted
         fold_records.append({"fold": fold_index, "held_out_prompt_groups": int(len(set(np.asarray(groups)[valid_idx]))),
-            "selected_candidate_ids": selected_ids, "optimized_weights": dict(zip(selected_ids, weights.tolist()))})
+            "selected_candidate_ids": selected_ids, "optimized_weights": dict(zip(selected_ids, weights.tolist())),
+            "all_candidate_weights": dict(zip([item["candidate_id"] for item in candidates], all_weights.tolist()))})
     metrics = {name: _probability_metrics(probabilities, y_true, classes)
                for name, probabilities in outputs.items()}
     return metrics, outputs, fold_records
@@ -408,9 +430,9 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
     """Select a compact equal or weighted blend from saved validation probabilities."""
     artifact_dir = Path(artifact_dir)
     output_dir = Path(output_dir) if output_dir else artifact_dir / "predictions"
-    all_candidates, read_problems = _read_candidates(artifact_dir / "predictions")
-    references = [item for item in all_candidates if item["dataset"] == reference_dataset]
-    reference_frame = references[0]["frame"] if references else None
+    all_candidates, read_problems = _read_candidates(artifact_dir / "predictions", deduplicate=False)
+    reference = _reference_candidate(all_candidates, reference_dataset, candidate_ids)
+    reference_frame = reference["frame"]
     if candidate_ids is None:
         candidates = all_candidates
     else:
@@ -419,35 +441,72 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
         missing_ids = requested_ids - {item["candidate_id"] for item in candidates}
         if missing_ids:
             raise FileNotFoundError(f"active candidate manifests or predictions are missing: {sorted(missing_ids)}")
+    candidates.sort(key=lambda item: (item["candidate_id"] != reference["candidate_id"], item["candidate_id"]))
     classes, y_true, groups, candidates, excluded, reference_ids = _align_candidates(
         candidates, reference_dataset=reference_dataset, reference_frame=reference_frame)
+    if candidate_ids is not None and excluded:
+        raise ValueError(f"active candidates do not align to the frozen validation set: {excluded}")
     selected, equal_probabilities, selection_steps, individual_scores = _forward_select(candidates, y_true, classes)
     selected_ids = [item["candidate_id"] for item in selected]
     selected_weights = fit_weights([item["probabilities"] for item in selected], y_true, classes, l2=weight_l2)
     weighted_probabilities = _weighted_probabilities(selected, selected_weights)
+    all_candidate_weights = fit_weights([item["probabilities"] for item in candidates], y_true, classes, l2=weight_l2)
+    all_candidate_probabilities = _weighted_probabilities(candidates, all_candidate_weights)
     champion = previous_champion or {}
-    champion_ids = list(champion.get("selected_candidate_ids") or [
-        item.get("candidate_id") for item in champion.get("selected_members", [])
-        if isinstance(item, dict)])
-    candidate_by_id = {item["candidate_id"]: item for item in candidates}
+    champion_ids = [str(item.get("candidate_id") if isinstance(item, dict) else item)
+                    for item in champion.get("selected_members", [])]
+    if not champion_ids:
+        champion_ids = list(champion.get("selected_candidate_ids") or [])
+    historical = []
+    if champion_ids:
+        _, _, _, historical, historic_excluded, _ = _align_candidates(
+            [item for item in all_candidates if item["candidate_id"] in champion_ids],
+            reference_frame=candidates[0]["frame"])
+        if historic_excluded:
+            raise ValueError(f"previous champion does not align: {historic_excluded}")
+    candidate_by_id = {item["candidate_id"]: item for item in historical}
     champion_members = [candidate_by_id[item] for item in champion_ids if item in candidate_by_id]
     if champion_ids and len(champion_members) != len(champion_ids):
         missing = sorted(set(champion_ids) - set(candidate_by_id))
         raise ValueError(f"previous champion candidates are unavailable for comparison: {missing}")
+    champion_rule = champion.get("selected_strategy", "equal_probability_blend")
+    if champion_rule == "previous_champion":
+        legacy_weights = champion.get("selected_weights") or {}
+        if legacy_weights and (set(legacy_weights) != set(champion_ids) or
+                any(not np.isclose(float(value), 1.0 / len(champion_ids), atol=1e-6)
+                    for value in legacy_weights.values())):
+            raise ValueError("previous champion lacks its executable strategy for nonuniform weights")
+        champion_rule = "equal_probability_blend"
+    champion_weights = []
     if champion_members:
-        champion_probabilities = np.mean(np.stack([item["probabilities"] for item in champion_members]), axis=0)
+        if champion_rule == "equal_probability_blend":
+            champion_weights = [1.0 / len(champion_members)] * len(champion_members)
+        elif champion_rule == "optimized_probability_blend":
+            weight_map = champion.get("selected_weights")
+            if not isinstance(weight_map, dict) or set(weight_map) != set(champion_ids):
+                raise ValueError("weighted champion requires a weight for each selected member")
+            champion_weights = np.asarray([weight_map[item] for item in champion_ids], dtype=float)
+            if (not np.isfinite(champion_weights).all() or np.any(champion_weights < 0)
+                    or not np.isclose(champion_weights.sum(), 1.0, atol=1e-6)):
+                raise ValueError("weighted champion has invalid or unnormalized weights")
+            champion_weights = champion_weights.tolist()
+        else:
+            raise ValueError(f"unsupported previous champion strategy: {champion_rule}")
+        champion_probabilities = _weighted_probabilities(champion_members, champion_weights)
     else:
-        champion_probabilities = equal_probabilities
+        champion_probabilities = None
     oof_metrics, oof_probabilities, fold_records = _grouped_strategy_comparison(
-        candidates, y_true, groups, classes, champion_ids=champion_ids,
+        candidates, y_true, groups, classes, champion_probabilities=champion_probabilities,
         folds=group_folds, l2=weight_l2)
     sizes = {"previous_champion": len(champion_members),
              "equal_probability_blend": len(selected_ids),
-             "optimized_probability_blend": len(selected_ids)}
+             "optimized_probability_blend": len(selected_ids),
+             "all_candidate_weighted_blend": len(candidates)}
     selection_names = {"previous_champion": champion.get("selected_strategy", "previous_champion"),
                        "equal_probability_blend": "equal_probability_blend",
                        "optimized_probability_blend": "optimized_probability_blend"}
-    winner_name = min(oof_metrics, key=lambda name: (-oof_metrics[name]["accuracy"],
+    selectable_names = {"previous_champion", "equal_probability_blend", "optimized_probability_blend"}
+    winner_name = min((name for name in oof_metrics if name in selectable_names), key=lambda name: (-oof_metrics[name]["accuracy"],
         oof_metrics[name]["log_loss"], sizes[name], selection_names[name], tuple(
             champion_ids if name == "previous_champion" else selected_ids)))
     final_probs = {"previous_champion": champion_probabilities,
@@ -456,29 +515,39 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
     full_metrics = {name: _probability_metrics(probs, y_true, classes) for name, probs in {
         "previous_champion": champion_probabilities,
         "equal_probability_blend": equal_probabilities,
-        "optimized_probability_blend": weighted_probabilities}.items()}
+        "optimized_probability_blend": weighted_probabilities,
+        "all_candidate_weighted_blend": all_candidate_probabilities}.items() if probs is not None}
     # Make final inference payload correspond to the selected strategy.
     if winner_name == "previous_champion" and champion_members:
         final_members = champion_members
-        final_weights = [1.0 / len(final_members)] * len(final_members)
+        final_weights = champion_weights
     else:
         final_members = selected
         final_weights = (selected_weights.tolist() if winner_name == "optimized_probability_blend"
                          else [1.0 / len(selected)] * len(selected))
-    selected_rule = (champion.get("selected_strategy", "equal_probability_blend")
+    selected_rule = (champion_rule
                      if winner_name == "previous_champion" else winner_name)
     if selected_rule == "previous_champion":
         # Older registry entries can store the comparison label rather than
         # the executable rule. The pre-optimizer champion used equal averaging.
         selected_rule = "equal_probability_blend"
-    winner_metrics = full_metrics[winner_name]
+    winner_metrics = oof_metrics[winner_name]
     winner_prediction = np.asarray(classes)[final_probs.argmax(axis=1)]
     validation_ids_sha256 = hashlib.sha256("\n".join(reference_ids).encode()).hexdigest()
+    validation_groups_sha256 = _sha(groups.tolist())
     candidate_ids_ordered = [item["candidate_id"] for item in candidates]
     run_hash = _sha({"candidate_ids": candidate_ids_ordered,
                      "validation_ids_sha256": validation_ids_sha256,
-                     "optimizer": "forward_group_cv_weighted_v1",
-                     "champion_ids": champion_ids, "weight_l2": weight_l2})[:12]
+                     "optimizer": "forward_group_cv_weighted_all_candidates_v2",
+                     "validation_groups_sha256": validation_groups_sha256,
+                     "validation_labels_sha256": _sha(y_true.tolist()),
+                     "classes": classes,
+                     "prediction_sha256": {item["candidate_id"]: hashlib.sha256(
+                         np.ascontiguousarray(item["probabilities"]).tobytes()).hexdigest()
+                         for item in candidates + historical},
+                     "champion_ids": champion_ids, "champion_strategy": champion_rule if champion_ids else None,
+                     "champion_weights": champion_weights, "group_folds": group_folds,
+                     "weight_l2": weight_l2})[:12]
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"prediction_{reference_dataset}_{run_hash}"
     summary_path = output_dir / f"{prefix}_summary.json"
@@ -487,13 +556,15 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
     manifest_path = output_dir / f"{prefix}_manifest.json"
     pd.DataFrame(selection_steps).to_csv(steps_path, index=False)
     validation_output = pd.DataFrame({"id": reference_ids, "prompt_id": groups, "y_true": y_true,
-        "champion_prediction": np.asarray(classes)[champion_probabilities.argmax(axis=1)],
         "equal_blend_prediction": np.asarray(classes)[equal_probabilities.argmax(axis=1)],
         "weighted_blend_prediction": np.asarray(classes)[weighted_probabilities.argmax(axis=1)],
+        "all_candidate_weighted_prediction": np.asarray(classes)[all_candidate_probabilities.argmax(axis=1)],
         "selected_prediction": winner_prediction})
+    if champion_probabilities is not None:
+        validation_output["champion_prediction"] = np.asarray(classes)[champion_probabilities.argmax(axis=1)]
     validation_output.to_parquet(row_path, index=False)
     candidate_records = []
-    for item in candidates:
+    for item in {item["candidate_id"]: item for item in candidates + historical}.values():
         manifest = item["model_manifest"]
         checkpoint = item.get("checkpoint_path")
         checkpoint_path = Path(checkpoint) if checkpoint else None
@@ -508,13 +579,14 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
             "model_revision": manifest.get("model_revision"), "config": manifest.get("config", {}),
             "calibration_temperature": manifest.get("calibration_temperature", 1.0),
             "classes": classes, "validation_balanced_accuracy": item["validation_score"],
-            "individual_accuracy": next(score["accuracy"] for score in individual_scores
-                                         if score["candidate_id"] == item["candidate_id"]),
+            "individual_accuracy": next((score["accuracy"] for score in individual_scores
+                                         if score["candidate_id"] == item["candidate_id"]), None),
         })
     report = {
         "experiment_id": prefix, "module": "prediction_factory", "reference_dataset": reference_dataset,
         "split": "validation", "classes": classes, "validation_rows": len(y_true),
         "validation_ids_sha256": validation_ids_sha256,
+        "validation_groups_sha256": validation_groups_sha256,
         "validation_prompt_groups": int(len(set(groups))),
         "candidate_count": len(candidates), "candidate_ids": candidate_ids_ordered,
         "candidates": candidate_records, "excluded_candidates": excluded,
@@ -522,9 +594,12 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
         "selection_method": "greedy_forward_selection",
         "selection_steps": selection_steps,
         "individual_accuracy": {row["candidate_id"]: row["accuracy"] for row in individual_scores},
-        "selected_candidate_ids": selected_ids,
+        "selected_candidate_ids": [item["candidate_id"] for item in final_members],
+        "forward_selected_candidate_ids": selected_ids,
+        "all_candidate_weights": dict(zip([item["candidate_id"] for item in candidates], all_candidate_weights.tolist())),
         "selected_weights": dict(zip([item["candidate_id"] for item in final_members], final_weights)),
         "previous_champion_candidate_ids": champion_ids,
+        "all_candidate_weights": dict(zip([item["candidate_id"] for item in candidates], all_candidate_weights.tolist())),
         "previous_champion_strategy": champion.get("selected_strategy"),
         "strategy_metrics": {name: {**oof_metrics[name], "ensemble_size": sizes[name]}
                              for name in oof_metrics},
@@ -537,6 +612,7 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
         "selected_validation_accuracy": winner_metrics["accuracy"],
         "selected_validation_balanced_accuracy": winner_metrics["balanced_accuracy"],
         "selected_validation_log_loss": winner_metrics["log_loss"],
+        "selected_validation_metric_scope": "prompt_group_out_of_fold",
         "selected_full_data_exploratory_metrics": full_metrics[winner_name],
         "weight_l2": weight_l2,
         "blend_rule": "weighted mean of member class-probability vectors",
@@ -551,6 +627,7 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
         "strategy_metrics_group_oof": report["strategy_metrics"],
         "strategy_metrics_full_data_exploratory": report["full_data_strategy_metrics_exploratory"],
         "selected_weights": report["selected_weights"], "selected_strategy": selected_rule,
+        "all_candidate_weights": report["all_candidate_weights"],
         "selected_comparison": winner_name,
         "forward_selection_steps": selection_steps}, indent=2) + "\n")
     manifest_path.write_text(json.dumps(report, indent=2, default=str) + "\n")
