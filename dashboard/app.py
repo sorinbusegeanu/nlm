@@ -503,8 +503,17 @@ with tabs[3]:
             "Model": model_display(model),
             "Best accuracy (balanced)": best["accuracy"],
             "Train loss": selected_history.get("train_loss") if selected_history else None,
-            "Checkpoint": Path(manifest["checkpoint_path"]).name if manifest.get("checkpoint_path") else None,
-            "Dataset": manifest.get("dataset"),
+            "Best run": row.get("description") or row.get("experiment_id"),
+            "Training": " → ".join(map(str, manifest.get("training_sequence", [])))
+                if manifest.get("training_sequence") else manifest.get("dataset"),
+            "Recipe": (f"{manifest.get('feature_count')} features; "
+                       f"baseline + {','.join(manifest.get('feature_recipe', {}).get('groups', []))}"
+                       if manifest.get("feature_recipe") else None),
+            "Trees": manifest.get("tree_count"),
+            "Checkpoint": (manifest.get("checkpoint_filename") or
+                           ("model.cbm" if manifest.get("checkpoint_path") and
+                            (Path(manifest["checkpoint_path"]) / "model.cbm").is_file() else
+                            Path(manifest["checkpoint_path"]).name if manifest.get("checkpoint_path") else None)),
         })
 
     if model_rows:

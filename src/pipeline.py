@@ -120,8 +120,11 @@ def _profile_path(data_dir, dataset):
     return Path(data_dir) / name
 
 
-def _is_openpool_profile(profile):
-    return (str(profile.get("curation_method", "")).startswith("openpool_v11_hard_defect_")
+def _is_training_only_profile(profile):
+    """Whether this artifact contains training rows and reuses frozen V0 validation."""
+    is_curated_openpool = str(profile.get("curation_method", "")).startswith("openpool_v11_hard_defect_")
+    is_explicit_training_only = profile.get("training_only") is True
+    return ((is_curated_openpool or is_explicit_training_only)
             and profile.get("validation_dataset_version") == "v0"
             and profile.get("validation_split_sha256"))
 
@@ -130,7 +133,7 @@ def _effective_profile(data_dir, dataset, rows):
     profile = json.loads(_profile_path(data_dir, dataset).read_text())
     if dataset == "v0":
         return profile
-    if not _is_openpool_profile(profile):
+    if not _is_training_only_profile(profile):
         return profile
     v0_profile = json.loads(_profile_path(data_dir, "v0").read_text())
     training = rows.loc[rows.split.eq("train")].sort_values("id", kind="stable")
@@ -158,7 +161,7 @@ def _effective_profile(data_dir, dataset, rows):
 
 def _load_dataset(dataset, data_dir):
     data_dir = Path(data_dir)
-    if dataset != "v0" and _is_openpool_profile(json.loads(_profile_path(data_dir, dataset).read_text())):
+    if dataset != "v0" and _is_training_only_profile(json.loads(_profile_path(data_dir, dataset).read_text())):
         openpool = pd.read_parquet(data_dir / f"dataset_{dataset}.parquet")
         v0_rows, _ = _load_dataset("v0", data_dir)
         openpool_profile = json.loads(_profile_path(data_dir, dataset).read_text())
@@ -372,7 +375,7 @@ def build_features(dataset="v0", data_dir="data/processed", config_path="configs
     return report
 
 
-def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None):
+def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None, refresh_prediction=True):
     """Fit one model on the fixed 80% train split and score its 20% validation split."""
     if folds is not None:
         raise ValueError("fold selection was removed; this pipeline uses one fixed train/validation split")
@@ -394,7 +397,7 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
     manifest_path = pred_dir / f"{experiment_id}_manifest.json"
     if manifest_path.exists() and prediction_path.exists():
         existing = json.loads(manifest_path.read_text())
-        if "prediction_factory_update" not in existing:
+        if refresh_prediction and "prediction_factory_update" not in existing:
             _refresh_ensemble_after_training(existing, manifest_path,
                 artifact_dir=artifact_dir, data_dir=data_dir)
         return existing
@@ -462,8 +465,9 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         description=description)
     (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")
     _release_completed_training_model(result)
-    _refresh_ensemble_after_training(manifest, manifest_path,
-        artifact_dir=artifact_dir, data_dir=data_dir)
+    if refresh_prediction:
+        _refresh_ensemble_after_training(manifest, manifest_path,
+            artifact_dir=artifact_dir, data_dir=data_dir)
     return manifest
 
 
@@ -1003,7 +1007,7 @@ def main(argv=None):
     mix=d.add_parser("assemble");mix.add_argument("--config",default="configs/data/mixed_v1_5.yaml")
     f=sub.add_parser("features").add_subparsers(dest="action",required=True);b=f.add_parser("build");b.add_argument("--dataset",default="v0");b.add_argument("--data-dir",default="data/processed");b.add_argument("--config",default="configs/features/default.yaml")
     m=sub.add_parser("models").add_subparsers(dest="action",required=True)
-    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v0");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
+    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v0");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--skip-prediction-refresh",action="store_true",help="save the model run without changing the active prediction roster or ensemble history");t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
     cq=m.add_parser("continue-qwen",help="continue the latest Qwen LoRA checkpoint and validate after every epoch")
     cq.add_argument("--dataset",default="v0");cq.add_argument("--epochs",type=int,default=4);cq.add_argument("--seed",type=int,default=2026)
     cq.add_argument("--from-experiment");cq.add_argument("--config");cq.add_argument("--accept-config-defaults",action="store_true")
@@ -1014,6 +1018,16 @@ def main(argv=None):
     ce.add_argument("--learning-rate-decay",type=float,default=0.9);ce.add_argument("--seed",type=int,default=2026)
     ce.add_argument("--data-dir",default="data/processed");ce.add_argument("--artifact-dir",default="artifacts")
     ce.add_argument("--registry",default="experiments/registry.sqlite");ce.add_argument("--accept-config-defaults",action="store_true")
+    ts=m.add_parser("catboost-two-stage",help="run sequential V1-all to V0 CatBoost feature experiments")
+    ts.add_argument("--data-dir",default="data/processed")
+    ts.add_argument("--artifact-dir",default="artifacts")
+    ts.add_argument("--registry",default="experiments/registry.sqlite")
+    ts.add_argument("--ensemble-registry",default="docs/ensembles.md")
+    ts.add_argument("--config",default=MODEL_CONFIGS["catboost_stylometry"])
+    ts.add_argument("--seed",type=int,default=2026)
+    ts.add_argument("--stage1-iterations",type=int,default=800)
+    ts.add_argument("--stage2-iterations",type=int,default=200)
+    ts.add_argument("--run-id",help="optional unique run identifier; defaults to current UTC timestamp")
     ft=m.add_parser("fit-final");ft.add_argument("--model",choices=MODEL_CONFIGS,default="svc");ft.add_argument("--dataset",default="v0");ft.add_argument("--config");ft.add_argument("--registry",default="experiments/registry.sqlite");ft.add_argument("--accept-config-defaults",action="store_true")
     e=sub.add_parser("ensemble").add_subparsers(dest="action",required=True);q=e.add_parser("evaluate");q.add_argument("--dataset",default="v0");q.add_argument("--artifact-dir",default="artifacts");q.add_argument("--bootstrap-replicates",type=int,default=2000);q.add_argument("--models",nargs="+",choices=ENSEMBLE_MODEL_CHOICES);q.add_argument("--force",action="store_true")
     pred=sub.add_parser("prediction").add_subparsers(dest="action",required=True)
@@ -1052,7 +1066,16 @@ def main(argv=None):
             cfg["features"] = _read_yaml(a.features_config)
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
         result=train_models(a.dataset,a.model,a.data_dir,a.artifact_dir,config_path=a.config,
-            feature_config_path=a.features_config,seed=a.seed,config_overrides=overrides)
+            feature_config_path=a.features_config,seed=a.seed,config_overrides=overrides,
+            refresh_prediction=not a.skip_prediction_refresh)
+    elif a.command=="models" and a.action=="catboost-two-stage":
+        from .catboost_two_stage import run_catboost_two_stage
+        cfg = _model_cfg("catboost_stylometry", a.config)
+        result=run_catboost_two_stage(load_dataset=_load_dataset,effective_profile=_effective_profile,
+            data_dir=a.data_dir,artifact_dir=a.artifact_dir,registry_path=a.registry,
+            ensemble_registry_path=a.ensemble_registry,
+            config=cfg,seed=a.seed,stage1_iterations=a.stage1_iterations,
+            stage2_iterations=a.stage2_iterations,run_id=a.run_id)
     elif a.command=="models" and a.action=="continue-qwen":
         cfg = _model_cfg("qwen06", a.config); cfg["epochs"] = a.epochs
         overrides = _confirm_training_config("qwen06", cfg, accept_defaults=a.accept_config_defaults)

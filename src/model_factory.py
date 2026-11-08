@@ -72,7 +72,8 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
                               iterations=800, depth=7, learning_rate=.05, l2_leaf_reg=5.0,
                               thread_count=8, seed=2026, temperature_calibration=True,
                               validation_labels=None, early_stopping_rounds=100,
-                              feature_recipe=None, feature_matrices=None):
+                              feature_recipe=None, feature_matrices=None, init_model=None,
+                              checkpoint_metadata=None):
     """Fit CatBoost on deterministic row-local style statistics; no validation fitting."""
     try:
         from catboost import CatBoostClassifier
@@ -95,6 +96,8 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         random_seed=int(seed), thread_count=int(thread_count), verbose=False,
         allow_writing_files=False)
     fit_kwargs = {}
+    if init_model is not None:
+        fit_kwargs["init_model"] = str(init_model)
     if validation_labels is not None:
         fit_kwargs.update({"eval_set": (x_validation, list(validation_labels)),
                            "use_best_model": True,
@@ -120,7 +123,7 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     model.save_model(str(output_dir / "model.cbm"))
-    (output_dir / "stylometry.json").write_text(json.dumps({
+    metadata = {
         "feature_version": STYLOMETRY_VERSION,
         "feature_names": feature_names,
         "feature_recipe": feature_recipe,
@@ -132,7 +135,13 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
             "learning_rate": float(learning_rate), "l2_leaf_reg": float(l2_leaf_reg),
             "thread_count": int(thread_count), "seed": int(seed),
             "feature_recipe": feature_recipe}
-    }, indent=2) + "\n")
+    }
+    metadata.update({"tree_count": int(model.tree_count_),
+                     "added_iterations": int(iterations),
+                     "parent_checkpoint": str(init_model) if init_model is not None else None})
+    if checkpoint_metadata:
+        metadata["experiment"] = dict(checkpoint_metadata)
+    (output_dir / "stylometry.json").write_text(json.dumps(metadata, indent=2) + "\n")
     return {"scores": raw, "probabilities": probabilities, "model": model,
         "fit_seconds": time.perf_counter() - start, "inference_seconds": inference_seconds,
         "classes": list(classes), "calibration_temperature": temperature,
@@ -141,7 +150,9 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         "feature_count": int(x_train.shape[1]), "feature_names": feature_names,
         "feature_recipe": feature_recipe,
         "checkpoint_selection_metric": "validation_accuracy" if validation_labels is not None else None,
-        "checkpoint": str(output_dir), "peak_gpu_memory_bytes": None}
+        "checkpoint": str(output_dir), "tree_count": int(model.tree_count_),
+        "added_iterations": int(iterations), "parent_checkpoint": str(init_model) if init_model is not None else None,
+        "peak_gpu_memory_bytes": None}
 
 
 FROZEN_BACKBONE_MODELS = {"embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b"}

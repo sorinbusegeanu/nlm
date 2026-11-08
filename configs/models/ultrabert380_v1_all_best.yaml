@@ -1,0 +1,19 @@
+# Fresh-start V1-all run using the hyperparameters from the best saved
+# UltraBERT validation checkpoint (V1.5 continuation, selected at epoch 5).
+model: ultrabert380
+checkpoint: dmis-lab/UltraBERT-380M
+revision: 671a38c087233c0cc72c5bfceea6fffa2822f1db
+epochs: 10
+early_stopping_patience: 3
+batch_size: 8
+auto_batch_size: false
+max_batch_size: 8
+gradient_accumulation_steps: 2
+learning_rate: 8.0e-06
+learning_rate_decay: 0.7
+optimizer: adamw_torch
+weight_decay: 0.0
+warmup_ratio: 0.0
+max_length: 384
+local_files_only: true
+checkpoint_selection: highest_validation_accuracy

@@ -158,7 +158,8 @@ def stylometry(texts, recipe=None, *, return_feature_names=False):
     """Extract deterministic row-local CatBoost style features for a recipe.
 
     Recipe keys are baseline (one or more of length/case/punctuation/function_words),
-    exclude (baseline groups to omit), and groups (any of L,V,C,P,W,F,R,X).
+    exclude (baseline groups to omit), and groups (any implemented group in
+    STYLOMETRY_GROUPS, including Markdown (M) and Unicode (U)).
     The default exactly preserves the historical baseline feature vector.
     """
     recipe = {"baseline": list(BASE_STYLOMETRY_GROUPS), "groups": [], **(recipe or {})}
