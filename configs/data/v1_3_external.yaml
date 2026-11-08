@@ -1,6 +1,5 @@
 dataset_version: v1.3
 display_name: V1.3
-base_dataset_path: data/processed/dataset_v1_all.parquet
 glm_primary_files:
   - data/raw/external_candidates/glm53_flash/data/glm53_harvest.parquet
   - data/raw/external_candidates/glm53_flash/data/glm53_harvest_r2.parquet
@@ -10,6 +9,7 @@ glm_provenance_path: data/raw/external_candidates/glm53_flash/data/provenance_r3
 gpt_traces_path: data/raw/external_candidates/gpt56_sol_luna/data/train.parquet
 output_dir: data/processed
 validation_dataset: v0
+expected_classes: 3
 seed: 2026
 minhash_permutations: 64
 compact_char_similarity: 0.92

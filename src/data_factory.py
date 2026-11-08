@@ -228,11 +228,11 @@ def _stable_prompt_id(prompt: str, fallback: str) -> str:
     return "external_prompt_" + hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
-def build_v1_3_external_dataset(base_dataset_path: str | Path, glm_files: list[str | Path],
+def build_v1_3_external_dataset(glm_files: list[str | Path],
                                 glm_provenance_path: str | Path, gpt_traces_path: str | Path,
                                 output_dir: str | Path, *, dataset_version: str = "v1.3",
                                 validation_dataset: str = "v0") -> dict:
-    """Append the downloaded GLM-5.3-Flash and GPT-5.6 Sol/Luna rows to V1-all.
+    """Build V1.3 from only the downloaded GLM-5.3-Flash and GPT-5.6 Sol/Luna rows.
 
     The source files are normalized into the training row schema, with row-level
     provenance retained. GLM's label is dataset-attributed; GPT labels are read
@@ -241,20 +241,13 @@ def build_v1_3_external_dataset(base_dataset_path: str | Path, glm_files: list[s
     """
     if validation_dataset != "v0":
         raise ValueError("V1.3 currently reuses the frozen V0 validation set")
-    base_dataset_path, output_dir = Path(base_dataset_path), Path(output_dir)
+    output_dir = Path(output_dir)
     glm_files = [Path(path) for path in glm_files]
     glm_provenance_path, gpt_traces_path = Path(glm_provenance_path), Path(gpt_traces_path)
-    required_files = [base_dataset_path, *glm_files, gpt_traces_path]
+    required_files = [*glm_files, glm_provenance_path, gpt_traces_path]
     if not all(path.is_file() for path in required_files):
         missing = [str(path) for path in required_files if not path.is_file()]
         raise FileNotFoundError("missing V1.3 source files: " + ", ".join(missing))
-
-    base = pd.read_parquet(base_dataset_path).reset_index(drop=True)
-    required = {"id", "text", "model", "source_dataset", "prompt_id"}
-    if required - set(base.columns):
-        raise ValueError(f"V1-all is missing required columns: {sorted(required - set(base.columns))}")
-    if base.id.astype(str).duplicated().any():
-        raise ValueError("V1-all contains duplicate IDs")
 
     provenance = pd.read_parquet(glm_provenance_path) if glm_provenance_path.is_file() else pd.DataFrame()
     if not provenance.empty:
@@ -370,13 +363,10 @@ def build_v1_3_external_dataset(base_dataset_path: str | Path, glm_files: list[s
     gpt_normalized = pd.DataFrame(gpt_records)
 
     external = pd.concat([glm, gpt_normalized], ignore_index=True, sort=False)
-    labels = set(base.model.dropna().astype(str).unique())
-    unknown = set(external.model.dropna().astype(str).unique()) - labels
-    if unknown:
-        raise ValueError(f"external sources contain labels absent from V1-all: {sorted(unknown)}")
     if set(external.model.dropna().astype(str).unique()) != {
             "glm-5.3-flash", "gpt-5.6-sol", "gpt-5.6-luna"}:
         raise ValueError("external source labels did not include the expected GLM Flash, GPT Sol, and GPT Luna classes")
+    labels = set(external.model.dropna().astype(str).unique())
 
     validation_profile_path = output_dir / "dataset_profile.json"
     validation_split_path = output_dir / "splits_v0.parquet"
@@ -402,15 +392,10 @@ def build_v1_3_external_dataset(base_dataset_path: str | Path, glm_files: list[s
     overlap_count = int(overlap.sum())
     external = external.loc[~overlap].reset_index(drop=True)
 
-    base_ids = set(base.id.astype(str))
     external_ids = set(external.id.astype(str))
-    if external_ids & base_ids:
-        raise ValueError("generated V1.3 external IDs overlap V1-all IDs")
-    combined = pd.concat([base, external], ignore_index=True, sort=False)
-    if combined.id.astype(str).duplicated().any():
+    if external.id.astype(str).duplicated().any():
         raise ValueError("generated V1.3 dataset has duplicate row IDs")
-    if set(combined.model.dropna().astype(str).unique()) != labels:
-        raise ValueError("V1.3 class labels differ from V1-all")
+    combined = external
 
     output_path = output_dir / f"dataset_{dataset_version}.parquet"
     profile_path = output_dir / f"dataset_profile_{dataset_version}.json"
@@ -443,10 +428,8 @@ def build_v1_3_external_dataset(base_dataset_path: str | Path, glm_files: list[s
         "external_input_rows": {"glm53_flash": int(glm_input_rows), "gpt56_sol_luna": int(len(gpt))},
         "gpt_trace_parse_errors": int(parse_errors),
         "validation_prompt_overlap_rows_removed": overlap_count,
-        "base_dataset_path": str(base_dataset_path),
-        "base_dataset_sha256": _hash_file(base_dataset_path),
         "source_hashes": source_hashes,
-        "curation_method": "v1_all_plus_normalized_external_glm53_flash_and_gpt56_sol_luna",
+        "curation_method": "normalized_glm53_flash_and_gpt56_sol_luna_only",
         "validation_dataset_version": validation_dataset,
         "validation_split_sha256": validation_profile["split_sha256"],
         "validation_rows": int(len(v0_validation)),
@@ -1152,6 +1135,7 @@ def curate_v1_all_balanced_deduped(source_path: str | Path, output_dir: str | Pa
 def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path, *,
                                 dataset_version: str = "v1-all",
                                 validation_dataset: str = "v0", seed: int = 2026,
+                                expected_classes: int | None = 18,
                                 minhash_permutations: int = 64,
                                 compact_char_similarity: float = 0.92,
                                 compact_word_similarity: float = 0.85,
@@ -1183,8 +1167,8 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
     missing = required - set(data.columns)
     if missing:
         raise ValueError(f"source dataset missing required columns: {sorted(missing)}")
-    if data.model.nunique(dropna=True) != 18:
-        raise ValueError(f"expected 18 model labels; found {data.model.nunique(dropna=True)}")
+    if expected_classes is not None and data.model.nunique(dropna=True) != expected_classes:
+        raise ValueError(f"expected {expected_classes} model labels; found {data.model.nunique(dropna=True)}")
     original_classes = set(data.model.dropna().astype(str))
     data["_original_row_index"] = np.arange(len(data), dtype=np.int64)
     data["_normalized_text"] = data.text.fillna("").astype(str).map(_normal_text)
@@ -1329,7 +1313,7 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
 
     clean_rows = clean.loc[clean._keep].drop(columns=["_keep", "_normalized_text", "_original_row_index"], errors="ignore")
     if set(clean_rows.model.astype(str)) != original_classes:
-        raise ValueError("clean curation must preserve all 18 model labels")
+        raise ValueError("clean curation must preserve every source model label")
     if clean_rows.id.astype(str).duplicated().any():
         raise ValueError("clean dataset still contains duplicate IDs")
     if clean_rows.text.isna().any() or clean_rows.text.astype(str).str.strip().eq("").any():
@@ -1356,25 +1340,22 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
     id_overlap = set(clean_rows.id.astype(str)) & v0_val_ids
     prompt_overlap = (set(clean_rows.prompt_id.astype(str)) & v0_prompt_ids) | canonical_overlap
     if id_overlap or prompt_overlap:
-        raise ValueError(f"V1-all overlaps frozen V0 validation: {len(id_overlap)} IDs, {len(prompt_overlap)} prompt groups")
-    if set(clean_rows.model.astype(str)) != set(v0_val.model.astype(str)):
-        raise ValueError("curated datasets must preserve all V0 model labels")
+        raise ValueError(f"source dataset overlaps frozen V0 validation: {len(id_overlap)} IDs, {len(prompt_overlap)} prompt groups")
+    if not set(clean_rows.model.astype(str)).issubset(set(v0_val.model.astype(str))):
+        raise ValueError("curated dataset contains model labels absent from V0 validation")
 
     # Compact: union character and word-trigram MinHash candidates, then verify
     # exact character 5-gram and word-trigram Jaccard. Only within-label pairs qualify.
     active = clean_rows.reset_index(drop=True).copy()
     active["_normalized_text"] = active.text.astype(str).map(_normal_text)
     n_perm = int(minhash_permutations)
-    word_lsh = MinHashLSH(threshold=min(.80, compact_word_similarity),
-                          num_perm=n_perm, params=(n_perm // 4, 4))
-    char_lsh = MinHashLSH(threshold=min(.80, compact_char_similarity),
-                          num_perm=n_perm, params=(n_perm // 4, 4))
-    char_sets, word_sets, signatures = {}, {}, {}
+    word_lsh = MinHashLSH(threshold=compact_word_similarity, num_perm=n_perm)
+    char_lsh = MinHashLSH(threshold=compact_char_similarity, num_perm=n_perm)
+    signatures = {}
     for i, text in enumerate(active._normalized_text):
         chars = {text[k:k+5] for k in range(max(1, len(text)-4))}
         words = text.split()
         word_grams = {" ".join(words[j:j+3]) for j in range(max(1, len(words)-2))}
-        char_sets[i], word_sets[i] = chars, word_grams
         word_sig = MinHash(num_perm=n_perm, seed=seed, hashfunc=lambda value: zlib.crc32(value))
         word_sig.update_batch([gram.encode("utf-8") for gram in word_grams])
         char_sig = MinHash(num_perm=n_perm, seed=seed, hashfunc=lambda value: zlib.crc32(value))
@@ -1398,12 +1379,20 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
     candidate_similarity = []
     for i in range(len(active)):
         matches = set(char_lsh.query(signatures[i][0])) | set(word_lsh.query(signatures[i][1]))
+        text_i = active.at[i, "_normalized_text"]
+        chars_i = {text_i[k:k+5] for k in range(max(1, len(text_i)-4))} if matches else set()
+        words_i = text_i.split()
+        word_grams_i = {" ".join(words_i[k:k+3]) for k in range(max(1, len(words_i)-2))} if matches else set()
         for match in matches:
             j = int(match)
             if j <= i or str(active.at[i, "model"]) != str(active.at[j, "model"]):
                 continue
-            char_sim = len(char_sets[i] & char_sets[j]) / max(1, len(char_sets[i] | char_sets[j]))
-            word_sim = len(word_sets[i] & word_sets[j]) / max(1, len(word_sets[i] | word_sets[j]))
+            text_j = active.at[j, "_normalized_text"]
+            chars_j = {text_j[k:k+5] for k in range(max(1, len(text_j)-4))}
+            words_j = text_j.split()
+            word_grams_j = {" ".join(words_j[k:k+3]) for k in range(max(1, len(words_j)-2))}
+            char_sim = len(chars_i & chars_j) / max(1, len(chars_i | chars_j))
+            word_sim = len(word_grams_i & word_grams_j) / max(1, len(word_grams_i | word_grams_j))
             candidate_similarity.append((float(char_sim), float(word_sim)))
             if char_sim >= compact_char_similarity and word_sim >= compact_word_similarity:
                 same_prompt = str(active.at[i, "prompt_id"]) == str(active.at[j, "prompt_id"])
@@ -1448,7 +1437,7 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
     if set(compact.id.astype(str)) - set(clean_rows.id.astype(str)):
         raise RuntimeError("compact contains rows absent from clean")
     if set(compact.model.astype(str)) != original_classes:
-        raise ValueError("compact curation must preserve all 18 model labels")
+        raise ValueError("compact curation must preserve every source model label")
 
     # Diagnostic template and prompt redundancy counts; these are not removal rules.
     def template_key(text):
@@ -1562,7 +1551,9 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
         "near_duplicate_clusters_detail": cluster_records,
         "similarity_thresholds": {"character_5gram_jaccard": compact_char_similarity,
                                   "word_3gram_jaccard": compact_word_similarity,
-                                  "minhash_permutations": n_perm, "minhash_candidate_threshold": .80,
+                                  "minhash_permutations": n_perm,
+                                  "minhash_candidate_thresholds": {"character": compact_char_similarity,
+                                                                   "word": compact_word_similarity},
                                   "seed": seed},
         "template_diagnostic": {"templates_repeated_3plus": int(len(repeated_templates)),
                                  "rows_in_repeated_templates": int(template_sizes[template_sizes.ge(3)].sum()),

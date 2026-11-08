@@ -164,7 +164,6 @@ def build_v1_3_external_data(config):
     output_dir = cfg.get("output_dir", "data/processed")
     dataset_version = cfg.get("dataset_version", "v1.3")
     base_profile = build_v1_3_external_dataset(
-        cfg.get("base_dataset_path", "data/processed/dataset_v1_all.parquet"),
         cfg.get("glm_primary_files", []),
         cfg.get("glm_provenance_path", "data/raw/external_candidates/glm53_flash/data/provenance_r34.parquet"),
         cfg.get("gpt_traces_path", "data/raw/external_candidates/gpt56_sol_luna/data/train.parquet"),
@@ -174,6 +173,7 @@ def build_v1_3_external_data(config):
         Path(output_dir) / f"dataset_{dataset_version}.parquet", output_dir,
         dataset_version=dataset_version,
         validation_dataset=cfg.get("validation_dataset", "v0"),
+        expected_classes=cfg.get("expected_classes", 3),
         seed=cfg.get("seed", 2026),
         minhash_permutations=cfg.get("minhash_permutations", 64),
         compact_char_similarity=cfg.get("compact_char_similarity", 0.92),
@@ -229,7 +229,7 @@ def _write_v1_all_clean_compact_report(result, path, data_dir, *,
                 extra = f"; representative `{row.get('representative_id', '')}`" if pd.notna(row.get("representative_id")) and str(row.get("representative_id")) else ""
                 lines.append(f"- `{row.get('id', 'N/A')}`{extra}: {row.get('evidence', 'measured removal rule')}.")
     lines.extend(["", "## Redundancy diagnostics", "",
-        f"Near-duplicate detection unions character 5-gram and word-trigram MinHash candidates (candidate threshold {result['similarity_thresholds']['minhash_candidate_threshold']:.2f}), then verifies exact character 5-gram Jaccard ≥ {result['similarity_thresholds']['character_5gram_jaccard']:.2f} and word 3-gram Jaccard ≥ {result['similarity_thresholds']['word_3gram_jaccard']:.2f}. Verified pairs: **{result['verified_near_duplicate_pairs']:,}**; connected clusters removed: **{result['near_duplicate_clusters']:,}**. Cluster sizes: `{result['near_duplicate_cluster_sizes']}`.",
+        f"Near-duplicate detection unions character 5-gram and word-trigram MinHash candidates (candidate thresholds: character {result['similarity_thresholds']['minhash_candidate_thresholds']['character']:.2f}, word {result['similarity_thresholds']['minhash_candidate_thresholds']['word']:.2f}), then verifies exact character 5-gram Jaccard ≥ {result['similarity_thresholds']['character_5gram_jaccard']:.2f} and word 3-gram Jaccard ≥ {result['similarity_thresholds']['word_3gram_jaccard']:.2f}. Verified pairs: **{result['verified_near_duplicate_pairs']:,}**; connected clusters removed: **{result['near_duplicate_clusters']:,}**. Cluster sizes: `{result['near_duplicate_cluster_sizes']}`.",
         f"Of {result['minhash_candidate_pair_count']:,} same-label candidate pairs, character 5-gram Jaccard P50/P90/max = {result['candidate_similarity']['character_5gram_jaccard']['p50']}, {result['candidate_similarity']['character_5gram_jaccard']['p90']}, {result['candidate_similarity']['character_5gram_jaccard']['max']}; word 3-gram Jaccard P50/P90/max = {result['candidate_similarity']['word_3gram_jaccard']['p50']}, {result['candidate_similarity']['word_3gram_jaccard']['p90']}, {result['candidate_similarity']['word_3gram_jaccard']['max']}. Verified-pair medians = {result['verified_similarity']['character_5gram_jaccard']['p50']} (character) and {result['verified_similarity']['word_3gram_jaccard']['p50']} (word); pairs sharing a prompt ID: {result['verified_pairs_same_prompt']:,}.",
         f"Repeated normalized templates occurring at least three times: {result['template_diagnostic']['templates_repeated_3plus']:,} templates / {result['template_diagnostic']['rows_in_repeated_templates']:,} rows. Prompt groups with multiple same-label rows: {result['prompt_redundancy_diagnostic']['model_prompt_groups_with_multiple_rows']:,} groups / {result['prompt_redundancy_diagnostic']['rows_in_repeated_model_prompt_groups']:,} rows. These diagnostic counts did not independently cause removals.",
         f"TF-IDF diagnostic: {result['tfidf_diagnostic']['method']}; sample {result['tfidf_diagnostic']['sample_size']:,}; nearest-neighbor cosine similarity P50/P90/max = {result['tfidf_diagnostic']['nearest_cosine_p50']}, {result['tfidf_diagnostic']['nearest_cosine_p90']}, {result['tfidf_diagnostic']['nearest_cosine_max']}. Diagnostic only; not used to select rows.", "",
@@ -250,14 +250,14 @@ def _write_v1_all_clean_compact_report(result, path, data_dir, *,
     compact_representative_pct = (f"{100 * compact_profile['removed_rows_with_representative'] / compact_profile['removed_rows']:.1f}%"
                                    if compact_profile["removed_rows"] else "N/A (no rows removed)")
     lines.extend(["", "## Integrity and validation", "",
-        f"All 18 labels remain. Clean rows originate from {display_name}; compact is a subset of clean. Both profiles reuse the frozen V0 validation set ({clean_profile['validation_rows']} rows; split hash `{clean_profile['validation_split_sha256']}`), with zero validation ID or prompt-group overlap. The data loader adds the same V0 validation rows at training time; these Parquet artifacts contain training rows only.",
+        f"All {len(clean_profile['classes'])} labels in the source remain. Compact is a subset of clean. Both profiles are checked against the frozen V0 validation set (split hash `{clean_profile['validation_split_sha256']}`), with zero validation ID or prompt-group overlap. These Parquet artifacts contain training rows only.",
         "",
         f"{display_name} removals by rule: " + ", ".join(f"`{key}` {value:,}" for key, value in clean_profile["removals_by_reason"].items()) + ".",
         f"Removed rows with a retained representative: Clean {clean_representative_pct}; Compact {compact_representative_pct}. Similarity is evidence of redundancy, not proof that either response is defective or that training accuracy will improve.",
         "",
         "### Ambiguous findings retained",
         "",
-        "The source has no explicit completion-status or finish-reason field. Therefore only explicit text markers and direct metadata contradictions were treated as defects; plausible but unmarked truncation, unusual writing, and uncertain provenance were retained. `model_version` conflicts were checked only when the value exactly matched another canonical label. No attempt was made to verify that the claimed model generated a response.",
+        "Only explicit text markers and available source metadata were treated as defects; plausible but unmarked truncation, unusual writing, and uncertain provenance were retained. `model_version` conflicts were checked only when the value exactly matched another canonical label. No attempt was made to verify that the claimed model generated a response.",
         "MinHash is an approximate candidate index. Zero verified pairs means no candidate pair passed both configured thresholds; it is not proof that no near-duplicates exist. TF-IDF diagnostics cover only the deterministic 3,000-row sample and did not affect selection.",
         "", f"Profiles: `dataset_profile_{clean_version}.json`, `dataset_profile_{compact_version}.json`. Audits: `{clean_audit_path}`, `{compact_audit_path}`."])
     path = Path(path)
@@ -1295,6 +1295,20 @@ def main(argv=None):
     px.add_argument("--output",default="submission.parquet")
     x=sub.add_parser("export");x.add_argument("--model",choices=MODEL_CONFIGS,default="svc");x.add_argument("--checkpoint",default="artifacts/checkpoints/svc_v0_final.json");x.add_argument("--test",default="data/raw/test.csv");x.add_argument("--output",default="submission.parquet")
     k=sub.add_parser("package-kaggle");k.add_argument("--manifest",default="artifacts/checkpoints/svc_v0_final.json");k.add_argument("--output",default="artifacts/kaggle/model_package.zip")
+    analysis = sub.add_parser("analysis").add_subparsers(dest="action", required=True)
+    ua = analysis.add_parser("ultrabert-four-checkpoints", help="run grouped OOF fusion analysis for saved UltraBERT checkpoints A-D")
+    ua.add_argument("--artifact-dir", default="artifacts/predictions")
+    ua.add_argument("--data-dir", default="data/processed")
+    ua.add_argument("--output-dir", default="artifacts/analysis/ultrabert_four_checkpoint")
+    ua.add_argument("--report", default="docs/ultrabert_4checkpoints_4experiments.md")
+    ta = analysis.add_parser("trusted-checkpoint-ensemble", help="run grouped OOF trusted specialist routing for saved UltraBERT checkpoints A-D")
+    ta.add_argument("--artifact-dir", default="artifacts/predictions")
+    ta.add_argument("--data-dir", default="data/processed")
+    ta.add_argument("--output-dir", default="artifacts/analysis/trusted_checkpoint_ensemble_ultrabert")
+    ta.add_argument("--report", default="docs/trusted_checkpoint_ensemble_ultrabert.md")
+    ta.add_argument("--minimum-support", type=int, default=10)
+    ta.add_argument("--prior-alpha", type=float, default=1.0)
+    ta.add_argument("--prior-beta", type=float, default=1.0)
     a=parser.parse_args(argv)
     if a.command=="restart": result=restart_mvp(models=a.models,seed=a.seed,bootstrap_replicates=a.bootstrap_replicates)
     elif a.command=="data" and a.action=="prepare": result=prepare_data(a.config)
@@ -1341,6 +1355,15 @@ def main(argv=None):
             artifact_dir=a.artifact_dir,registry_path=a.registry,
             output_path=a.output,dataset=a.dataset,
             bootstrap_replicates=a.bootstrap_replicates,seed=a.seed)
+    elif a.command=="analysis" and a.action=="ultrabert-four-checkpoints":
+        from .ultrabert_checkpoint_ensembles import run_ultrabert_four_checkpoint_experiments
+        result=run_ultrabert_four_checkpoint_experiments(artifact_dir=a.artifact_dir,
+            data_dir=a.data_dir,output_dir=a.output_dir,report_path=a.report)
+    elif a.command=="analysis" and a.action=="trusted-checkpoint-ensemble":
+        from .trusted_checkpoint_ensemble import run_ultrabert_trusted_checkpoint_ensemble
+        result=run_ultrabert_trusted_checkpoint_ensemble(artifact_dir=a.artifact_dir,
+            data_dir=a.data_dir,output_dir=a.output_dir,report_path=a.report,
+            minimum_support=a.minimum_support,prior_alpha=a.prior_alpha,prior_beta=a.prior_beta)
     elif a.command=="models" and a.action=="continue-qwen":
         cfg = _model_cfg("qwen06", a.config); cfg["epochs"] = a.epochs
         overrides = _confirm_training_config("qwen06", cfg, accept_defaults=a.accept_config_defaults)
