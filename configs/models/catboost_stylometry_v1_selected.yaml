@@ -1,0 +1,21 @@
+model: catboost_stylometry
+max_batch_size: 1024
+iterations: 800
+depth: 7
+learning_rate: 0.05
+l2_leaf_reg: 5.0
+thread_count: 8
+temperature_calibration: true
+early_stopping_rounds: 100
+checkpoint_selection: highest_validation_accuracy
+checkpoint_selection_version: 2
+feature_recipe:
+  baseline:
+  - length
+  - case
+  - punctuation
+  - function_words
+  groups:
+  - F
+  - U
+batch_probe_safety_fraction: 0.95

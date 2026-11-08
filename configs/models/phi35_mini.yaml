@@ -1,0 +1,25 @@
+model: phi35_mini
+checkpoint_selection: highest_validation_accuracy
+checkpoint: microsoft/Phi-3.5-mini-instruct
+revision: 2fe192450127e6a83f7441aef6e3ca586c338b77
+trust_remote_code: true
+epochs: 10
+early_stopping_patience: 3
+batch_size: 1
+auto_batch_size: true
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-05
+optimizer: adamw_torch
+weight_decay: 0.0
+lr_scheduler_type: linear
+warmup_ratio: 0.02
+max_length: 384
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - qkv_proj
+  - o_proj
+gradient_checkpointing: true
+local_files_only: true

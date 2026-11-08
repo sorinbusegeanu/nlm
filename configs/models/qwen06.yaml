@@ -2,15 +2,23 @@ model: qwen06
 checkpoint: Qwen/Qwen3-0.6B
 revision: c1899de289a04d12100db370d81485cdf75e47ca
 epochs: 10
+early_stopping_patience: 3
 batch_size: 4
 auto_batch_size: true
-max_batch_size: 32
-batch_probe_safety_fraction: 0.9
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
 gradient_accumulation_steps: 1
-learning_rate: 0.0001
-learning_rate_decay: 0.9
+learning_rate: 5.0e-05
+optimizer: adamw_torch
+weight_decay: 0.0
+lr_scheduler_type: linear
+warmup_ratio: 0.02
 max_length: 384
 lora_rank: 16
 lora_alpha: 32
-lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+lora_target_modules:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
 local_files_only: true

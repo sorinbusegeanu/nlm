@@ -1,0 +1,5 @@
+version: features-v1
+views: [stylometry_raw]
+stylometry_recipe:
+  baseline: [length, case, punctuation, function_words]
+  groups: []

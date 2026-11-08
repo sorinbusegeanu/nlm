@@ -1,0 +1,27 @@
+model: smollm3_3b
+checkpoint_selection: highest_validation_accuracy
+checkpoint_selection_version: 2
+checkpoint: HuggingFaceTB/SmolLM3-3B-Base
+revision: d78a42f79198603e614095753484a04c10c2b940
+epochs: 10
+early_stopping_patience: 3
+batch_size: 1
+auto_batch_size: true
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-05
+optimizer: adamw_torch
+weight_decay: 0.0
+lr_scheduler_type: linear
+warmup_ratio: 0.02
+max_length: 384
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+gradient_checkpointing: true
+local_files_only: true

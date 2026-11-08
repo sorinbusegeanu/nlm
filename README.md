@@ -37,24 +37,30 @@ Run the complete clean restart from raw CSVs. It removes generated processed dat
 python -m src.pipeline restart
 ```
 
-The default run trains `svc`, `ultrabert380`, and `qwen06` on the same 80% train rows and evaluates each on the same 20% validation rows. To run a subset, pass `--models svc ultrabert380`; to change the split seed, pass `--seed 2027`. The registry is recreated, so sequence numbers start at 0001.
+The default run trains `svc`, `catboost_stylometry`, `ultrabert380`, and `qwen06` on the same 80% train rows and evaluates each on the same 20% validation rows. CatBoost uses the existing handcrafted stylometry statistics. To run a subset, pass `--models svc catboost_stylometry`; to change the split seed, pass `--seed 2027`. The registry is recreated, so sequence numbers start at 0001.
 
 For individual factory runs:
 
 ```bash
 python -m src.pipeline data prepare --config configs/data/official_v0.yaml
+python -m src.pipeline data curate-openpool --config configs/data/openpool_v1.yaml
 python -m src.pipeline features build --dataset v0
 python -m src.pipeline models train --model svc --dataset v0
+python -m src.pipeline models train --model catboost_stylometry --dataset v0
 python -m src.pipeline models train --model ultrabert380 --dataset v0
 python -m src.pipeline models train --model qwen06 --dataset v0
 python -m src.pipeline models train --model qwen17 --dataset v0
 python -m src.pipeline models train --model qwen4 --dataset v0
 python -m src.pipeline models train --model llama32_3b --dataset v0
+python -m src.pipeline models train --model smollm3_3b --dataset v0
+python -m src.pipeline models train --model granite4_h_micro --dataset v0
 python -m src.pipeline ensemble evaluate --dataset v0
 python scripts/evaluate_qwen06_best_ensemble.py
 ```
 
 The Qwen checkpoint comparison script registers the best epoch-3 checkpoint from the recorded 10-epoch Qwen3-0.6B run, then evaluates every two-model pair and the three-model blend with SVC and UltraBERT-380M.
+
+After training additional models, pass their IDs to `ensemble evaluate --models ...` to compare every pair and larger combination. `qwen06_best_epoch03` selects the registered best Qwen checkpoint rather than the final epoch.
 
 The split is grouped on `prompt_id` and selected from deterministic candidates to stay near 20% of rows and the full dataset class proportions. All fitted features, classifiers, calibrators, and ensemble weights use train rows only. The ensemble report compares equal weights with train-fitted, equal-share-regularized weights on the validation rows; those weights are frozen before validation scoring. Treat model selection on the validation results as exploratory, not as an independent final estimate.
 

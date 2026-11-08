@@ -1,0 +1,13 @@
+dataset_version: v1.1
+source_path: data/raw/open_pool/ntl_open_pool.parquet
+official_reference_path: data/raw/train.csv
+output_dir: data/processed
+seed: 2026
+expected_classes: 18
+base_dataset_path: data/processed/dataset_v1.parquet
+additional_rows_by_class:
+  claude-fable-5: 6874
+  glm-5.3: 8617
+  glm-5.3-flash: 8617
+selection_method: shortest_response
+validation_dataset: v0

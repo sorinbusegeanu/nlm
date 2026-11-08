@@ -5,6 +5,8 @@ from pathlib import Path
 import yaml
 from huggingface_hub import snapshot_download
 
+from _hf_auth import hf_token
+
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ("qwen17", "qwen4")
 
@@ -12,7 +14,7 @@ MODELS = ("qwen17", "qwen4")
 def download(model):
     config_path = ROOT / "configs" / "models" / f"{model}.yaml"
     config = yaml.safe_load(config_path.read_text())
-    path = snapshot_download(repo_id=config["checkpoint"], revision=config["revision"])
+    path = snapshot_download(repo_id=config["checkpoint"], revision=config["revision"], token=hf_token())
     return model, config["checkpoint"], config["revision"], path
 
 

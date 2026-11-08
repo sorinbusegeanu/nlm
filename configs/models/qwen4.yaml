@@ -1,16 +1,27 @@
 model: qwen4
+checkpoint_selection: highest_validation_accuracy
+checkpoint_selection_version: 2
 checkpoint: Qwen/Qwen3-4B-Base
 revision: 906bfd4b4dc7f14ee4320094d8b41684abff8539
 epochs: 10
+early_stopping_patience: 3
 batch_size: 1
 auto_batch_size: true
-max_batch_size: 8
-batch_probe_safety_fraction: 0.9
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
 gradient_accumulation_steps: 8
-learning_rate: 0.0001
+learning_rate: 5.0e-05
+optimizer: adamw_torch
+weight_decay: 0.0
+lr_scheduler_type: linear
+warmup_ratio: 0.02
 max_length: 384
 lora_rank: 16
 lora_alpha: 32
-lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+lora_target_modules:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
 gradient_checkpointing: true
 local_files_only: true

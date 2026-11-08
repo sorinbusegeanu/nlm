@@ -1,0 +1,5 @@
+input_dir: data/processed
+output_dir: data/processed
+dataset_version: v1.5
+openpool_version: v1
+expected_classes: 18

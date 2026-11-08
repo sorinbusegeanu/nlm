@@ -67,6 +67,7 @@ Accept a human-supplied dataset URL or file. Preserve exact source, license, ver
 |---|---|---|
 | Character TF-IDF | 3–5 grams | Writing/typography patterns |
 | Word TF-IDF | 1–2 grams | Lexical patterns |
+| Handcrafted stylometry | Sentence/word lengths, punctuation, case, digits, function-word rates | Numeric style features for CatBoost |
 | Optional punctuation/word view | 1–3 grams | Surface structure |
 | Optional shape/function-word view | Explicit transforms | Topic-reduced stylistic patterns |
 | Handcrafted stylometry | Sentence/word lengths, quote/dash counts, function-word rates | Diagnostics, later ablations |
@@ -89,6 +90,7 @@ All predictions must use the **same stable class order** and row IDs. Store raw 
 | Model | Training | Starting settings | Hardware |
 |---|---|---|---|
 | Character + word TF-IDF + LinearSVC | CPU supervised classification | C=0.5, balanced class weights; calibrate using training-only data | CPU |
+| CatBoost + stylometry | CPU multiclass classification over handcrafted row-local style statistics | 800 trees, depth 7, balanced class weights; train-only temperature calibration | CPU |
 | UltraBERT-380M (`dmis-lab/UltraBERT-380M`) | Fine-tune 18-class encoder head | 384 tokens, 3 epochs, LR 8e-6, batch 8, gradient accumulation 2, BF16/FP16 as supported | RTX 5070 Ti 16 GB |
 | Configurable causal LM (default `Qwen/Qwen3-0.6B`) | LoRA + 18-class readout | 384 tokens, 3 epochs, LoRA rank 16 / alpha 32 / LR 1e-4, batch 4–8; target modules configured per architecture | RTX 5070 Ti 16 GB |
 

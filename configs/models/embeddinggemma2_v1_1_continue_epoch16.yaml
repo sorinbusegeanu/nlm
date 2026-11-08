@@ -1,0 +1,35 @@
+model: embeddinggemma2
+experiment_name: EmbeddingGemma 2 v1.1 continuation from epoch 16, LR 5e-5 decay 0.9
+checkpoint: google/embeddinggemma-2
+revision: f9972ac22e696a105c482202646979e33e4b5a1e
+training_mode: lora
+resume_checkpoint: artifacts/runs/embeddinggemma2_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbbaa9462_code667e2d0/checkpoints/embeddinggemma2_foldvalidation/epoch-16
+checkpoint_selection: highest_validation_accuracy
+checkpoint_selection_version: 2
+epochs: 100
+early_stopping_patience: 3
+batch_size: 8
+auto_batch_size: true
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
+gradient_accumulation_steps: 2
+learning_rate: 0.00005
+learning_rate_decay: 0.9
+optimizer: adamw_torch
+weight_decay: 0.0
+lr_scheduler_type: epoch_decay
+warmup_ratio: 0.02
+warmup_epochs: 10
+max_length: 384
+readout_hidden_size: 768
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+lora_exclude_modules: .*(?:vision_tower|audio_tower).*[.](?:q_proj|k_proj|v_proj|o_proj)
+gradient_checkpointing: false
+task_prefix: 'task: classification | query: '
+local_files_only: true

@@ -1,7 +1,11 @@
 model: svc
+max_batch_size: 1024
 C: 0.5
 class_weight: balanced
 calibration: sigmoid
 calibration_cv: 3
 features:
-  views: [char, word]
+  views:
+  - char
+  - word
+batch_probe_safety_fraction: 0.95

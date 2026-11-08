@@ -1,0 +1,31 @@
+model: embeddinggemma2
+checkpoint_selection: highest_validation_accuracy
+checkpoint_selection_version: 2
+checkpoint: google/embeddinggemma-2
+revision: f9972ac22e696a105c482202646979e33e4b5a1e
+training_mode: lora
+early_stopping_patience: 3
+epochs: 10
+batch_size: 8
+auto_batch_size: true
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
+gradient_accumulation_steps: 2
+learning_rate: 5.0e-05
+optimizer: adamw_torch
+weight_decay: 0.0
+lr_scheduler_type: linear
+warmup_ratio: 0.02
+max_length: 384
+readout_hidden_size: 768
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+lora_exclude_modules: .*(?:vision_tower|audio_tower).*[.](?:q_proj|k_proj|v_proj|o_proj)
+gradient_checkpointing: false
+task_prefix: 'task: classification | query: '
+local_files_only: true

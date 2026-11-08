@@ -2,7 +2,9 @@
 from pathlib import Path
 
 import yaml
-from huggingface_hub import get_token, snapshot_download
+from huggingface_hub import snapshot_download
+
+from _hf_auth import hf_token
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs/models/llama32_3b.yaml"
@@ -10,7 +12,7 @@ CONFIG = ROOT / "configs/models/llama32_3b.yaml"
 
 def main():
     config = yaml.safe_load(CONFIG.read_text())
-    token = get_token()
+    token = hf_token()
     if not token:
         raise SystemExit(
             "No Hugging Face token is configured. meta-llama/Llama-3.2-3B is gated: "
