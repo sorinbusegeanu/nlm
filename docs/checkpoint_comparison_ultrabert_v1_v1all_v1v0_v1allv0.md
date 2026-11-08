@@ -12,16 +12,18 @@ This report compares four saved UltraBERT checkpoints on the same frozen V0 vali
 
 ## Checkpoints
 
-| Stage | Experiment | Training sequence | Selected epoch | Learning rate | Decay | Validation predictions |
-|---|---|---|---:|---:|---:|---|
-| V1 | `ultrabert380_v1_datada64f007_split147ce64e_seed2026_cfgb5a91dee_code667e2d0` | V1 | — | 8e-06 | — | `ultrabert380_v1_datada64f007_split147ce64e_seed2026_cfgb5a91dee_code667e2d0_validation.parquet` |
-| V1-all | `ultrabert380_v1_all_data3c4b61a6_split0b0fd08e_seed2026_cfgebf0c70f_code1b9bfc2` | V1-all | 2 | 8e-06 | 0.7 | `ultrabert380_v1_all_data3c4b61a6_split0b0fd08e_seed2026_cfgebf0c70f_code1b9bfc2_validation.parquet` |
-| V1 → V0 | `ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0` | V1 → V0 | 5 | 8e-06 | 0.7 | `ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0_validation.parquet` |
-| V1-all → V0 | `ultrabert380_v0_fromeab1ab35_data40a22ce8_split147ce64e_seed2026_cfg34506fe0_codedb9ddff` | V1-all → V0 | 2 | 8e-06 | 0.7 | `ultrabert380_v0_fromeab1ab35_data40a22ce8_split147ce64e_seed2026_cfg34506fe0_codedb9ddff_validation.parquet` |
+| Stage | Experiment | Training sequence | Checkpoint | Selected epoch | Run-recorded selection accuracy | Learning rate | Decay | Validation predictions |
+|---|---|---|---|---:|---:|---:|---:|---|
+| V1 | `ultrabert380_v1_datada64f007_split147ce64e_seed2026_cfgb5a91dee_code667e2d0` | V1 | `ultrabert380_foldvalidation` | — | — | 8e-06 | — | `ultrabert380_v1_datada64f007_split147ce64e_seed2026_cfgb5a91dee_code667e2d0_validation.parquet` |
+| V1-all | `ultrabert380_v1_all_data3c4b61a6_split0b0fd08e_seed2026_cfgebf0c70f_code1b9bfc2` | V1-all | `ultrabert380_foldvalidation` | 2 | 52.4% | 8e-06 | 0.7 | `ultrabert380_v1_all_data3c4b61a6_split0b0fd08e_seed2026_cfgebf0c70f_code1b9bfc2_validation.parquet` |
+| V1 → V0 | `ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0` | V1 → V0 | `best_checkpoint` | 5 | 53.1% | 8e-06 | 0.7 | `ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0_validation.parquet` |
+| V1-all → V0 | `ultrabert380_v0_fromeab1ab35_data40a22ce8_split147ce64e_seed2026_cfg34506fe0_codedb9ddff` | V1-all → V0 | `best_checkpoint` | 2 | 55.4% | 8e-06 | 0.7 | `ultrabert380_v0_fromeab1ab35_data40a22ce8_split147ce64e_seed2026_cfg34506fe0_codedb9ddff_validation.parquet` |
 
 ## Overall metrics
 
 Accuracy is row-level top-1 accuracy. Balanced accuracy is the macro-average recall; because the frozen set has equal class support, it should closely match accuracy.
+
+The checkpoint table's run-recorded selection accuracy is copied from the training manifest. The metric table is recalculated from each persisted validation probability file, giving one consistent inference-time comparison. The V1-all and V1-all → V0 records differ from their persisted predictions by one validation row; the recalculated values are used in the comparisons below.
 
 | Checkpoint | Accuracy | Balanced accuracy | Macro F1 | Top-3 accuracy | MRR | Log loss ↓ | Brier ↓ | Δ balanced accuracy vs V1 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -32,12 +34,12 @@ Accuracy is row-level top-1 accuracy. Balanced accuracy is the macro-average rec
 
 ## Paired changes from each base checkpoint
 
-Corrected/regressed count rows where the continuation is correct/wrong relative to its base checkpoint.
+Corrected/regressed counts are rows where the V0 continuation becomes correct or wrong relative to its base checkpoint.
 
 | Comparison | Δ accuracy | Δ balanced accuracy | 95% prompt-bootstrap CI for Δ balanced accuracy | Corrected | Regressed |
 |---|---:|---:|---:|---:|---:|
-| V1 → V1 → V0 | +2.0 pp | +2.0 pp | [-0.9 pp, +5.4 pp] | 45 | 34 |
-| V1-all → V1-all → V0 | +3.0 pp | +3.0 pp | [-1.3 pp, +7.2 pp] | 78 | 62 |
+| V1 base → V0 continuation | +2.0 pp | +2.0 pp | [-0.9 pp, +5.4 pp] | 45 | 34 |
+| V1-all base → V0 continuation | +3.0 pp | +3.0 pp | [-1.3 pp, +7.2 pp] | 78 | 62 |
 
 ## Per-class top-1 recall
 
@@ -78,6 +80,8 @@ Agreement compares the two models' predicted labels. 'Both wrong' counts rows bo
 ## Reading the result
 
 - Highest balanced accuracy on this validation set: **V1-all → V0** (55.2%).
-- V1 → V0 changed balanced accuracy by +2.0 pp; V1-all → V0 changed it by +3.0 pp.
+- V1 → V0 changed balanced accuracy by +2.0 pp (95% prompt-bootstrap CI [-0.9 pp, +5.4 pp]); V1-all → V0 changed it by +3.0 pp (95% CI [-1.3 pp, +7.2 pp]). Both intervals include zero, so these validation comparisons do not establish a reliable improvement under prompt resampling.
+- V1 → V0 has much worse probability scores than V1 (log loss 13.50 vs 2.78; Brier 0.924 vs 0.793), indicating severe overconfidence in its saved probabilities.
+- V1-all → V0 has the best top-1 and top-3 scores, but its log loss and Brier score are worse than V1-all (2.57 vs 1.91; 0.729 vs 0.699); recalibration should be evaluated separately before relying on its confidence values.
 - Validation comparisons are development evidence: these same V0 rows were used for checkpoint selection.
 - A positive bootstrap interval wholly above zero supports an improvement under prompt resampling; an interval spanning zero leaves the direction uncertain at this sample size.

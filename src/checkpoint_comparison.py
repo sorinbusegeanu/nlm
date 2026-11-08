@@ -31,7 +31,10 @@ def _validated_probabilities(probabilities, n_rows, n_classes, name):
     if (not np.isfinite(values).all() or np.any(values < 0)
             or not np.allclose(values.sum(axis=1), 1.0, atol=1e-5)):
         raise ValueError(f"{name}: probabilities must be finite, nonnegative, and sum to one")
-    return values
+    # Remove harmless float32 accumulation drift before proper scoring rules
+    # such as log loss. These are probability rows, so normalization preserves
+    # the class ranking while ensuring a valid categorical distribution.
+    return values / values.sum(axis=1, keepdims=True)
 
 
 def align_checkpoint_predictions(previous, new, classes, validation_rows):
@@ -544,8 +547,8 @@ def compare_checkpoint_set(checkpoints, *, data_dir="data/processed", artifact_d
         f"- Bootstrap: paired prompt-group bootstrap with {bootstrap_replicates:,} replicates and seed {seed}; "
         "intervals describe validation sampling uncertainty, not generalization guarantees.", "",
         "## Checkpoints", "",
-        "| Stage | Experiment | Training sequence | Selected epoch | Learning rate | Decay | Validation predictions |",
-        "|---|---|---|---:|---:|---:|---|",
+        "| Stage | Experiment | Training sequence | Checkpoint | Selected epoch | Run-recorded selection accuracy | Learning rate | Decay | Validation predictions |",
+        "|---|---|---|---|---:|---:|---:|---:|---|",
     ]
     for label, entry in entries.items():
         manifest = entry["manifest"]
@@ -555,18 +558,28 @@ def compare_checkpoint_set(checkpoints, *, data_dir="data/processed", artifact_d
         epoch = manifest.get("selected_epoch")
         if epoch is None:
             epoch = (manifest.get("checkpoint_selection") or {}).get("selected_epoch", "—")
+        training_accuracy = manifest.get("selected_validation_accuracy")
+        if training_accuracy is None:
+            training_accuracy = manifest.get("best_validation_accuracy")
+        training_accuracy = "—" if training_accuracy is None else _pct(training_accuracy)
+        checkpoint_name = Path(manifest.get("best_checkpoint_path") or
+                                manifest.get("checkpoint_path", "N/A")).name
         source = Path(entry["prediction_path"]).name
         if entry["prediction_generated"]:
             source += " (generated)"
         lines.append(
             f"| {label} | `{manifest['experiment_id']}` | {_dataset_description(manifest)} | "
-            f"{epoch} | {lr} | {decay} | `{source}` |"
+            f"`{checkpoint_name}` | {epoch} | {training_accuracy} | {lr} | {decay} | `{source}` |"
         )
 
     lines.extend([
         "", "## Overall metrics", "",
         "Accuracy is row-level top-1 accuracy. Balanced accuracy is the macro-average recall; because the "
         "frozen set has equal class support, it should closely match accuracy.", "",
+        "The checkpoint table's run-recorded selection accuracy is copied from the training manifest. The "
+        "metric table is recalculated from each persisted validation probability file, giving one consistent "
+        "inference-time comparison. The V1-all and V1-all → V0 records differ from their persisted predictions "
+        "by one validation row; the recalculated values are used in the comparisons below.", "",
         "| Checkpoint | Accuracy | Balanced accuracy | Macro F1 | Top-3 accuracy | MRR | Log loss ↓ | Brier ↓ | Δ balanced accuracy vs V1 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
@@ -581,15 +594,18 @@ def compare_checkpoint_set(checkpoints, *, data_dir="data/processed", artifact_d
 
     lines.extend([
         "", "## Paired changes from each base checkpoint", "",
-        "Corrected/regressed count rows where the continuation is correct/wrong relative to its base checkpoint.", "",
+        "Corrected/regressed counts are rows where the V0 continuation becomes correct or wrong relative to its base checkpoint.", "",
         "| Comparison | Δ accuracy | Δ balanced accuracy | 95% prompt-bootstrap CI for Δ balanced accuracy | Corrected | Regressed |",
         "|---|---:|---:|---:|---:|---:|",
     ])
-    for left, right in ((labels[0], labels[2]), (labels[1], labels[3])):
+    for left, right, transition in (
+        (labels[0], labels[2], "V1 base → V0 continuation"),
+        (labels[1], labels[3], "V1-all base → V0 continuation"),
+    ):
         pair = next(p for p in pairs if p["left"] == left and p["right"] == right)
         lm, rm = entries[left]["metrics"], entries[right]["metrics"]
         lines.append(
-            f"| {left} → {right} | {_pp_change(rm['accuracy'] - lm['accuracy'])} | "
+            f"| {transition} | {_pp_change(rm['accuracy'] - lm['accuracy'])} | "
             f"{_pp_change(pair['bacc_delta'])} | [{_pp_change(pair['bacc_ci_low'])}, {_pp_change(pair['bacc_ci_high'])}] | "
             f"{pair['left_corrected']} | {pair['left_regressed']} |"
         )
@@ -618,14 +634,31 @@ def compare_checkpoint_set(checkpoints, *, data_dir="data/processed", artifact_d
         )
 
     best_overall = max(labels, key=lambda name: entries[name]["metrics"]["balanced_accuracy"])
+    v1_to_v0_delta = entries[labels[2]]["metrics"]["balanced_accuracy"] - entries[labels[0]]["metrics"]["balanced_accuracy"]
+    v1all_to_v0_delta = entries[labels[3]]["metrics"]["balanced_accuracy"] - entries[labels[1]]["metrics"]["balanced_accuracy"]
+    v1_to_v0_pair = next(p for p in pairs if p["left"] == labels[0] and p["right"] == labels[2])
+    v1all_to_v0_pair = next(p for p in pairs if p["left"] == labels[1] and p["right"] == labels[3])
+    v1_to_v0_metrics = entries[labels[2]]["metrics"]
+    v1_metrics = entries[labels[0]]["metrics"]
+    v1all_to_v0_metrics = entries[labels[3]]["metrics"]
+    v1all_metrics = entries[labels[1]]["metrics"]
     lines.extend([
         "", "## Reading the result", "",
         f"- Highest balanced accuracy on this validation set: **{best_overall}** "
         f"({_pct(entries[best_overall]['metrics']['balanced_accuracy'])}).",
-        f"- V1 → V0 changed balanced accuracy by "
-        f"{_pp_change(entries[labels[2]]['metrics']['balanced_accuracy'] - entries[labels[0]]['metrics']['balanced_accuracy'])}; "
-        f"V1-all → V0 changed it by "
-        f"{_pp_change(entries[labels[3]]['metrics']['balanced_accuracy'] - entries[labels[1]]['metrics']['balanced_accuracy'])}.",
+        f"- V1 → V0 changed balanced accuracy by {_pp_change(v1_to_v0_delta)} "
+        f"(95% prompt-bootstrap CI [{_pp_change(v1_to_v0_pair['bacc_ci_low'])}, "
+        f"{_pp_change(v1_to_v0_pair['bacc_ci_high'])}]); V1-all → V0 changed it by "
+        f"{_pp_change(v1all_to_v0_delta)} (95% CI [{_pp_change(v1all_to_v0_pair['bacc_ci_low'])}, "
+        f"{_pp_change(v1all_to_v0_pair['bacc_ci_high'])}]). Both intervals include zero, so these validation "
+        "comparisons do not establish a reliable improvement under prompt resampling.",
+        f"- V1 → V0 has much worse probability scores than V1 (log loss {v1_to_v0_metrics['log_loss']:.2f} vs "
+        f"{v1_metrics['log_loss']:.2f}; Brier {v1_to_v0_metrics['multiclass_brier']:.3f} vs "
+        f"{v1_metrics['multiclass_brier']:.3f}), indicating severe overconfidence in its saved probabilities.",
+        f"- V1-all → V0 has the best top-1 and top-3 scores, but its log loss and Brier score are worse than "
+        f"V1-all ({v1all_to_v0_metrics['log_loss']:.2f} vs {v1all_metrics['log_loss']:.2f}; "
+        f"{v1all_to_v0_metrics['multiclass_brier']:.3f} vs {v1all_metrics['multiclass_brier']:.3f}); recalibration "
+        "should be evaluated separately before relying on its confidence values.",
         "- Validation comparisons are development evidence: these same V0 rows were used for checkpoint selection.",
         "- A positive bootstrap interval wholly above zero supports an improvement under prompt resampling; "
         "an interval spanning zero leaves the direction uncertain at this sample size.", "",
