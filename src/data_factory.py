@@ -200,6 +200,262 @@ def _normal_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", str(value)).casefold().split())
 
 
+def _external_content_text(value) -> str:
+    """Flatten the text-bearing shapes used by the downloaded conversation rows."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        text = value.get("text")
+        return text if isinstance(text, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def _stable_prompt_id(prompt: str, fallback: str) -> str:
+    normalized = _normal_text(prompt)
+    key = normalized if normalized else fallback
+    return "external_prompt_" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def build_v1_3_external_dataset(base_dataset_path: str | Path, glm_files: list[str | Path],
+                                glm_provenance_path: str | Path, gpt_traces_path: str | Path,
+                                output_dir: str | Path, *, dataset_version: str = "v1.3",
+                                validation_dataset: str = "v0") -> dict:
+    """Append the downloaded GLM-5.3-Flash and GPT-5.6 Sol/Luna rows to V1-all.
+
+    The source files are normalized into the training row schema, with row-level
+    provenance retained. GLM's label is dataset-attributed; GPT labels are read
+    from each trace. Empty assistant responses remain in the assembled input so
+    the clean pass can record and remove them in its audit.
+    """
+    if validation_dataset != "v0":
+        raise ValueError("V1.3 currently reuses the frozen V0 validation set")
+    base_dataset_path, output_dir = Path(base_dataset_path), Path(output_dir)
+    glm_files = [Path(path) for path in glm_files]
+    glm_provenance_path, gpt_traces_path = Path(glm_provenance_path), Path(gpt_traces_path)
+    required_files = [base_dataset_path, *glm_files, gpt_traces_path]
+    if not all(path.is_file() for path in required_files):
+        missing = [str(path) for path in required_files if not path.is_file()]
+        raise FileNotFoundError("missing V1.3 source files: " + ", ".join(missing))
+
+    base = pd.read_parquet(base_dataset_path).reset_index(drop=True)
+    required = {"id", "text", "model", "source_dataset", "prompt_id"}
+    if required - set(base.columns):
+        raise ValueError(f"V1-all is missing required columns: {sorted(required - set(base.columns))}")
+    if base.id.astype(str).duplicated().any():
+        raise ValueError("V1-all contains duplicate IDs")
+
+    provenance = pd.read_parquet(glm_provenance_path) if glm_provenance_path.is_file() else pd.DataFrame()
+    if not provenance.empty:
+        if "id" not in provenance:
+            raise ValueError("GLM provenance table has no id column")
+        provenance = provenance.drop_duplicates("id", keep="first").set_index("id")
+    glm_rows = []
+    glm_input_rows = 0
+    for source_path in glm_files:
+        frame = pd.read_parquet(source_path)
+        needed = {"id", "prompt", "response"}
+        if needed - set(frame.columns):
+            raise ValueError(f"{source_path} is missing columns: {sorted(needed - set(frame.columns))}")
+        glm_input_rows += len(frame)
+        if not provenance.empty:
+            joined = provenance.reindex(frame.id.astype(str))
+            for column in ("finish", "truncated", "cap_hit", "round", "source", "mode", "tokens"):
+                if column in joined:
+                    frame[f"_prov_{column}"] = joined[column].to_numpy()
+        frame = frame.reset_index(drop=True)
+        source_name = source_path.name
+        canonical_prompts = frame.prompt.fillna("").astype(str)
+        raw_ids = frame.id.fillna("").astype(str)
+        records = pd.DataFrame({
+            "id": ["v13_" + hashlib.sha256(
+                f"glm53_flash\0{source_name}\0{row_index}\0{raw_id}".encode("utf-8")).hexdigest()[:32]
+                for row_index, raw_id in enumerate(raw_ids)],
+            "text": frame.response.fillna("").astype(str),
+            "model": "glm-5.3-flash",
+            "source_dataset": "Zek-Takai/glm53-flash-harvest",
+            "source_file": source_name,
+            "source_license": "mit",
+            "source_row_id": raw_ids,
+            "source_corpus": "Zek-Takai/glm53-flash-harvest",
+            "source_model_attribution": "dataset_level",
+            "prompt_canon": canonical_prompts,
+            "prompt_id": [_stable_prompt_id(prompt, f"glm53_flash:{source_name}:{raw_id}")
+                          for prompt, raw_id in zip(canonical_prompts, raw_ids)],
+            "language": frame.get("lang", pd.Series("unknown", index=frame.index)).fillna("unknown").astype(str),
+            "provider": "zai",
+            "model_version": "glm-5.3-flash",
+            "register": frame.get("register"),
+            "thinking": frame.get("thinking"),
+            "source_finish_reason": frame.get("_prov_finish"),
+            "source_truncated": frame.get("_prov_truncated"),
+            "source_cap_hit": frame.get("_prov_cap_hit"),
+            "source_round": frame.get("_prov_round"),
+            "source_origin": frame.get("_prov_source"),
+            "source_mode": frame.get("_prov_mode"),
+            "source_tokens": frame.get("_prov_tokens", frame.get("tokens")),
+        })
+        glm_rows.append(records)
+    glm = pd.concat(glm_rows, ignore_index=True, sort=False) if glm_rows else pd.DataFrame()
+
+    gpt = pd.read_parquet(gpt_traces_path).reset_index(drop=True)
+    if "row_json" not in gpt:
+        raise ValueError("GPT Sol/Luna trace table is missing row_json")
+    gpt_records, parse_errors = [], 0
+    for row_index, row in gpt.iterrows():
+        try:
+            raw = json.loads(row.row_json) if isinstance(row.row_json, str) else row.row_json
+            if not isinstance(raw, dict):
+                raise ValueError("row_json is not an object")
+            messages = raw.get("messages") or []
+            users = [message.get("content") for message in messages
+                     if isinstance(message, dict) and message.get("role") == "user"]
+            assistants = [message.get("content") for message in messages
+                          if isinstance(message, dict) and message.get("role") == "assistant"]
+            raw_model = raw.get("teacher_model") or raw.get("model")
+            model = str(raw_model or "").removeprefix("openai/")
+            if model not in {"gpt-5.6-sol", "gpt-5.6-luna"}:
+                raise ValueError(f"unrecognized GPT model label {model!r}")
+            prompt = _external_content_text(users[-1]) if users else ""
+            response = _external_content_text(assistants[-1]) if assistants else ""
+            raw_id = str(row.get("row_hash") or row_index)
+            gpt_records.append({
+                "id": "v13_" + hashlib.sha256(
+                    f"gpt56_sol_luna\0{row_index}\0{raw_id}".encode("utf-8")).hexdigest()[:32],
+                "text": response, "model": model,
+                "source_dataset": str(row.get("first_source_dataset") or
+                                      "Crownelius/GPT-5.6-Sol-Luna-Terra-Traces"),
+                "source_file": gpt_traces_path.name, "source_license": "cc-by-4.0",
+                "source_row_id": raw_id,
+                "source_corpus": "Crownelius/GPT-5.6-Sol-Luna-Terra-Traces",
+                "source_model_attribution": "row_level_teacher_model_or_model",
+                "prompt_canon": prompt,
+                "prompt_id": _stable_prompt_id(prompt, f"gpt56_sol_luna:{raw_id}"),
+                "language": "en", "provider": "openai", "model_version": model,
+                "source_original_dataset": row.get("first_source_dataset"),
+                "source_original_config": row.get("first_source_config"),
+                "source_original_split": row.get("first_source_split"),
+                "source_trace_id": raw.get("source_trajectory_id"),
+                "source_category": raw.get("category"), "source_domain": raw.get("domain"),
+                "source_task": raw.get("task"), "source_reasoning_effort": raw.get("reasoning_effort"),
+            })
+        except (ValueError, TypeError, json.JSONDecodeError):
+            parse_errors += 1
+            # Keep a structurally invalid row in the assembled artifact so that
+            # its absence is represented by the subsequent clean audit.
+            raw_id = str(row.get("row_hash") or row_index)
+            gpt_records.append({
+                "id": "v13_" + hashlib.sha256(
+                    f"gpt56_sol_luna\0{row_index}\0{raw_id}".encode("utf-8")).hexdigest()[:32],
+                "text": "", "model": None,
+                "source_dataset": str(row.get("first_source_dataset") or
+                                      "Crownelius/GPT-5.6-Sol-Luna-Terra-Traces"),
+                "source_file": gpt_traces_path.name, "source_license": "cc-by-4.0",
+                "source_row_id": raw_id,
+                "source_corpus": "Crownelius/GPT-5.6-Sol-Luna-Terra-Traces",
+                "source_model_attribution": "parse_error", "prompt_canon": "",
+                "prompt_id": _stable_prompt_id("", f"gpt56_sol_luna:{raw_id}"),
+            })
+    gpt_normalized = pd.DataFrame(gpt_records)
+
+    external = pd.concat([glm, gpt_normalized], ignore_index=True, sort=False)
+    labels = set(base.model.dropna().astype(str).unique())
+    unknown = set(external.model.dropna().astype(str).unique()) - labels
+    if unknown:
+        raise ValueError(f"external sources contain labels absent from V1-all: {sorted(unknown)}")
+    if set(external.model.dropna().astype(str).unique()) != {
+            "glm-5.3-flash", "gpt-5.6-sol", "gpt-5.6-luna"}:
+        raise ValueError("external source labels did not include the expected GLM Flash, GPT Sol, and GPT Luna classes")
+
+    validation_profile_path = output_dir / "dataset_profile.json"
+    validation_split_path = output_dir / "splits_v0.parquet"
+    validation_data_path = output_dir / "dataset_v0.parquet"
+    if not all(path.is_file() for path in (validation_profile_path, validation_split_path, validation_data_path)):
+        raise FileNotFoundError("prepare V0 first; V1.3 must use its frozen validation split")
+    validation_profile = json.loads(validation_profile_path.read_text(encoding="utf-8"))
+    validation_assignments = pd.read_parquet(validation_split_path)
+    validation_ids = set(validation_assignments.loc[
+        validation_assignments.split.eq("validation"), "id"].astype(str))
+    v0 = pd.read_parquet(validation_data_path)
+    v0_validation = v0.loc[v0.id.astype(str).isin(validation_ids)]
+    if len(v0_validation) != int(validation_profile.get("validation_rows", -1)):
+        raise ValueError("V0 validation assignments do not match the frozen profile")
+    if "prompt_canon" in v0_validation:
+        validation_prompts = set(v0_validation.prompt_canon.fillna("").astype(str).map(_normal_text)) - {""}
+    else:
+        validation_prompts = set()
+    validation_prompt_ids = set(v0_validation.prompt_id.astype(str))
+    external_prompt_norm = external.prompt_canon.fillna("").astype(str).map(_normal_text)
+    overlap = (external.prompt_id.astype(str).isin(validation_prompt_ids)
+               | external_prompt_norm.isin(validation_prompts))
+    overlap_count = int(overlap.sum())
+    external = external.loc[~overlap].reset_index(drop=True)
+
+    base_ids = set(base.id.astype(str))
+    external_ids = set(external.id.astype(str))
+    if external_ids & base_ids:
+        raise ValueError("generated V1.3 external IDs overlap V1-all IDs")
+    combined = pd.concat([base, external], ignore_index=True, sort=False)
+    if combined.id.astype(str).duplicated().any():
+        raise ValueError("generated V1.3 dataset has duplicate row IDs")
+    if set(combined.model.dropna().astype(str).unique()) != labels:
+        raise ValueError("V1.3 class labels differ from V1-all")
+
+    output_path = output_dir / f"dataset_{dataset_version}.parquet"
+    profile_path = output_dir / f"dataset_profile_{dataset_version}.json"
+    if output_path.exists() or profile_path.exists():
+        if not (output_path.is_file() and profile_path.is_file()):
+            raise FileExistsError(f"partial {dataset_version} artifacts exist; refusing to overwrite")
+        old_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        old_data = pd.read_parquet(output_path)
+        if (old_profile.get("dataset_sha256") == hashlib.sha256(
+                old_data.to_csv(index=False, lineterminator="\n").encode("utf-8")).hexdigest()
+                and old_profile.get("source_hashes") == {str(path): _hash_file(path) for path in required_files}
+                and old_profile.get("validation_split_sha256") == validation_profile.get("split_sha256")):
+            return old_profile
+        raise FileExistsError(f"{dataset_version} artifacts exist for different source data; choose a new version")
+
+    combined = combined.sort_values("id", kind="stable").reset_index(drop=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(output_path, index=False)
+    source_hashes = {str(path): _hash_file(path) for path in required_files}
+    dataset_hash = hashlib.sha256(combined.to_csv(index=False, lineterminator="\n").encode("utf-8")).hexdigest()
+    profile = {
+        "dataset_version": dataset_version, "dataset_sha256": dataset_hash,
+        "rows": int(len(combined)), "training_only": True,
+        "classes": sorted(labels),
+        "class_counts": {str(k): int(v) for k, v in combined.model.value_counts().sort_index().items()},
+        "prompt_groups": int(combined.prompt_id.nunique()),
+        "source_counts": {str(k): int(v) for k, v in combined.source_dataset.value_counts().sort_index().items()},
+        "external_added_rows": int(len(external)),
+        "external_added_rows_by_model": {str(k): int(v) for k, v in external.model.value_counts().sort_index().items()},
+        "external_input_rows": {"glm53_flash": int(glm_input_rows), "gpt56_sol_luna": int(len(gpt))},
+        "gpt_trace_parse_errors": int(parse_errors),
+        "validation_prompt_overlap_rows_removed": overlap_count,
+        "base_dataset_path": str(base_dataset_path),
+        "base_dataset_sha256": _hash_file(base_dataset_path),
+        "source_hashes": source_hashes,
+        "curation_method": "v1_all_plus_normalized_external_glm53_flash_and_gpt56_sol_luna",
+        "validation_dataset_version": validation_dataset,
+        "validation_split_sha256": validation_profile["split_sha256"],
+        "validation_rows": int(len(v0_validation)),
+        "validation_ids_sha256": hashlib.sha256("\n".join(sorted(validation_ids)).encode()).hexdigest(),
+    }
+    profile_path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+    return profile
+
+
 def _language(text: str) -> str:
     from langdetect import detect
     try:
@@ -894,6 +1150,7 @@ def curate_v1_all_balanced_deduped(source_path: str | Path, output_dir: str | Pa
 
 
 def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path, *,
+                                dataset_version: str = "v1-all",
                                 validation_dataset: str = "v0", seed: int = 2026,
                                 minhash_permutations: int = 64,
                                 compact_char_similarity: float = 0.92,
@@ -903,8 +1160,9 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
 
     Clean removes only explicit, auditable defects. Compact starts from clean and
     removes only same-label responses verified as highly similar in both character
-    and word n-gram Jaccard space. No source quotas or model-performance signals
-    affect selection.
+    and word n-gram Jaccard space. ``dataset_version`` names the paired ``_clean``
+    and ``_compact`` outputs. No source quotas or model-performance signals affect
+    selection.
     """
     from datasketch import MinHash, MinHashLSH
     import zlib
@@ -1004,6 +1262,19 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
     clean_reasons["explicit_truncation_or_failure_marker"] = remove_clean(
         clean._normalized_text.map(lambda value: bool(trunc_re.search(value))),
         "explicit_truncation_or_failure_marker", "response ends with an explicit truncation/failure marker")
+    def explicit_true(column):
+        if column not in clean:
+            return pd.Series(False, index=clean.index)
+        return clean[column].map(lambda value: (str(value).strip().casefold() in {"true", "1", "yes"})
+                                 if pd.notna(value) else False)
+    finish = clean.get("source_finish_reason", pd.Series("", index=clean.index)).fillna("").astype(str).str.strip().str.casefold()
+    truncated_finish = finish.isin({"length", "max_tokens", "token_limit", "length_capped"})
+    clean_reasons["source_explicit_truncation_metadata"] = remove_clean(
+        explicit_true("source_truncated") | truncated_finish,
+        "source_explicit_truncation_metadata", "source metadata explicitly marks a truncated or length-capped response")
+    clean_reasons["source_explicit_cap_hit"] = remove_clean(
+        explicit_true("source_cap_hit"),
+        "source_explicit_cap_hit", "source metadata explicitly marks a generation cap hit")
 
     # Cross-label identical normalized text is a direct ambiguity; remove all members
     # and retain the row IDs as evidence. Same-label duplicates keep the best-backed row.
@@ -1238,9 +1509,11 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
         public = frame.copy()
         public.to_parquet(out_path, index=False)
         audit_columns = [c for c in ("_original_row_index", "_compact_row_index", "id", "model",
-            "source_dataset", "source_file", "prompt_id", "removal_reason", "evidence", "representative_id") if c in removals]
+            "source_dataset", "source_file", "source_row_id", "source_finish_reason",
+            "source_truncated", "source_cap_hit", "prompt_id", "removal_reason", "evidence",
+            "representative_id") if c in removals]
         audit = removals[audit_columns].copy() if len(removals) else pd.DataFrame(columns=audit_columns or
-            ["original_row_index", "id", "model", "source_dataset", "source_file", "prompt_id",
+            ["original_row_index", "id", "model", "source_dataset", "source_file", "source_row_id", "prompt_id",
              "removal_reason", "evidence", "representative_id"])
         audit.to_csv(audit_path, index=False, lineterminator="\n")
         profile = {
@@ -1253,7 +1526,7 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
             "classes": sorted(public.model.astype(str).unique()),
             "class_counts": {str(k): int(v) for k,v in public.model.value_counts().sort_index().items()},
             "prompt_groups": int(public.prompt_id.nunique()), "unique_sources": int(public.source_dataset.nunique()),
-            "training_only": True, "curation_method": f"v1_all_{'defect_clean' if version.endswith('_clean') else 'verified_redundancy_compact'}",
+            "training_only": True, "curation_method": f"{dataset_version}_{'defect_clean' if version.endswith('_clean') else 'verified_redundancy_compact'}",
             "seed": seed, "removals_by_reason": summary,
             "removed_rows": int(len(audit)), "removal_audit_path": str(audit_path),
             "removed_rows_with_representative": int(audit.representative_id.fillna("").astype(str).str.strip().ne("").sum())
@@ -1267,10 +1540,12 @@ def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path,
         return profile
 
     clean_removed = pd.concat([clean_removals], ignore_index=True) if len(clean_removals) else pd.DataFrame()
-    clean_profile = write_dataset(clean_rows, "v1-all_clean", clean_removed, clean_reasons)
-    compact_profile = write_dataset(compact, "v1-all_compact", compact_removed,
+    clean_version = f"{dataset_version}_clean"
+    compact_version = f"{dataset_version}_compact"
+    clean_profile = write_dataset(clean_rows, clean_version, clean_removed, clean_reasons)
+    compact_profile = write_dataset(compact, compact_version, compact_removed,
                                     {"verified_same_label_near_duplicate": int(len(compact_removed))},
-                                    parent_version="v1-all_clean")
+                                    parent_version=clean_version)
     return {
         "source_dataset_path": str(source_path), "source_dataset_sha256": source_hash,
         "clean": clean_profile, "compact": compact_profile,

@@ -1,0 +1,18 @@
+dataset_version: v1.3
+display_name: V1.3
+base_dataset_path: data/processed/dataset_v1_all.parquet
+glm_primary_files:
+  - data/raw/external_candidates/glm53_flash/data/glm53_harvest.parquet
+  - data/raw/external_candidates/glm53_flash/data/glm53_harvest_r2.parquet
+  - data/raw/external_candidates/glm53_flash/data/glm53_harvest_r3.parquet
+  - data/raw/external_candidates/glm53_flash/data/glm53_harvest_r4.parquet
+glm_provenance_path: data/raw/external_candidates/glm53_flash/data/provenance_r34.parquet
+gpt_traces_path: data/raw/external_candidates/gpt56_sol_luna/data/train.parquet
+output_dir: data/processed
+validation_dataset: v0
+seed: 2026
+minhash_permutations: 64
+compact_char_similarity: 0.92
+compact_word_similarity: 0.85
+tfidf_diagnostic_sample: 3000
+report_path: docs/v1_3_clean_compact.md

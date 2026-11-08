@@ -19,8 +19,9 @@ import yaml
 import joblib
 from sklearn.metrics import balanced_accuracy_score
 
-from .data_factory import (assemble_openpool_mix, assemble_v1_5, curate_openpool,
-                           curate_v1_all_balanced_deduped, curate_v1_all_clean_compact, prepare)
+from .data_factory import (assemble_openpool_mix, assemble_v1_5, build_v1_3_external_dataset,
+                           curate_openpool, curate_v1_all_balanced_deduped,
+                           curate_v1_all_clean_compact, prepare)
 from .evaluation import (align_predictions, complementarity, evaluate, paired_group_bootstrap)
 from .ensemble_factory import ensemble_probabilities
 from .feature_factory import load_or_fit
@@ -141,6 +142,7 @@ def curate_v1_all_clean_compact_data(config):
             source_path = alias
     result = curate_v1_all_clean_compact(
         source_path, cfg.get("output_dir", "data/processed"),
+        dataset_version=cfg.get("dataset_version", "v1-all"),
         validation_dataset=cfg.get("validation_dataset", "v0"),
         seed=cfg.get("seed", 2026),
         minhash_permutations=cfg.get("minhash_permutations", 64),
@@ -149,33 +151,71 @@ def curate_v1_all_clean_compact_data(config):
         tfidf_diagnostic_sample=cfg.get("tfidf_diagnostic_sample", 3000))
     report_path = Path(cfg.get("report_path", "docs/v1_all_clean_compact.md"))
     _write_v1_all_clean_compact_report(result, report_path,
-        cfg.get("output_dir", "data/processed"))
+        cfg.get("output_dir", "data/processed"),
+        dataset_version=cfg.get("dataset_version", "v1-all"),
+        display_name=cfg.get("display_name", cfg.get("dataset_version", "V1-all")))
     result["report_path"] = str(report_path)
     return result
 
 
-def _write_v1_all_clean_compact_report(result, path, data_dir):
+def build_v1_3_external_data(config):
+    """Assemble V1.3 from the two new raw corpora, then run clean and compact."""
+    cfg = _read_yaml(config)
+    output_dir = cfg.get("output_dir", "data/processed")
+    dataset_version = cfg.get("dataset_version", "v1.3")
+    base_profile = build_v1_3_external_dataset(
+        cfg.get("base_dataset_path", "data/processed/dataset_v1_all.parquet"),
+        cfg.get("glm_primary_files", []),
+        cfg.get("glm_provenance_path", "data/raw/external_candidates/glm53_flash/data/provenance_r34.parquet"),
+        cfg.get("gpt_traces_path", "data/raw/external_candidates/gpt56_sol_luna/data/train.parquet"),
+        output_dir, dataset_version=dataset_version,
+        validation_dataset=cfg.get("validation_dataset", "v0"))
+    clean_result = curate_v1_all_clean_compact(
+        Path(output_dir) / f"dataset_{dataset_version}.parquet", output_dir,
+        dataset_version=dataset_version,
+        validation_dataset=cfg.get("validation_dataset", "v0"),
+        seed=cfg.get("seed", 2026),
+        minhash_permutations=cfg.get("minhash_permutations", 64),
+        compact_char_similarity=cfg.get("compact_char_similarity", 0.92),
+        compact_word_similarity=cfg.get("compact_word_similarity", 0.85),
+        tfidf_diagnostic_sample=cfg.get("tfidf_diagnostic_sample", 3000))
+    report_path = Path(cfg.get("report_path", "docs/v1_3_clean_compact.md"))
+    display_name = cfg.get("display_name", "V1.3")
+    _write_v1_all_clean_compact_report(clean_result, report_path, output_dir,
+                                       dataset_version=dataset_version, display_name=display_name)
+    return {"dataset": base_profile, "clean": clean_result["clean"],
+            "compact": clean_result["compact"], "report_path": str(report_path),
+            "verified_near_duplicate_pairs": clean_result["verified_near_duplicate_pairs"],
+            "clean_stats": clean_result["clean_stats"],
+            "compact_stats": clean_result["compact_stats"]}
+
+
+def _write_v1_all_clean_compact_report(result, path, data_dir, *,
+                                       dataset_version="v1-all", display_name="V1-all"):
     before, clean, compact = result["before_stats"], result["clean_stats"], result["compact_stats"]
     clean_profile, compact_profile = result["clean"], result["compact"]
-    lines = ["# V1-all Clean and Compact Datasets", "",
-        "Input: `data/processed/dataset_v1_all.parquet`. Clean removes only explicit defects; compact starts from clean and removes verified same-label near duplicates. Neither pass uses source caps, class quotas, classifier outputs, or validation scores.", "",
+    clean_version, compact_version = f"{dataset_version}_clean", f"{dataset_version}_compact"
+    clean_label, compact_label = f"{display_name} clean", f"{display_name} compact"
+    input_path = f"{data_dir}/dataset_{dataset_version}.parquet"
+    lines = [f"# {display_name} Clean and Compact Datasets", "",
+        f"Input: `{input_path}`. Clean removes only explicit defects; compact starts from clean and removes verified same-label near duplicates. Neither pass uses source caps, class quotas, classifier outputs, or validation scores.", "",
         "## Dataset overview", "",
-        "| Metric | V1-all | Clean | Compact |", "|---|---:|---:|---:|"]
+        f"| Metric | {display_name} | Clean | Compact |", "|---|---:|---:|---:|"]
     for label, key in [("Total rows", "rows"), ("Unique prompts", "prompt_groups"), ("Unique sources", "unique_sources")]:
         lines.append(f"| {label} | {before[key]:,} | {clean[key]:,} | {compact[key]:,} |")
     lines.extend([
         f"| Exact/normalized duplicate responses removed in Clean | — | {clean_profile['removals_by_reason'].get('normalized_duplicate_response', 0):,} | — |",
         f"| Verified near-duplicate pairs | — | — | {result['verified_near_duplicate_pairs']:,} |",
         f"| Model-label conflict rows removed in Clean | — | {clean_profile['removals_by_reason'].get('conflicting_labels_for_identical_response', 0):,} | — |", "",
-        "## Per-model row counts", "", "| Model | V1-all | Clean | Compact | Clean retained | Compact retained from Clean |", "|---|---:|---:|---:|---:|---:|"])
+        "## Per-model row counts", "", f"| Model | {display_name} | Clean | Compact | Clean retained | Compact retained from Clean |", "|---|---:|---:|---:|---:|---:|"])
     for model in sorted(result["class_counts_before"]):
         a = result["class_counts_before"][model]; b = result["class_counts_clean"][model]; c = result["class_counts_compact"][model]
         lines.append(f"| {model} | {a:,} | {b:,} | {c:,} | {b/max(1,a):.1%} | {c/max(1,b):.1%} |")
     lines.extend(["", "## Removal audit", "", "### Clean", "", "| Reason | Rows removed |", "|---|---:|"])
     for reason, count in sorted(clean_profile["removals_by_reason"].items(), key=lambda item: (-item[1], item[0])):
         lines.append(f"| `{reason}` | {count:,} |")
-    clean_audit_path = Path(data_dir) / "v1-all_clean_removals.csv"
-    compact_audit_path = Path(data_dir) / "v1-all_compact_removals.csv"
+    clean_audit_path = Path(data_dir) / f"{clean_version}_removals.csv"
+    compact_audit_path = Path(data_dir) / f"{compact_version}_removals.csv"
     for title, audit_path in (("Clean examples", clean_audit_path), ("Compact examples", compact_audit_path)):
         lines.extend(["", f"### {title}", ""])
         audit = pd.read_csv(audit_path) if audit_path.exists() else pd.DataFrame()
@@ -193,7 +233,7 @@ def _write_v1_all_clean_compact_report(result, path, data_dir):
         f"Of {result['minhash_candidate_pair_count']:,} same-label candidate pairs, character 5-gram Jaccard P50/P90/max = {result['candidate_similarity']['character_5gram_jaccard']['p50']}, {result['candidate_similarity']['character_5gram_jaccard']['p90']}, {result['candidate_similarity']['character_5gram_jaccard']['max']}; word 3-gram Jaccard P50/P90/max = {result['candidate_similarity']['word_3gram_jaccard']['p50']}, {result['candidate_similarity']['word_3gram_jaccard']['p90']}, {result['candidate_similarity']['word_3gram_jaccard']['max']}. Verified-pair medians = {result['verified_similarity']['character_5gram_jaccard']['p50']} (character) and {result['verified_similarity']['word_3gram_jaccard']['p50']} (word); pairs sharing a prompt ID: {result['verified_pairs_same_prompt']:,}.",
         f"Repeated normalized templates occurring at least three times: {result['template_diagnostic']['templates_repeated_3plus']:,} templates / {result['template_diagnostic']['rows_in_repeated_templates']:,} rows. Prompt groups with multiple same-label rows: {result['prompt_redundancy_diagnostic']['model_prompt_groups_with_multiple_rows']:,} groups / {result['prompt_redundancy_diagnostic']['rows_in_repeated_model_prompt_groups']:,} rows. These diagnostic counts did not independently cause removals.",
         f"TF-IDF diagnostic: {result['tfidf_diagnostic']['method']}; sample {result['tfidf_diagnostic']['sample_size']:,}; nearest-neighbor cosine similarity P50/P90/max = {result['tfidf_diagnostic']['nearest_cosine_p50']}, {result['tfidf_diagnostic']['nearest_cosine_p90']}, {result['tfidf_diagnostic']['nearest_cosine_max']}. Diagnostic only; not used to select rows.", "",
-        "## Response characteristics", "", "| Statistic | V1-all | Clean | Compact |", "|---|---:|---:|---:|"])
+        "## Response characteristics", "", f"| Statistic | {display_name} | Clean | Compact |", "|---|---:|---:|---:|"])
     for key, label, fmt in [("length_chars", "Character length median (P10–P90)", ".0f"),
                             ("length_words", "Word count median (P10–P90)", ".0f")]:
         values = [before[key], clean[key], compact[key]]
@@ -210,16 +250,16 @@ def _write_v1_all_clean_compact_report(result, path, data_dir):
     compact_representative_pct = (f"{100 * compact_profile['removed_rows_with_representative'] / compact_profile['removed_rows']:.1f}%"
                                    if compact_profile["removed_rows"] else "N/A (no rows removed)")
     lines.extend(["", "## Integrity and validation", "",
-        f"All 18 labels remain. Clean rows originate from V1-all; compact is a subset of clean. Both profiles reuse the frozen V0 validation set ({clean_profile['validation_rows']} rows; split hash `{clean_profile['validation_split_sha256']}`), with zero validation ID or prompt-group overlap. The data loader adds the same V0 validation rows at training time; these Parquet artifacts contain training rows only.",
+        f"All 18 labels remain. Clean rows originate from {display_name}; compact is a subset of clean. Both profiles reuse the frozen V0 validation set ({clean_profile['validation_rows']} rows; split hash `{clean_profile['validation_split_sha256']}`), with zero validation ID or prompt-group overlap. The data loader adds the same V0 validation rows at training time; these Parquet artifacts contain training rows only.",
         "",
-        "Current V1-all removals by rule: " + ", ".join(f"`{key}` {value:,}" for key, value in clean_profile["removals_by_reason"].items()) + ".",
+        f"{display_name} removals by rule: " + ", ".join(f"`{key}` {value:,}" for key, value in clean_profile["removals_by_reason"].items()) + ".",
         f"Removed rows with a retained representative: Clean {clean_representative_pct}; Compact {compact_representative_pct}. Similarity is evidence of redundancy, not proof that either response is defective or that training accuracy will improve.",
         "",
         "### Ambiguous findings retained",
         "",
         "The source has no explicit completion-status or finish-reason field. Therefore only explicit text markers and direct metadata contradictions were treated as defects; plausible but unmarked truncation, unusual writing, and uncertain provenance were retained. `model_version` conflicts were checked only when the value exactly matched another canonical label. No attempt was made to verify that the claimed model generated a response.",
         "MinHash is an approximate candidate index. Zero verified pairs means no candidate pair passed both configured thresholds; it is not proof that no near-duplicates exist. TF-IDF diagnostics cover only the deterministic 3,000-row sample and did not affect selection.",
-        "", f"Profiles: `dataset_profile_v1-all_clean.json`, `dataset_profile_v1-all_compact.json`. Audits: `{clean_audit_path}`, `{compact_audit_path}`."])
+        "", f"Profiles: `dataset_profile_{clean_version}.json`, `dataset_profile_{compact_version}.json`. Audits: `{clean_audit_path}`, `{compact_audit_path}`."])
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1185,6 +1225,8 @@ def main(argv=None):
     vd.add_argument("--config",default="configs/data/v1_all_balanced_deduped.yaml")
     vc=d.add_parser("curate-clean-compact", help="create defect-only V1-all clean and redundancy-reduced compact datasets")
     vc.add_argument("--config",default="configs/data/v1_all_clean_compact.yaml")
+    v13=d.add_parser("build-v1-3", help="assemble V1.3 from the downloaded GLM/GPT corpora and run clean plus compact")
+    v13.add_argument("--config",default="configs/data/v1_3_external.yaml")
     mix=d.add_parser("assemble");mix.add_argument("--config",default="configs/data/mixed_v1_5.yaml")
     f=sub.add_parser("features").add_subparsers(dest="action",required=True);b=f.add_parser("build");b.add_argument("--dataset",default="v0");b.add_argument("--data-dir",default="data/processed");b.add_argument("--config",default="configs/features/default.yaml")
     m=sub.add_parser("models").add_subparsers(dest="action",required=True)
@@ -1259,6 +1301,7 @@ def main(argv=None):
     elif a.command=="data" and a.action=="curate-openpool": result=curate_openpool_data(a.config)
     elif a.command=="data" and a.action=="curate-balanced-deduped": result=curate_v1_all_balanced_deduped_data(a.config)
     elif a.command=="data" and a.action=="curate-clean-compact": result=curate_v1_all_clean_compact_data(a.config)
+    elif a.command=="data" and a.action=="build-v1-3": result=build_v1_3_external_data(a.config)
     elif a.command=="data" and a.action=="assemble": result=assemble_training_dataset(a.config)
     elif a.command=="features": result=build_features(a.dataset,a.data_dir,a.config)
     elif a.command=="models" and a.action=="train":
