@@ -242,11 +242,50 @@ def _pp_change(value):
 
 
 def _dataset_description(manifest):
+    sequence = manifest.get("training_sequence")
+    if sequence:
+        return " → ".join(_display_dataset(item) for item in sequence)
     dataset = manifest.get("dataset", "unknown")
     training = manifest.get("training_dataset")
     if training and training != dataset:
         return f"{dataset} (trained on {training})"
     return str(dataset)
+
+
+def _display_dataset(value):
+    value = str(value).strip().replace("_", "-")
+    return "V" + value[1:] if value[:1].lower() == "v" else value
+
+
+def _training_sequence(manifest, manifest_path, *, _visited=None):
+    """Resolve explicit stages or recursively follow a continuation's source run."""
+    visited = set() if _visited is None else set(_visited)
+    experiment_id = manifest.get("experiment_id")
+    if experiment_id:
+        if experiment_id in visited:
+            return []
+        visited.add(experiment_id)
+
+    sequence = manifest.get("training_sequence")
+    if sequence:
+        return [str(item) for item in sequence if item]
+
+    current = manifest.get("training_dataset") or manifest.get("dataset")
+    parent_id = manifest.get("continued_from_experiment")
+    if not parent_id:
+        return [str(current)] if current else []
+
+    parent_path = Path(manifest_path).parent / f"{parent_id}_manifest.json"
+    if parent_id in visited or not parent_path.is_file():
+        return (["continued", str(current)] if current else ["continued"])
+    try:
+        parent = json.loads(parent_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return (["continued", str(current)] if current else ["continued"])
+    sequence = _training_sequence(parent, parent_path, _visited=visited)
+    if current:
+        sequence.append(str(current))
+    return sequence
 
 
 def render_report(previous_manifest, new_manifest, classes, comparison, *,
@@ -342,6 +381,8 @@ def compare_checkpoints(previous, new, *, data_dir="data/processed", artifact_di
         previous, artifact_dir=artifact_dir, registry_path=registry_path)
     new_manifest, new_path = _load_manifest(new, artifact_dir=artifact_dir,
                                             registry_path=registry_path)
+    previous_manifest["training_sequence"] = _training_sequence(previous_manifest, previous_path)
+    new_manifest["training_sequence"] = _training_sequence(new_manifest, new_path)
     if str(previous_manifest["model"]).lower() != str(new_manifest["model"]).lower():
         raise ValueError("checkpoint comparison requires two checkpoints of the same model")
     if dataset != "v0":
@@ -390,4 +431,214 @@ def compare_checkpoints(previous, new, *, data_dir="data/processed", artifact_di
         "previous_log_loss": comparison["previous"]["log_loss"],
         "new_log_loss": comparison["new"]["log_loss"],
         "prediction_generated": {"previous": previous_generated, "new": new_generated},
+    }
+
+
+def _checkpoint_label_metrics(metrics):
+    """Keep scalar metrics for a multi-checkpoint report."""
+    return {key: metrics[key] for key in (
+        "accuracy", "balanced_accuracy", "macro_f1", "top3_accuracy", "mrr",
+        "log_loss", "multiclass_brier",
+    )}
+
+
+def compare_checkpoint_set(checkpoints, *, data_dir="data/processed", artifact_dir="artifacts",
+                           registry_path="experiments/registry.sqlite",
+                           output_path="docs/checkpoint_comparison.md", dataset="v0",
+                           bootstrap_replicates=2000, seed=2026):
+    """Compare 3+ checkpoints on the exact same frozen V0 validation rows.
+
+    ``checkpoints`` is an insertion-ordered mapping of display label to manifest
+    path or experiment ID. Pairwise predictions are ID-aligned and checked
+    against canonical V0 truth and prompt IDs before any metric is calculated.
+    """
+    from .pipeline import _load_dataset
+    from .evaluation import paired_group_bootstrap
+
+    if len(checkpoints) < 3:
+        raise ValueError("checkpoint set comparison requires at least three checkpoints")
+    if dataset != "v0":
+        raise ValueError("checkpoint set comparison currently uses frozen V0 validation only")
+
+    rows, _ = _load_dataset("v0", data_dir)
+    validation = rows.loc[rows.split.eq("validation")].copy()
+    validation = validation.sort_values("id", kind="stable").reset_index(drop=True)
+    classes = sorted(rows.model.astype(str).unique().tolist())
+    if len(validation) != 540:
+        raise ValueError(f"frozen V0 validation must contain 540 rows; found {len(validation)}")
+    profile = json.loads((Path(data_dir) / "dataset_profile.json").read_text(encoding="utf-8"))
+    split_hash = str(profile["split_sha256"])
+    ids_hash = hashlib.sha256("\n".join(validation.id.astype(str)).encode()).hexdigest()
+
+    entries = {}
+    truth = validation.model.astype(str).to_numpy()
+    groups = validation.prompt_id.astype(str).to_numpy()
+    for label, reference in checkpoints.items():
+        manifest, manifest_path = _load_manifest(reference, artifact_dir=artifact_dir,
+                                                  registry_path=registry_path)
+        if entries and str(manifest["model"]).lower() != str(next(iter(entries.values()))["manifest"]["model"]).lower():
+            raise ValueError("checkpoint set comparison requires checkpoints of the same model")
+        if manifest.get("classes") != classes:
+            raise ValueError(f"{label}: manifest class order differs from canonical V0 class order")
+        if manifest.get("validation_split_sha256") not in (None, split_hash):
+            raise ValueError(f"{label}: manifest references a different frozen V0 split")
+        if manifest.get("id_sha256") not in (None, ids_hash):
+            raise ValueError(f"{label}: manifest validation IDs differ from frozen V0")
+        manifest["training_sequence"] = _training_sequence(manifest, manifest_path)
+        frame, prediction_path, generated = _prediction_frame(
+            manifest, manifest_path, validation, classes, artifact_dir)
+        aligned, probabilities, _ = align_checkpoint_predictions(
+            frame, frame, classes, validation)
+        if not np.array_equal(aligned.y_true.astype(str).to_numpy(), truth):
+            raise ValueError(f"{label}: aligned truth does not match canonical V0 labels")
+        metrics = checkpoint_metrics(truth, probabilities, classes)
+        basic = evaluate(truth, probabilities, classes, probabilities=probabilities)
+        metrics["accuracy"] = float(np.mean(metrics["predictions"] == truth))
+        metrics["macro_f1"] = basic["macro_f1"]
+        metrics["multiclass_brier"] = basic["multiclass_brier"]
+        entries[str(label)] = {
+            "manifest": manifest, "manifest_path": manifest_path,
+            "prediction_path": prediction_path, "prediction_generated": generated,
+            "probabilities": probabilities, "metrics": metrics,
+        }
+
+    labels = list(entries)
+    predictions = {label: entry["metrics"]["predictions"] for label, entry in entries.items()}
+    pairs = []
+    for left_index, left in enumerate(labels):
+        for right in labels[left_index + 1:]:
+            pred_left, pred_right = predictions[left], predictions[right]
+            correct_left, correct_right = pred_left == truth, pred_right == truth
+            bootstrap = paired_group_bootstrap(
+                truth, pred_left, pred_right, groups,
+                n_bootstrap=bootstrap_replicates, seed=seed)
+            pairs.append({
+                "left": left, "right": right,
+                "agreement": float(np.mean(pred_left == pred_right)),
+                "left_corrected": int(np.sum(~correct_left & correct_right)),
+                "left_regressed": int(np.sum(correct_left & ~correct_right)),
+                "both_wrong": int(np.sum(~correct_left & ~correct_right)),
+                "either_correct": int(np.sum(correct_left | correct_right)),
+                "bacc_delta": bootstrap["delta_balanced_accuracy"],
+                "bacc_ci_low": bootstrap["lower"], "bacc_ci_high": bootstrap["upper"],
+            })
+
+    baseline = labels[0]
+    baseline_recalls = entries[baseline]["metrics"]["per_class"]
+    best_by_class = {
+        cls: max(labels, key=lambda name: entries[name]["metrics"]["per_class"][cls]["top1_recall"])
+        for cls in classes
+    }
+    lines = [
+        "# UltraBERT checkpoint comparison: V1, V1-all, and V0 continuations", "",
+        "## Scope and method", "",
+        "This report compares four saved UltraBERT checkpoints on the same frozen V0 validation rows. "
+        "Predictions are loaded from the run artifacts when available; missing predictions are generated "
+        "from the saved checkpoint. IDs, labels, prompt IDs, class order, and probability rows are validated "
+        "before scoring.", "",
+        f"- Validation rows: **{len(validation)}**; classes: **{len(classes)}**; prompt groups: **{len(np.unique(groups))}**.",
+        f"- Split SHA-256: `{split_hash}`.",
+        f"- Validation ID SHA-256: `{ids_hash}`.",
+        f"- Metrics: accuracy, balanced accuracy, macro F1, top-3 accuracy, mean reciprocal rank (MRR), "
+        f"log loss, and multiclass Brier score.",
+        f"- Bootstrap: paired prompt-group bootstrap with {bootstrap_replicates:,} replicates and seed {seed}; "
+        "intervals describe validation sampling uncertainty, not generalization guarantees.", "",
+        "## Checkpoints", "",
+        "| Stage | Experiment | Training sequence | Selected epoch | Learning rate | Decay | Validation predictions |",
+        "|---|---|---|---:|---:|---:|---|",
+    ]
+    for label, entry in entries.items():
+        manifest = entry["manifest"]
+        config = manifest.get("config") or {}
+        lr = config.get("learning_rate", "—")
+        decay = config.get("learning_rate_decay", "—")
+        epoch = manifest.get("selected_epoch")
+        if epoch is None:
+            epoch = (manifest.get("checkpoint_selection") or {}).get("selected_epoch", "—")
+        source = Path(entry["prediction_path"]).name
+        if entry["prediction_generated"]:
+            source += " (generated)"
+        lines.append(
+            f"| {label} | `{manifest['experiment_id']}` | {_dataset_description(manifest)} | "
+            f"{epoch} | {lr} | {decay} | `{source}` |"
+        )
+
+    lines.extend([
+        "", "## Overall metrics", "",
+        "Accuracy is row-level top-1 accuracy. Balanced accuracy is the macro-average recall; because the "
+        "frozen set has equal class support, it should closely match accuracy.", "",
+        "| Checkpoint | Accuracy | Balanced accuracy | Macro F1 | Top-3 accuracy | MRR | Log loss ↓ | Brier ↓ | Δ balanced accuracy vs V1 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    baseline_bacc = entries[baseline]["metrics"]["balanced_accuracy"]
+    for label, entry in entries.items():
+        m = entry["metrics"]
+        lines.append(
+            f"| {label} | {_pct(m['accuracy'])} | {_pct(m['balanced_accuracy'])} | {_pct(m['macro_f1'])} | "
+            f"{_pct(m['top3_accuracy'])} | {m['mrr']:.4f} | {m['log_loss']:.4f} | "
+            f"{m['multiclass_brier']:.4f} | {_pp_change(m['balanced_accuracy'] - baseline_bacc)} |"
+        )
+
+    lines.extend([
+        "", "## Paired changes from each base checkpoint", "",
+        "Corrected/regressed count rows where the continuation is correct/wrong relative to its base checkpoint.", "",
+        "| Comparison | Δ accuracy | Δ balanced accuracy | 95% prompt-bootstrap CI for Δ balanced accuracy | Corrected | Regressed |",
+        "|---|---:|---:|---:|---:|---:|",
+    ])
+    for left, right in ((labels[0], labels[2]), (labels[1], labels[3])):
+        pair = next(p for p in pairs if p["left"] == left and p["right"] == right)
+        lm, rm = entries[left]["metrics"], entries[right]["metrics"]
+        lines.append(
+            f"| {left} → {right} | {_pp_change(rm['accuracy'] - lm['accuracy'])} | "
+            f"{_pp_change(pair['bacc_delta'])} | [{_pp_change(pair['bacc_ci_low'])}, {_pp_change(pair['bacc_ci_high'])}] | "
+            f"{pair['left_corrected']} | {pair['left_regressed']} |"
+        )
+
+    lines.extend([
+        "", "## Per-class top-1 recall", "",
+        "| Target model | " + " | ".join(labels) + " | Best checkpoint |",
+        "|---|" + "---:|" * (len(labels) + 1),
+    ])
+    for cls in classes:
+        best = best_by_class[cls]
+        recalls = [entries[label]["metrics"]["per_class"][cls]["top1_recall"] for label in labels]
+        lines.append(f"| {_display(cls)} | " + " | ".join(_pct(x) for x in recalls) + f" | {best} |")
+
+    lines.extend([
+        "", "## Pairwise prediction and error overlap", "",
+        "Agreement compares the two models' predicted labels. 'Both wrong' counts rows both miss; "
+        "'either correct' is the oracle coverage if a selector could choose the right model per row.", "",
+        "| Pair | Prediction agreement | Both wrong | Either correct | Left corrected by right | Left regressed by right | Δ balanced accuracy, left → right |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ])
+    for p in pairs:
+        lines.append(
+            f"| {p['left']} vs {p['right']} | {_pct(p['agreement'])} | {p['both_wrong']} | {p['either_correct']} | "
+            f"{p['left_corrected']} | {p['left_regressed']} | {_pp_change(p['bacc_delta'])} |"
+        )
+
+    best_overall = max(labels, key=lambda name: entries[name]["metrics"]["balanced_accuracy"])
+    lines.extend([
+        "", "## Reading the result", "",
+        f"- Highest balanced accuracy on this validation set: **{best_overall}** "
+        f"({_pct(entries[best_overall]['metrics']['balanced_accuracy'])}).",
+        f"- V1 → V0 changed balanced accuracy by "
+        f"{_pp_change(entries[labels[2]]['metrics']['balanced_accuracy'] - entries[labels[0]]['metrics']['balanced_accuracy'])}; "
+        f"V1-all → V0 changed it by "
+        f"{_pp_change(entries[labels[3]]['metrics']['balanced_accuracy'] - entries[labels[1]]['metrics']['balanced_accuracy'])}.",
+        "- Validation comparisons are development evidence: these same V0 rows were used for checkpoint selection.",
+        "- A positive bootstrap interval wholly above zero supports an improvement under prompt resampling; "
+        "an interval spanning zero leaves the direction uncertain at this sample size.", "",
+    ])
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    return {
+        "report_path": str(output_path), "checkpoints": labels,
+        "metrics": {label: _checkpoint_label_metrics(entry["metrics"])
+                    for label, entry in entries.items()},
+        "pairwise": pairs,
+        "prediction_generated": {label: entry["prediction_generated"]
+                                 for label, entry in entries.items()},
     }

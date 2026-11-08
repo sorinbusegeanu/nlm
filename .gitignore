@@ -10,3 +10,7 @@ artifacts/runs/
 artifacts/final_runs/
 experiments/*.sqlite
 experiments/*.sqlite-*
+
+# Keep large downloaded candidate corpora local; retain their compact inventory.
+data/raw/external_candidates/**
+!data/raw/external_candidates/README.md

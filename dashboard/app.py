@@ -16,6 +16,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.registry import Registry
 from src.ensemble_registry import read_ensemble_registry
+from dashboard.training_lineage import training_lineage
 
 st.set_page_config(page_title="Name That LLM experiments", layout="wide")
 st.title("Name That LLM — experiment results")
@@ -234,18 +235,20 @@ def live_epoch_metrics(log_path):
 comparison = []
 for row in records:
     value = metrics(row)
+    run_manifest = manifest_for(row)
     weighted_accuracy = None
     if value.get("ensembles"):
         weighted = next((item for name, item in value["ensembles"].items()
                          if name.startswith("train_weighted:")), None)
         if weighted:
             weighted_accuracy = weighted.get("metrics", {}).get("balanced_accuracy")
-    row_validation_rows = value.get("validation_rows", manifest_for(row).get("validation_rows"))
+    row_validation_rows = value.get("validation_rows", run_manifest.get("validation_rows"))
     if row_validation_rows is None or pd.isna(row_validation_rows):
         row_validation_rows = profile_validation_rows
     comparison.append({"Experiment": f"{int(row['sequence_number']):04d}", "Description": row.get("description", ""),
         "Model": model_display(row["model"]), "Split": row["split"],
-        "acc_raw": value.get("balanced_accuracy"), "acc_weighted": weighted_accuracy, "Macro F1": value.get("macro_f1"),
+        "acc_raw": run_manifest.get("selected_validation_accuracy", value.get("balanced_accuracy")),
+        "acc_weighted": weighted_accuracy, "Macro F1": value.get("macro_f1"),
         "Log loss": value.get("log_loss"), "Runtime (s)": row.get("runtime_seconds"),
         "Validation rows": row_validation_rows,
         "Seed": row.get("seed"), "Created": row.get("created_at")})
@@ -478,7 +481,18 @@ with tabs[3]:
         model = canonical_model(row.get("model", ""))
         if row.get("split") != "validation" or "ensemble" in model.lower() or "+" in model:
             continue
-        accuracy = metrics(row).get("balanced_accuracy")
+        run_manifest = manifest_for(row)
+        # For checkpoint-selected runs, the manifest records the best epoch's
+        # validation score. Prefer it when choosing the displayed model maximum;
+        # stale registry scores from older prediction-order bugs can otherwise
+        # hide the selected checkpoint's actual validation result.
+        accuracy = run_manifest.get("selected_validation_accuracy")
+        if accuracy is None:
+            history = run_manifest.get("validation_metrics_by_epoch", [])
+            history_scores = [item.get("eval_balanced_accuracy", item.get("eval_accuracy"))
+                              for item in history]
+            history_scores = [float(value) for value in history_scores if value is not None]
+            accuracy = max(history_scores) if history_scores else metrics(row).get("balanced_accuracy")
         if accuracy is None or pd.isna(accuracy):
             continue
         # records are newest first, so ties keep the most recent run.
@@ -504,8 +518,8 @@ with tabs[3]:
             "Best accuracy (balanced)": best["accuracy"],
             "Train loss": selected_history.get("train_loss") if selected_history else None,
             "Best run": row.get("description") or row.get("experiment_id"),
-            "Training": " → ".join(map(str, manifest.get("training_sequence", [])))
-                if manifest.get("training_sequence") else manifest.get("dataset"),
+            "Training": training_lineage(
+                manifest, Path(row.get("artifact_path") or "artifacts/predictions").parent),
             "Recipe": (f"{manifest.get('feature_count')} features; "
                        f"baseline + {','.join(manifest.get('feature_recipe', {}).get('groups', []))}"
                        if manifest.get("feature_recipe") else None),

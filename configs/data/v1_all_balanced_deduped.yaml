@@ -1,0 +1,12 @@
+source_path: data/processed/dataset_v1-all.parquet
+output_dir: data/processed
+dataset_version: v1-all_balanced_deduped
+validation_dataset: v0
+seed: 2026
+near_duplicate_threshold: 0.90
+char_ngram_size: 5
+minhash_permutations: 64
+minimum_template_chars: 100
+template_min_repeats: 5
+source_median_multiplier: 3.0
+report_path: docs/v1_all_balanced_deduped.md

@@ -1,0 +1,9 @@
+source_path: data/processed/dataset_v1_all.parquet
+output_dir: data/processed
+validation_dataset: v0
+seed: 2026
+minhash_permutations: 64
+compact_char_similarity: 0.92
+compact_word_similarity: 0.85
+tfidf_diagnostic_sample: 3000
+report_path: docs/v1_all_clean_compact.md

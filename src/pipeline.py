@@ -19,7 +19,8 @@ import yaml
 import joblib
 from sklearn.metrics import balanced_accuracy_score
 
-from .data_factory import assemble_openpool_mix, assemble_v1_5, curate_openpool, prepare
+from .data_factory import (assemble_openpool_mix, assemble_v1_5, curate_openpool,
+                           curate_v1_all_balanced_deduped, curate_v1_all_clean_compact, prepare)
 from .evaluation import (align_predictions, complementarity, evaluate, paired_group_bootstrap)
 from .ensemble_factory import ensemble_probabilities
 from .feature_factory import load_or_fit
@@ -104,6 +105,166 @@ def curate_openpool_data(config):
         selection_method=cfg.get("selection_method", "source_stratified"),
         base_dataset_path=cfg.get("base_dataset_path"),
         additional_rows_by_class=cfg.get("additional_rows_by_class"))
+
+
+def curate_v1_all_balanced_deduped_data(config):
+    cfg = _read_yaml(config)
+    source_path = Path(cfg.get("source_path", "data/processed/dataset_v1-all.parquet"))
+    # The checked-in V1-all artifact predates the requested hyphenated alias.
+    if not source_path.exists() and source_path.name == "dataset_v1-all.parquet":
+        alias = source_path.with_name("dataset_v1_all.parquet")
+        if alias.exists():
+            source_path = alias
+    profile = curate_v1_all_balanced_deduped(
+        source_path, cfg.get("output_dir", "data/processed"),
+        dataset_version=cfg.get("dataset_version", "v1-all_balanced_deduped"),
+        validation_dataset=cfg.get("validation_dataset", "v0"),
+        seed=cfg.get("seed", 2026),
+        near_duplicate_threshold=cfg.get("near_duplicate_threshold", 0.90),
+        char_ngram_size=cfg.get("char_ngram_size", 5),
+        minhash_permutations=cfg.get("minhash_permutations", 64),
+        minimum_template_chars=cfg.get("minimum_template_chars", 100),
+        template_min_repeats=cfg.get("template_min_repeats", 5),
+        source_median_multiplier=cfg.get("source_median_multiplier", 3.0))
+    report_path = Path(cfg.get("report_path", "docs/v1_all_balanced_deduped.md"))
+    _write_v1_all_curation_report(profile, report_path)
+    profile["report_path"] = str(report_path)
+    return profile
+
+
+def curate_v1_all_clean_compact_data(config):
+    cfg = _read_yaml(config)
+    source_path = Path(cfg.get("source_path", "data/processed/dataset_v1_all.parquet"))
+    if not source_path.exists() and source_path.name == "dataset_v1-all.parquet":
+        alias = source_path.with_name("dataset_v1_all.parquet")
+        if alias.exists():
+            source_path = alias
+    result = curate_v1_all_clean_compact(
+        source_path, cfg.get("output_dir", "data/processed"),
+        validation_dataset=cfg.get("validation_dataset", "v0"),
+        seed=cfg.get("seed", 2026),
+        minhash_permutations=cfg.get("minhash_permutations", 64),
+        compact_char_similarity=cfg.get("compact_char_similarity", 0.92),
+        compact_word_similarity=cfg.get("compact_word_similarity", 0.85),
+        tfidf_diagnostic_sample=cfg.get("tfidf_diagnostic_sample", 3000))
+    report_path = Path(cfg.get("report_path", "docs/v1_all_clean_compact.md"))
+    _write_v1_all_clean_compact_report(result, report_path,
+        cfg.get("output_dir", "data/processed"))
+    result["report_path"] = str(report_path)
+    return result
+
+
+def _write_v1_all_clean_compact_report(result, path, data_dir):
+    before, clean, compact = result["before_stats"], result["clean_stats"], result["compact_stats"]
+    clean_profile, compact_profile = result["clean"], result["compact"]
+    lines = ["# V1-all Clean and Compact Datasets", "",
+        "Input: `data/processed/dataset_v1_all.parquet`. Clean removes only explicit defects; compact starts from clean and removes verified same-label near duplicates. Neither pass uses source caps, class quotas, classifier outputs, or validation scores.", "",
+        "## Dataset overview", "",
+        "| Metric | V1-all | Clean | Compact |", "|---|---:|---:|---:|"]
+    for label, key in [("Total rows", "rows"), ("Unique prompts", "prompt_groups"), ("Unique sources", "unique_sources")]:
+        lines.append(f"| {label} | {before[key]:,} | {clean[key]:,} | {compact[key]:,} |")
+    lines.extend([
+        f"| Exact/normalized duplicate responses removed in Clean | — | {clean_profile['removals_by_reason'].get('normalized_duplicate_response', 0):,} | — |",
+        f"| Verified near-duplicate pairs | — | — | {result['verified_near_duplicate_pairs']:,} |",
+        f"| Model-label conflict rows removed in Clean | — | {clean_profile['removals_by_reason'].get('conflicting_labels_for_identical_response', 0):,} | — |", "",
+        "## Per-model row counts", "", "| Model | V1-all | Clean | Compact | Clean retained | Compact retained from Clean |", "|---|---:|---:|---:|---:|---:|"])
+    for model in sorted(result["class_counts_before"]):
+        a = result["class_counts_before"][model]; b = result["class_counts_clean"][model]; c = result["class_counts_compact"][model]
+        lines.append(f"| {model} | {a:,} | {b:,} | {c:,} | {b/max(1,a):.1%} | {c/max(1,b):.1%} |")
+    lines.extend(["", "## Removal audit", "", "### Clean", "", "| Reason | Rows removed |", "|---|---:|"])
+    for reason, count in sorted(clean_profile["removals_by_reason"].items(), key=lambda item: (-item[1], item[0])):
+        lines.append(f"| `{reason}` | {count:,} |")
+    clean_audit_path = Path(data_dir) / "v1-all_clean_removals.csv"
+    compact_audit_path = Path(data_dir) / "v1-all_compact_removals.csv"
+    for title, audit_path in (("Clean examples", clean_audit_path), ("Compact examples", compact_audit_path)):
+        lines.extend(["", f"### {title}", ""])
+        audit = pd.read_csv(audit_path) if audit_path.exists() else pd.DataFrame()
+        if audit.empty:
+            lines.append("No rows were removed in this pass.")
+            continue
+        for reason, group in audit.groupby("removal_reason", sort=True):
+            lines.append(f"**`{reason}` — {len(group):,} rows.** Example rows (up to five):")
+            examples = group.head(5)
+            for _, row in examples.iterrows():
+                extra = f"; representative `{row.get('representative_id', '')}`" if pd.notna(row.get("representative_id")) and str(row.get("representative_id")) else ""
+                lines.append(f"- `{row.get('id', 'N/A')}`{extra}: {row.get('evidence', 'measured removal rule')}.")
+    lines.extend(["", "## Redundancy diagnostics", "",
+        f"Near-duplicate detection unions character 5-gram and word-trigram MinHash candidates (candidate threshold {result['similarity_thresholds']['minhash_candidate_threshold']:.2f}), then verifies exact character 5-gram Jaccard ≥ {result['similarity_thresholds']['character_5gram_jaccard']:.2f} and word 3-gram Jaccard ≥ {result['similarity_thresholds']['word_3gram_jaccard']:.2f}. Verified pairs: **{result['verified_near_duplicate_pairs']:,}**; connected clusters removed: **{result['near_duplicate_clusters']:,}**. Cluster sizes: `{result['near_duplicate_cluster_sizes']}`.",
+        f"Of {result['minhash_candidate_pair_count']:,} same-label candidate pairs, character 5-gram Jaccard P50/P90/max = {result['candidate_similarity']['character_5gram_jaccard']['p50']}, {result['candidate_similarity']['character_5gram_jaccard']['p90']}, {result['candidate_similarity']['character_5gram_jaccard']['max']}; word 3-gram Jaccard P50/P90/max = {result['candidate_similarity']['word_3gram_jaccard']['p50']}, {result['candidate_similarity']['word_3gram_jaccard']['p90']}, {result['candidate_similarity']['word_3gram_jaccard']['max']}. Verified-pair medians = {result['verified_similarity']['character_5gram_jaccard']['p50']} (character) and {result['verified_similarity']['word_3gram_jaccard']['p50']} (word); pairs sharing a prompt ID: {result['verified_pairs_same_prompt']:,}.",
+        f"Repeated normalized templates occurring at least three times: {result['template_diagnostic']['templates_repeated_3plus']:,} templates / {result['template_diagnostic']['rows_in_repeated_templates']:,} rows. Prompt groups with multiple same-label rows: {result['prompt_redundancy_diagnostic']['model_prompt_groups_with_multiple_rows']:,} groups / {result['prompt_redundancy_diagnostic']['rows_in_repeated_model_prompt_groups']:,} rows. These diagnostic counts did not independently cause removals.",
+        f"TF-IDF diagnostic: {result['tfidf_diagnostic']['method']}; sample {result['tfidf_diagnostic']['sample_size']:,}; nearest-neighbor cosine similarity P50/P90/max = {result['tfidf_diagnostic']['nearest_cosine_p50']}, {result['tfidf_diagnostic']['nearest_cosine_p90']}, {result['tfidf_diagnostic']['nearest_cosine_max']}. Diagnostic only; not used to select rows.", "",
+        "## Response characteristics", "", "| Statistic | V1-all | Clean | Compact |", "|---|---:|---:|---:|"])
+    for key, label, fmt in [("length_chars", "Character length median (P10–P90)", ".0f"),
+                            ("length_words", "Word count median (P10–P90)", ".0f")]:
+        values = [before[key], clean[key], compact[key]]
+        lines.append(f"| {label} | " + " | ".join(f"{v['0.5']:{fmt}} ({v['0.1']:{fmt}}–{v['0.9']:{fmt}})" for v in values) + " |")
+    for key, label in [("mean_lexical_diversity", "Mean type-token ratio"), ("markdown_fraction", "Markdown/structured formatting fraction"),
+                       ("code_block_fraction", "Code block fraction"), ("url_fraction", "URL fraction")]:
+        lines.append(f"| {label} | " + " | ".join(f"{x[key]:.2%}" for x in (before, clean, compact)) + " |")
+    for key, label in [("paragraph_count_median", "Median paragraphs per response"),
+                       ("repeated_openings_10plus", "Opening templates repeated ≥10 times"),
+                       ("repeated_endings_10plus", "Ending templates repeated ≥10 times")]:
+        lines.append(f"| {label} | " + " | ".join(f"{x[key]:,.1f}" if isinstance(x[key], float) else f"{x[key]:,}" for x in (before, clean, compact)) + " |")
+    clean_representative_pct = (f"{100 * clean_profile['removed_rows_with_representative'] / clean_profile['removed_rows']:.1f}%"
+                                if clean_profile["removed_rows"] else "N/A (no rows removed)")
+    compact_representative_pct = (f"{100 * compact_profile['removed_rows_with_representative'] / compact_profile['removed_rows']:.1f}%"
+                                   if compact_profile["removed_rows"] else "N/A (no rows removed)")
+    lines.extend(["", "## Integrity and validation", "",
+        f"All 18 labels remain. Clean rows originate from V1-all; compact is a subset of clean. Both profiles reuse the frozen V0 validation set ({clean_profile['validation_rows']} rows; split hash `{clean_profile['validation_split_sha256']}`), with zero validation ID or prompt-group overlap. The data loader adds the same V0 validation rows at training time; these Parquet artifacts contain training rows only.",
+        "",
+        "Current V1-all removals by rule: " + ", ".join(f"`{key}` {value:,}" for key, value in clean_profile["removals_by_reason"].items()) + ".",
+        f"Removed rows with a retained representative: Clean {clean_representative_pct}; Compact {compact_representative_pct}. Similarity is evidence of redundancy, not proof that either response is defective or that training accuracy will improve.",
+        "",
+        "### Ambiguous findings retained",
+        "",
+        "The source has no explicit completion-status or finish-reason field. Therefore only explicit text markers and direct metadata contradictions were treated as defects; plausible but unmarked truncation, unusual writing, and uncertain provenance were retained. `model_version` conflicts were checked only when the value exactly matched another canonical label. No attempt was made to verify that the claimed model generated a response.",
+        "MinHash is an approximate candidate index. Zero verified pairs means no candidate pair passed both configured thresholds; it is not proof that no near-duplicates exist. TF-IDF diagnostics cover only the deterministic 3,000-row sample and did not affect selection.",
+        "", f"Profiles: `dataset_profile_v1-all_clean.json`, `dataset_profile_v1-all_compact.json`. Audits: `{clean_audit_path}`, `{compact_audit_path}`."])
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_v1_all_curation_report(profile, path):
+    lines = ["# V1-all Balanced and Deduped Dataset", "",
+             f"Input: `{profile['source_dataset_path']}`  ",
+             f"Output: `data/processed/dataset_{profile['dataset_version']}.parquet`  ",
+             f"Method: `{profile['curation_method']}`; seed {profile['seed']}; word-trigram MinHash candidates verified with character {profile['char_ngram_size']}-gram Jaccard at threshold {profile['near_duplicate_threshold']:.2f}.", "",
+             "## Dataset size and reduction", "",
+             "| Metric | V1-all | New dataset | Change |", "|---|---:|---:|---:|"]
+    original_rows = sum(v["original_count"] for v in profile["class_summary"].values())
+    original_sources = profile["unique_sources_before"]
+    selected_sources = profile["unique_sources"]
+    lines.extend([
+        f"| Total rows | {original_rows:,} | {profile['rows']:,} | {profile['rows']-original_rows:+,} ({100*profile['rows']/max(1,original_rows):.1f}% retained) |",
+        f"| Unique prompts | {profile['unique_prompts_before']:,} | {profile['unique_prompts_after']:,} | {profile['unique_prompts_after']-profile['unique_prompts_before']:+,} |",
+        f"| Unique sources | {original_sources:,} | {selected_sources:,} | {selected_sources-original_sources:+,} |",
+        f"| Near-duplicate clusters | N/A | {profile['near_duplicate_clusters']:,} | Verified pairs: {profile['near_duplicate_pairs_verified']:,} |", "",
+        "## Per-class summary", "",
+        "| Model | Original | Retained | Retained % | Unique prompts | Sources |", "|---|---:|---:|---:|---:|---:|"])
+    for label, row in sorted(profile["class_summary"].items(), key=lambda kv: (-kv[1]["retained_count"], kv[0])):
+        lines.append(f"| {label} | {row['original_count']:,} | {row['retained_count']:,} | {row['retained_fraction']:.1%} | {row['unique_prompts_retained']:,} | {row['sources_retained']} |")
+    lines.extend(["", "## Filtering summary", "", "| Removal reason | Rows |", "|---|---:|"])
+    for reason, count in sorted(profile["removals_by_reason"].items(), key=lambda kv: -kv[1]):
+        lines.append(f"| {reason} | {count:,} |")
+    lines.extend(["", f"Rows removed: **{profile['removed_rows']:,}**. Suspicious exact cross-label conflicts: **{profile['suspicious_exact_label_conflict_rows']:,} rows**; near-duplicate cross-label clusters flagged for review: **{profile['suspicious_near_duplicate_cross_label_clusters']:,}**.",
+        "", "| Length percentile (characters) | V1-all | New dataset |", "|---|---:|---:|"])
+    for q, name in zip(["0.0", "0.1", "0.5", "0.9", "1.0"], ["Min", "P10", "Median", "P90", "Max"]):
+        lines.append(f"| {name} | {profile['length_chars_before'][q]:,.0f} | {profile['length_chars_after'][q]:,.0f} |")
+    before = profile["source_concentration_before"]
+    after = profile["source_concentration_after"]
+    lines.extend(["", "| Source concentration | V1-all | New dataset |", "|---|---:|---:|"])
+    for metric, title in [("largest_source_fraction", "Mean largest-source share across classes"), ("top3_source_fraction", "Mean top-three-source share across classes")]:
+        b = sum(v[metric] for v in before.values()) / len(before)
+        a = sum(v[metric] for v in after.values()) / len(after)
+        lines.append(f"| {title} | {b:.1%} | {a:.1%} |")
+    lines.extend(["", "## Assessment", "",
+        f"Selection was label-preserving and used no model predictions or validation scores. Exact duplicate text was checked across labels; word-trigram MinHash candidates were verified by character n-gram Jaccard. The reported zero near-duplicate clusters means no candidate pair passed verification; MinHash candidate generation is approximate and does not prove that no near-duplicates exist. Long repeated templates and statistical prompt outliers were reduced within each label. The adaptive source cap is max(Q3, min(Tukey upper fence, {profile.get('source_median_multiplier', 3.0):g} times the class median source count)). There are no equal class quotas. Source-cap selection round-robins response-length, formatting and lexical-richness bins while preferring complete provenance.",
+        "", f"All 18 labels remain. Validation isolation: {profile['validation_rows']} frozen V0 rows, split hash `{profile['validation_split_sha256']}`, ID overlap {profile['validation_id_overlap']}, prompt overlap {profile['validation_prompt_overlap']}. The V0 validation data and the V1-all source artifact were read-only.",
+        "", "Removal audit: `data/processed/" + Path(profile["removal_audit_path"]).name + "`. Profile: `data/processed/dataset_profile_" + profile["dataset_version"] + ".json`."])
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def assemble_training_dataset(config):
@@ -637,11 +798,21 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
     source = json.loads(source_path.read_text())
     if source.get("model") != model:
         raise ValueError(f"source experiment is {source.get('model')}, expected {model}")
-    source_checkpoint = Path(source["checkpoint_path"])
+    # Training manifests commonly point at the checkpoint container, while
+    # `train_encoder_fold(select_best_checkpoint=True)` saves the selected
+    # epoch in its nested best_checkpoint directory. Prefer an explicit best
+    # path, then discover that nested checkpoint before resuming.
+    raw_checkpoint = source.get("best_checkpoint_path") or source.get("checkpoint_path")
+    if not raw_checkpoint:
+        raise FileNotFoundError("source experiment manifest has no checkpoint path")
+    source_checkpoint = Path(raw_checkpoint)
     if not source_checkpoint.is_absolute() and not source_checkpoint.exists():
         source_checkpoint = Path(artifact_dir) / source_checkpoint
     if not source_checkpoint.is_dir():
         raise FileNotFoundError(f"source checkpoint not found: {source_checkpoint}")
+    nested_best = source_checkpoint / "best_checkpoint"
+    if nested_best.is_dir():
+        source_checkpoint = nested_best
 
     rows, data_dir = _load_dataset(dataset, data_dir)
     profile = _effective_profile(data_dir, dataset, rows)
@@ -654,21 +825,27 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         raise ValueError("source checkpoint class labels differ from the target dataset")
 
     source_key = hashlib.sha256(from_experiment.encode()).hexdigest()[:8]
+    cfg = source.get("config", {})
     config_snapshot = {
-        "model": model, "dataset": "v1.5", "training_dataset": dataset,
+        "model": model, "dataset": dataset, "training_dataset": dataset,
         "continued_from_experiment": from_experiment,
         "epochs": int(epochs), "learning_rate": float(learning_rate),
         "learning_rate_decay": float(learning_rate_decay), "seed": int(seed),
         "optimizer": optimizer, "weight_decay": float(weight_decay),
         "early_stopping_patience": cfg.get("early_stopping_patience", 3),
         "batch_size": int(source.get("config", {}).get("batch_size", 8)),
+        "auto_batch_size": bool(source.get("config", {}).get("auto_batch_size", False)),
+        "max_batch_size": int(source.get("config", {}).get("max_batch_size", 1024)),
+        "batch_probe_safety_fraction": float(source.get("config", {}).get("batch_probe_safety_fraction", 0.95)),
         "gradient_accumulation_steps": int(source.get("config", {}).get("gradient_accumulation_steps", 1)),
         "max_length": int(source.get("config", {}).get("max_length", 384)),
+        "warmup_ratio": float(source.get("config", {}).get("warmup_ratio", 0.0)),
+        "lr_scheduler_type": source.get("config", {}).get("lr_scheduler_type", "linear"),
         "baseline_validation_before_training": True,
         "checkpoint_selection": "highest_validation_accuracy",
     }
     config_hash = _sha(config_snapshot)
-    experiment_id = (f"{model}_v15_from{source_key}_data{profile['dataset_sha256'][:8]}_"
+    experiment_id = (f"{model}_{dataset}_from{source_key}_data{profile['dataset_sha256'][:8]}_"
                     f"split{profile['split_sha256'][:8]}_seed{seed}_cfg{config_hash[:8]}_code{_revision()[:7]}")
     run_dir = Path(artifact_dir) / "runs" / experiment_id
     prediction_path = manifests_dir / f"{experiment_id}_validation.parquet"
@@ -682,7 +859,6 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
     if run_dir.exists():
         raise FileExistsError(f"incomplete continuation run exists at {run_dir}")
 
-    cfg = source.get("config", {})
     result = train_encoder_fold(
         train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
         checkpoint=source.get("checkpoint_id") or str(source_checkpoint),
@@ -717,6 +893,7 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         "selected_epoch": result["best_epoch"],
         "selected_validation_accuracy": result["best_validation_accuracy"],
         "checkpoint_selection_metric": result["checkpoint_selection_metric"],
+        "checkpoint_scoring_method": result.get("checkpoint_scoring_method"),
         "train_rows": len(train), "validation_rows": len(valid), "classes": classes,
         "dataset_sha256": profile["dataset_sha256"], "split_sha256": profile["split_sha256"],
         "code_revision": _revision(), "model_revision": source.get("model_revision"),
@@ -1004,6 +1181,10 @@ def main(argv=None):
     restart.add_argument("--seed",type=int,default=2026);restart.add_argument("--bootstrap-replicates",type=int,default=2000)
     d=sub.add_parser("data").add_subparsers(dest="action",required=True);p=d.add_parser("prepare");p.add_argument("--config",default="configs/data/official_v0.yaml")
     oc=d.add_parser("curate-openpool");oc.add_argument("--config",default="configs/data/openpool_v1.yaml")
+    vd=d.add_parser("curate-balanced-deduped", help="quality and diversity curation for V1-all without class quotas")
+    vd.add_argument("--config",default="configs/data/v1_all_balanced_deduped.yaml")
+    vc=d.add_parser("curate-clean-compact", help="create defect-only V1-all clean and redundancy-reduced compact datasets")
+    vc.add_argument("--config",default="configs/data/v1_all_clean_compact.yaml")
     mix=d.add_parser("assemble");mix.add_argument("--config",default="configs/data/mixed_v1_5.yaml")
     f=sub.add_parser("features").add_subparsers(dest="action",required=True);b=f.add_parser("build");b.add_argument("--dataset",default="v0");b.add_argument("--data-dir",default="data/processed");b.add_argument("--config",default="configs/features/default.yaml")
     m=sub.add_parser("models").add_subparsers(dest="action",required=True)
@@ -1036,6 +1217,16 @@ def main(argv=None):
     cc.add_argument("--artifact-dir",default="artifacts")
     cc.add_argument("--registry",default="experiments/registry.sqlite")
     cc.add_argument("--output",default="docs/checkpoint_comparison.md")
+    ccs=m.add_parser("compare-checkpoint-set",help="compare 3+ same-model checkpoints on frozen V0 validation")
+    ccs.add_argument("--checkpoint",action="append",required=True,metavar="LABEL=REFERENCE",
+        help="display label and experiment ID or manifest path; repeat in desired report order")
+    ccs.add_argument("--dataset",default="v0",choices=["v0"])
+    ccs.add_argument("--data-dir",default="data/processed")
+    ccs.add_argument("--artifact-dir",default="artifacts")
+    ccs.add_argument("--registry",default="experiments/registry.sqlite")
+    ccs.add_argument("--output",default="docs/checkpoint_comparison.md")
+    ccs.add_argument("--bootstrap-replicates",type=int,default=2000)
+    ccs.add_argument("--seed",type=int,default=2026)
     ft=m.add_parser("fit-final");ft.add_argument("--model",choices=MODEL_CONFIGS,default="svc");ft.add_argument("--dataset",default="v0");ft.add_argument("--config");ft.add_argument("--registry",default="experiments/registry.sqlite");ft.add_argument("--accept-config-defaults",action="store_true")
     e=sub.add_parser("ensemble").add_subparsers(dest="action",required=True);q=e.add_parser("evaluate");q.add_argument("--dataset",default="v0");q.add_argument("--artifact-dir",default="artifacts");q.add_argument("--bootstrap-replicates",type=int,default=2000);q.add_argument("--models",nargs="+",choices=ENSEMBLE_MODEL_CHOICES);q.add_argument("--force",action="store_true")
     pred=sub.add_parser("prediction").add_subparsers(dest="action",required=True)
@@ -1066,6 +1257,8 @@ def main(argv=None):
     if a.command=="restart": result=restart_mvp(models=a.models,seed=a.seed,bootstrap_replicates=a.bootstrap_replicates)
     elif a.command=="data" and a.action=="prepare": result=prepare_data(a.config)
     elif a.command=="data" and a.action=="curate-openpool": result=curate_openpool_data(a.config)
+    elif a.command=="data" and a.action=="curate-balanced-deduped": result=curate_v1_all_balanced_deduped_data(a.config)
+    elif a.command=="data" and a.action=="curate-clean-compact": result=curate_v1_all_clean_compact_data(a.config)
     elif a.command=="data" and a.action=="assemble": result=assemble_training_dataset(a.config)
     elif a.command=="features": result=build_features(a.dataset,a.data_dir,a.config)
     elif a.command=="models" and a.action=="train":
@@ -1089,6 +1282,22 @@ def main(argv=None):
         result=compare_checkpoints(a.previous,a.new,data_dir=a.data_dir,
             artifact_dir=a.artifact_dir,registry_path=a.registry,
             output_path=a.output,dataset=a.dataset)
+    elif a.command=="models" and a.action=="compare-checkpoint-set":
+        from .checkpoint_comparison import compare_checkpoint_set
+        checkpoint_map={}
+        for item in a.checkpoint:
+            if "=" not in item:
+                raise ValueError(f"--checkpoint must be LABEL=REFERENCE; got {item!r}")
+            label, reference=item.split("=",1)
+            if not label.strip() or not reference.strip():
+                raise ValueError(f"--checkpoint must have nonempty label and reference; got {item!r}")
+            if label.strip() in checkpoint_map:
+                raise ValueError(f"duplicate checkpoint label: {label.strip()}")
+            checkpoint_map[label.strip()]=reference.strip()
+        result=compare_checkpoint_set(checkpoint_map,data_dir=a.data_dir,
+            artifact_dir=a.artifact_dir,registry_path=a.registry,
+            output_path=a.output,dataset=a.dataset,
+            bootstrap_replicates=a.bootstrap_replicates,seed=a.seed)
     elif a.command=="models" and a.action=="continue-qwen":
         cfg = _model_cfg("qwen06", a.config); cfg["epochs"] = a.epochs
         overrides = _confirm_training_config("qwen06", cfg, accept_defaults=a.accept_config_defaults)

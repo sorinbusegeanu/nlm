@@ -526,10 +526,37 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         eval_dataset=val if validation_labels is not None else None,
         compute_metrics=compute_metrics if validation_labels is not None else None,
         processing_class=tokenizer, callbacks=callbacks)
+    # Trainer's length-grouped prediction sampler can return predictions in a
+    # different row order from the supplied text list. Use a sequential loader
+    # for baseline, calibration and final validation scores so outputs remain
+    # aligned with their original ids and labels.
+    from torch.utils.data import DataLoader
+    prediction_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(prediction_device)
+    prediction_dtype = (torch.bfloat16 if use_bf16 else
+                       torch.float16 if use_fp16 else None)
+
+    def predict_in_input_order(texts):
+        dataset = _TextDataset(texts, None, tokenizer, max_length)
+        loader = DataLoader(dataset, batch_size=effective_batch_size, shuffle=False,
+                            collate_fn=data_collator, num_workers=0)
+        chunks = []
+        model.eval()
+        with torch.inference_mode():
+            for batch in loader:
+                batch = {key: value.to(prediction_device) for key, value in batch.items()}
+                amp = (torch.autocast(device_type="cuda", dtype=prediction_dtype)
+                       if prediction_device.type == "cuda" and prediction_dtype is not None
+                       else nullcontext())
+                with amp:
+                    output = model(**batch)
+                chunks.append(output.logits.float().cpu().numpy())
+        return np.concatenate(chunks, axis=0) if chunks else np.empty((0, len(classes)))
+
     baseline_logits = None
     baseline_metrics = None
     if validate_before_training:
-        baseline_logits = np.asarray(trainer.predict(val).predictions)
+        baseline_logits = predict_in_input_order(validation_text)
         baseline_predictions = np.asarray(classes)[baseline_logits.argmax(axis=1)]
         from sklearn.metrics import accuracy_score, balanced_accuracy_score, log_loss
         baseline_metrics = {
@@ -554,11 +581,11 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "metric": "validation_accuracy", "selected_epoch": best_state["epoch"],
             "selected_validation_accuracy": best_state["accuracy"],
             "best_checkpoint": str(best_dir)}, indent=2) + "\n")
-    train_logits = np.asarray(trainer.predict(train).predictions)
+    train_logits = predict_in_input_order(train_text)
     train_labels = list(y_train)
     temperature = _fit_temperature(train_logits, train_labels, classes)
     pred_start = time.perf_counter()
-    logits = np.asarray(trainer.predict(val).predictions)
+    logits = predict_in_input_order(validation_text)
     inference_seconds = time.perf_counter() - pred_start
     model.save_pretrained(output_dir, safe_serialization=True); tokenizer.save_pretrained(output_dir)
     if not np.isfinite(logits).all(): raise ValueError("encoder produced non-finite scores")
@@ -578,6 +605,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "validation_metrics_by_epoch": epoch_history,
             "best_epoch": best_state["epoch"],
             "best_validation_accuracy": best_state["accuracy"] if best_state["epoch"] is not None else None,
+            "checkpoint_scoring_method": "sequential_restored_model_forward",
             "early_stopping": (_early_stopping_summary(early_stopping_callback, early_stopping_patience, epochs)
                                if early_stopping_callback is not None else None),
             "checkpoint_selection_metric": "validation_accuracy" if select_best_checkpoint else None,

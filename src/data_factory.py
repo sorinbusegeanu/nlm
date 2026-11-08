@@ -538,6 +538,780 @@ def curate_openpool(source_path: str | Path, output_dir: str | Path, *, dataset_
     return profile
 
 
+def curate_v1_all_balanced_deduped(source_path: str | Path, output_dir: str | Path, *,
+                                    dataset_version: str = "v1-all_balanced_deduped",
+                                    validation_dataset: str = "v0", seed: int = 2026,
+                                    near_duplicate_threshold: float = 0.90,
+                                    char_ngram_size: int = 5, minhash_permutations: int = 64,
+                                    minimum_template_chars: int = 100,
+                                    template_min_repeats: int = 5,
+                                    source_median_multiplier: float = 3.0) -> dict:
+    """Curate V1-all by conservative quality, duplicate, template and diversity rules.
+
+    No class quotas are used. Selection depends only on the supplied response,
+    prompt, label and provenance columns. The artifact reuses frozen V0 validation.
+    """
+    from datasketch import MinHash, MinHashLSH
+    import zlib
+
+    if not 0 < near_duplicate_threshold < 1:
+        raise ValueError("near_duplicate_threshold must be in (0, 1)")
+    if char_ngram_size < 2 or minhash_permutations < 16:
+        raise ValueError("char_ngram_size must be >= 2 and minhash_permutations >= 16")
+    if source_median_multiplier < 1:
+        raise ValueError("source_median_multiplier must be >= 1")
+    if validation_dataset != "v0":
+        raise ValueError("this curation reuses the frozen V0 validation set")
+    source_path, output_dir = Path(source_path), Path(output_dir)
+    if not source_path.is_file():
+        raise FileNotFoundError(source_path)
+    data = pd.read_parquet(source_path).reset_index(drop=True)
+    required = {"id", "text", "model", "source_dataset", "prompt_id"}
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(f"source dataset missing required columns: {sorted(missing)}")
+    if data.model.nunique(dropna=True) != 18:
+        raise ValueError(f"expected 18 model labels; found {data.model.nunique(dropna=True)}")
+    original_classes = set(data.model.dropna().astype(str))
+    data["_original_index"] = np.arange(len(data), dtype=np.int64)
+    data["_text_norm"] = data.text.fillna("").astype(str).map(_normal_text)
+    data["_prompt_key"] = data.get("prompt_canon", pd.Series(index=data.index, dtype=object)).fillna("").astype(str).str.strip()
+    data.loc[data._prompt_key.eq(""), "_prompt_key"] = data.loc[data._prompt_key.eq(""), "prompt_id"].astype(str)
+    removal_parts: list[pd.DataFrame] = []
+
+    def remove(mask, reason):
+        mask = pd.Series(mask, index=data.index).fillna(False).astype(bool) & data._keep
+        if mask.any():
+            chunk = data.loc[mask].copy()
+            chunk["removal_reason"] = reason
+            removal_parts.append(chunk)
+            data.loc[mask, "_keep"] = False
+        return int(mask.sum())
+
+    data["_keep"] = True
+    reasons: dict[str, int] = {}
+    required_valid = (data.id.notna() & data.id.astype(str).str.strip().ne("") & data.model.notna()
+                      & data.text.notna() & data._text_norm.str.len().gt(0)
+                      & data.source_dataset.notna() & data.source_dataset.astype(str).str.strip().ne("")
+                      & data.prompt_id.notna() & data.prompt_id.astype(str).str.strip().ne(""))
+    reasons["missing_or_structurally_empty_required_fields"] = remove(~required_valid, "missing_or_structurally_empty_required_fields")
+    duplicate_ids = data.id.astype(str).duplicated(keep="first")
+    reasons["duplicate_row_id"] = remove(duplicate_ids, "duplicate_row_id")
+    reasons["malformed_placeholder_or_extraction_artifact"] = remove(
+        data._text_norm.str.contains(r"\[object object\]|<\|(?:im_start|im_end|assistant|user)\|>|\x00", regex=True),
+        "malformed_placeholder_or_extraction_artifact")
+    # Truncation is flagged only for unmistakable export markers; sentence fragments
+    # and short but complete answers remain eligible.
+    reasons["explicit_truncation_marker"] = remove(
+        data._text_norm.str.contains(r"(?:\[truncated\]|\(truncated\)|\.\.\.\s*\[end\])\s*$", regex=True),
+        "explicit_truncation_marker")
+    # Prompt echoes require a long prompt repeated at the beginning of the answer
+    # with little answer content remaining. A shared phrase alone is insufficient.
+    prompt_norm = data.get("prompt_canon", pd.Series("", index=data.index)).fillna("").astype(str).map(_normal_text)
+    echo = pd.Series([len(p) >= 80 and t.startswith(p) and len(t) - len(p) <= 180
+                      for p, t in zip(prompt_norm, data._text_norm)], index=data.index)
+    reasons["prompt_echo_or_extraction"] = remove(echo, "prompt_echo_or_extraction")
+
+    kept = data.loc[data._keep].copy()
+    # A model_version that exactly names another canonical class is a direct
+    # provenance contradiction. General provider/route prose is too ambiguous.
+    canonical_label = {re.sub(r"[^a-z0-9]", "", str(label).casefold()): str(label)
+                       for label in original_classes}
+    version = data.get("model_version", pd.Series("", index=data.index)).fillna("").astype(str)
+    version_key = version.map(lambda value: re.sub(r"[^a-z0-9]", "", value.casefold()))
+    recognized_version = version_key.map(canonical_label)
+    provenance_conflict = recognized_version.notna() & recognized_version.ne(data.model.astype(str))
+    reasons["provenance_label_conflict"] = remove(provenance_conflict, "provenance_label_conflict")
+    kept = data.loc[data._keep].copy()
+    # Any identical normalized response assigned to multiple labels is ambiguous;
+    # remove the entire conflicting group instead of arbitrarily choosing a label.
+    label_counts = kept.groupby("_text_norm").model.nunique()
+    conflict_texts = set(label_counts[label_counts.gt(1)].index)
+    reasons["exact_response_label_conflict"] = remove(data._text_norm.isin(conflict_texts), "exact_response_label_conflict")
+    suspicious_conflict_rows = int(kept._text_norm.isin(conflict_texts).sum()) + reasons["provenance_label_conflict"]
+
+    def quality_key(i):
+        row = data.loc[i]
+        text = str(row.text)
+        provenance_fields = [c for c in ("source_dataset", "source_file", "source_license", "origin_hint", "provider", "model_version", "route") if c in data]
+        provenance = sum(pd.notna(row[c]) and str(row[c]).strip().casefold() not in {"", "n/s", "none", "nan"} for c in provenance_fields)
+        endings = text.rstrip()[-1:] in ".!?`)'\"”’)]}"
+        integrity = int(bool(re.search(r"[A-Za-z0-9]", text))) + int(endings)
+        return (provenance, integrity, len(text), hashlib.sha256(text.encode("utf-8")).hexdigest())
+
+    exact_duplicate_rows = set()
+    same_label_groups = data.loc[data._keep].groupby("_text_norm", sort=True)
+    for _, group in same_label_groups:
+        if len(group) > 1:
+            winner = max(group.index.tolist(), key=quality_key)
+            exact_duplicate_rows.update(i for i in group.index if i != winner)
+    reasons["exact_duplicate_response"] = remove(data.index.isin(exact_duplicate_rows), "exact_duplicate_response")
+
+    # Word-trigram MinHash narrows candidate pairs, then exact character n-gram
+    # Jaccard verifies candidates before near-duplicate removal.
+    eligible_idx = data.index[data._keep].tolist()
+    # Fixed 4-row bands keep candidate recall high even for conservative custom
+    # thresholds; exact Jaccard applies the configured threshold afterward.
+    lsh = MinHashLSH(threshold=near_duplicate_threshold, num_perm=minhash_permutations,
+                     params=(minhash_permutations // 4, 4))
+    signatures = {}
+    for i in eligible_idx:
+        text = data.at[i, "_text_norm"]
+        words = text.split()
+        # Word-trigram MinHash is a compact candidate index. Exact character
+        # n-gram Jaccard below verifies every candidate before removal.
+        word_grams = {" ".join(words[j:j + 3]) for j in range(max(1, len(words) - 2))}
+        signature = MinHash(num_perm=minhash_permutations, seed=seed,
+                           hashfunc=lambda value: zlib.crc32(value))
+        signature.update_batch([gram.encode("utf-8") for gram in word_grams])
+        key = str(i)
+        signatures[i] = signature
+        lsh.insert(key, signature)
+    parent = {i: i for i in eligible_idx}
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    near_pairs = set()
+    cross_label_near_pairs = set()
+    for i in eligible_idx:
+        for match in lsh.query(signatures[i]):
+            j = int(match)
+            if j <= i:
+                continue
+            ta, tb = data.at[i, "_text_norm"], data.at[j, "_text_norm"]
+            ga = {ta[k:k + char_ngram_size] for k in range(max(1, len(ta) - char_ngram_size + 1))}
+            gb = {tb[k:k + char_ngram_size] for k in range(max(1, len(tb) - char_ngram_size + 1))}
+            similarity = len(ga & gb) / max(1, len(ga | gb))
+            if similarity >= near_duplicate_threshold:
+                near_pairs.add((i, j))
+                if str(data.at[i, "model"]) == str(data.at[j, "model"]):
+                    union(i, j)
+                else:
+                    cross_label_near_pairs.add((i, j))
+    clusters: dict[int, list[int]] = {}
+    for i in eligible_idx:
+        clusters.setdefault(find(i), []).append(i)
+    duplicate_cluster_count = sum(len(items) > 1 for items in clusters.values())
+
+    def diverse_order(frame):
+        """Order rows round-robin across length, formatting and lexical-richness bins."""
+        sub = frame.copy()
+        lengths = sub.text.astype(str).str.len()
+        sub["_length_bin"] = pd.qcut(lengths.rank(method="first"), q=min(8, len(sub)),
+                                     labels=False, duplicates="drop")
+        sub["_format_bin"] = sub.text.astype(str).str.contains(
+            r"(?m)^\s*(?:[-*#]|\d+[.)])\s|```|\|", regex=True).astype(int)
+        lexical = sub.text.astype(str).map(lambda value: len(set(re.findall(r"[a-z]+", value.casefold()))) /
+                                           max(1, len(re.findall(r"[a-z]+", value.casefold()))))
+        sub["_lexical_bin"] = pd.qcut(lexical.rank(method="first"), q=min(3, len(sub)),
+                                      labels=False, duplicates="drop")
+        queues = {}
+        for key, bucket in sub.groupby(["_length_bin", "_format_bin", "_lexical_bin"], sort=True, dropna=False):
+            queues[key if isinstance(key, tuple) else (key,)] = sorted(bucket.index, key=quality_key, reverse=True)
+        ordered = []
+        keys = sorted(queues, key=lambda value: tuple(str(x) for x in value))
+        while any(queues.values()):
+            for key in keys:
+                if queues[key]:
+                    ordered.append(queues[key].pop(0))
+        return ordered
+
+    near_removed = set()
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        winner = max(members, key=quality_key)
+        near_removed.update(i for i in members if i != winner)
+    reasons["near_duplicate_response"] = remove(data.index.isin(near_removed), "near_duplicate_response")
+
+    # Repeated templated boilerplate is detected after replacing numbers and URLs.
+    # It is capped only when the normalized template is long and occurs repeatedly.
+    def template_signature(text):
+        value = _normal_text(text)
+        value = re.sub(r"https?://\S+", " <url> ", value)
+        value = re.sub(r"\b\d+(?:[.,]\d+)*\b", " <num> ", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    data["_template"] = data.text.fillna("").astype(str).map(template_signature)
+    template_rows = data.loc[data._keep]
+    template_removed = set()
+    for (_, template), group in template_rows.groupby(["model", "_template"], sort=True):
+        if len(group) < template_min_repeats or len(template) < minimum_template_chars:
+            continue
+        # Keep a template representative from each source, not each prompt. A
+        # long signature repeated across prompts inside one source is the target.
+        ordered = sorted(group.index, key=quality_key, reverse=True)
+        seen = set()
+        for i in ordered:
+            key = str(data.at[i, "source_dataset"])
+            if key in seen:
+                template_removed.add(i)
+            else:
+                seen.add(key)
+    reasons["repeated_template_boilerplate"] = remove(data.index.isin(template_removed), "repeated_template_boilerplate")
+
+    # Adaptive caps use each label's observed source and source-prompt redundancy
+    # distributions. No model receives an equal row quota.
+    source_removed, prompt_removed = set(), set()
+    active = data.loc[data._keep].copy()
+    active["_source_count"] = active.groupby(["model", "source_dataset"]).id.transform("size")
+    for label, group in active.groupby("model", sort=True):
+        counts = group.groupby("source_dataset").size()
+        if len(counts) >= 4:
+            q1, q3 = counts.quantile([.25, .75])
+            tukey_cap = int(math.ceil(q3 + 1.5 * (q3 - q1)))
+            median_cap = int(math.ceil(counts.median() * source_median_multiplier))
+            cap = max(int(math.ceil(q3)), min(tukey_cap, median_cap))
+            overloaded = set(counts[counts > cap].index.astype(str))
+            for source in overloaded:
+                sub = group[group.source_dataset.astype(str).eq(source)].copy()
+                # Round-robin length, formatting, and vocabulary-richness bins,
+                # using provenance completeness and integrity within each bin.
+                priority = diverse_order(sub)
+                source_removed.update(priority[cap:])
+    reasons["adaptive_source_redundancy_cap"] = remove(data.index.isin(source_removed), "adaptive_source_redundancy_cap")
+
+    active = data.loc[data._keep].copy()
+    for _, source_group in active.groupby(["model", "source_dataset"], sort=True):
+        all_counts = source_group.groupby("_prompt_key").size()
+        if len(all_counts) < 4:
+            continue
+        q1, q3 = all_counts.quantile([.25, .75])
+        cap = max(2, int(math.ceil(q3 + 1.5 * (q3 - q1))))
+        for prompt, count in all_counts[all_counts.gt(cap)].items():
+            members = source_group.index[source_group._prompt_key.eq(prompt)].tolist()
+            ordered = diverse_order(data.loc[members])
+            prompt_removed.update(ordered[cap:])
+    reasons["adaptive_prompt_redundancy_cap"] = remove(data.index.isin(prompt_removed), "adaptive_prompt_redundancy_cap")
+
+    selected = data.loc[data._keep].copy()
+    if set(selected.model.astype(str)) != original_classes:
+        raise ValueError("curation removed an entire model class")
+    # Freeze V0 validation identity and ensure neither response IDs nor prompt IDs
+    # overlap. Open Pool prompt groups may be canonical text or source prompt IDs.
+    v0_profile_path = output_dir / "dataset_profile.json"
+    v0_split_path = output_dir / "splits_v0.parquet"
+    v0_data_path = output_dir / "dataset_v0.parquet"
+    if not (v0_profile_path.is_file() and v0_split_path.is_file() and v0_data_path.is_file()):
+        raise FileNotFoundError("prepare V0 first; its frozen validation rows are required")
+    v0_profile = json.loads(v0_profile_path.read_text())
+    v0_assignments = pd.read_parquet(v0_split_path)
+    v0 = pd.read_parquet(v0_data_path)
+    v0_val_ids = set(v0_assignments.loc[v0_assignments.split.eq("validation"), "id"].astype(str))
+    v0_val = v0[v0.id.astype(str).isin(v0_val_ids)]
+    v0_ids_hash = hashlib.sha256("\n".join(sorted(v0_val_ids)).encode()).hexdigest()
+    if len(v0_val) != int(v0_profile.get("validation_rows", -1)):
+        raise ValueError("V0 validation assignments do not match the frozen profile")
+    id_overlap = set(selected.id.astype(str)) & v0_val_ids
+    v0_prompt_ids = set(v0_val.prompt_id.astype(str))
+    prompt_id_overlap = set(selected.prompt_id.astype(str)) & v0_prompt_ids
+    selected_prompt_keys = set(selected._prompt_key.astype(str))
+    if "prompt_canon" in v0_val:
+        v0_prompt_keys = set(v0_val.prompt_canon.fillna("").astype(str).map(_normal_text))
+        v0_prompt_keys.discard("")
+        canonical_overlap = selected_prompt_keys & v0_prompt_keys
+    else:
+        canonical_overlap = set()
+    prompt_overlap = prompt_id_overlap | canonical_overlap
+    if id_overlap or prompt_overlap:
+        raise ValueError(f"curated training data overlaps V0 validation: {len(id_overlap)} IDs, {len(prompt_overlap)} prompt groups")
+    if set(selected.model.astype(str)) != set(v0_val.model.astype(str)):
+        raise ValueError("curated training dataset must preserve all V0 model labels")
+    retained_prompt_keys = selected.groupby("model")._prompt_key.nunique()
+    retained_unique_prompts = int(selected._prompt_key.nunique())
+    selected = selected.drop(columns=["_keep", "_text_norm", "_prompt_key", "_template", "_original_index", "_source_count"], errors="ignore")
+    selected = selected.sort_values("id", kind="stable").reset_index(drop=True)
+    removals = pd.concat(removal_parts, ignore_index=True) if removal_parts else pd.DataFrame()
+    audit_cols = [c for c in ("_original_index", "id", "model", "source_dataset", "source_file", "source_license", "prompt_id", "removal_reason") if c in removals]
+    audit = removals[audit_cols].rename(columns={"_original_index": "original_row_index"})
+    if not audit.empty:
+        audit = audit.sort_values("original_row_index", kind="stable")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset_file, profile_file = _dataset_artifact_names(dataset_version)
+    output_path, profile_path = output_dir / dataset_file, output_dir / profile_file
+    if output_path.exists() or profile_path.exists():
+        raise FileExistsError(f"refusing to overwrite existing curation artifacts for {dataset_version}")
+    selected.to_parquet(output_path, index=False)
+    audit_path = output_dir / f"{dataset_version}_removals.csv"
+    audit.to_csv(audit_path, index=False, lineterminator="\n")
+    source_hash = _hash_file(source_path)
+    before_class = data.groupby("model").size()
+    after_class = selected.groupby("model").size()
+    prompts_after = retained_prompt_keys
+    profile = {
+        "dataset_version": dataset_version, "rows": int(len(selected)),
+        "dataset_sha256": hashlib.sha256(selected.to_csv(index=False, lineterminator="\n").encode()).hexdigest(),
+        "source_dataset_path": str(source_path), "source_dataset_sha256": source_hash,
+        "classes": sorted(selected.model.astype(str).unique()),
+        "class_counts": {str(k): int(v) for k, v in after_class.items()},
+        "prompt_groups": int(selected.prompt_id.nunique()),
+        "unique_sources": int(selected.source_dataset.nunique()),
+        "training_only": True, "curation_method": "v1_all_quality_minhash_adaptive_diversity",
+        "seed": seed, "near_duplicate_threshold": near_duplicate_threshold,
+        "char_ngram_size": char_ngram_size, "minhash_permutations": minhash_permutations,
+        "source_median_multiplier": source_median_multiplier,
+        "minhash_candidate_shingles": "word trigrams",
+        "near_duplicate_verification": "character n-gram Jaccard",
+        "near_duplicate_clusters": int(duplicate_cluster_count),
+        "near_duplicate_pairs_verified": int(len(near_pairs)),
+        "suspicious_near_duplicate_cross_label_clusters": int(len(cross_label_near_pairs)),
+        "suspicious_exact_label_conflict_rows": suspicious_conflict_rows,
+        "removals_by_reason": reasons, "removed_rows": int(len(audit)),
+        "removal_audit_path": str(audit_path),
+        "removal_manifest_sha256": _hash_file(audit_path),
+        "unique_prompts_before": int(data._prompt_key.nunique()),
+        "unique_prompts_after": retained_unique_prompts,
+        "unique_sources_before": int(data.source_dataset.nunique()),
+        "source_counts_before": {str(k): int(v) for k, v in data.source_dataset.value_counts().sort_index().items()},
+        "source_counts_after": {str(k): int(v) for k, v in selected.source_dataset.value_counts().sort_index().items()},
+        "class_summary": {str(label): {"original_count": int(before_class.get(label, 0)),
+            "retained_count": int(after_class.get(label, 0)),
+            "retained_fraction": float(after_class.get(label, 0) / max(1, before_class.get(label, 0))),
+            "unique_prompts_retained": int(prompts_after.get(label, 0)),
+            "sources_retained": int(selected.loc[selected.model.eq(label), "source_dataset"].nunique())}
+            for label in sorted(before_class.index.astype(str))},
+        "length_chars_before": {str(k): float(v) for k, v in data.text.fillna("").astype(str).str.len().quantile([0, .1, .5, .9, 1]).items()},
+        "length_chars_after": {str(k): float(v) for k, v in selected.text.fillna("").astype(str).str.len().quantile([0, .1, .5, .9, 1]).items()},
+        "source_concentration_before": _source_concentration(data),
+        "source_concentration_after": _source_concentration(selected),
+        "validation_dataset_version": "v0", "validation_split_sha256": v0_profile["split_sha256"],
+        "validation_rows": int(len(v0_val)), "validation_ids_sha256": v0_ids_hash,
+        "validation_id_overlap": 0, "validation_prompt_overlap": 0,
+    }
+    # Use the pipeline's training-only profile contract; the loader attaches V0
+    # validation and will independently verify ID and prompt isolation.
+    profile_path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+    return profile
+
+
+def curate_v1_all_clean_compact(source_path: str | Path, output_dir: str | Path, *,
+                                validation_dataset: str = "v0", seed: int = 2026,
+                                minhash_permutations: int = 64,
+                                compact_char_similarity: float = 0.92,
+                                compact_word_similarity: float = 0.85,
+                                tfidf_diagnostic_sample: int = 3000) -> dict:
+    """Create defect-only clean and conservative redundancy-reduced compact sets.
+
+    Clean removes only explicit, auditable defects. Compact starts from clean and
+    removes only same-label responses verified as highly similar in both character
+    and word n-gram Jaccard space. No source quotas or model-performance signals
+    affect selection.
+    """
+    from datasketch import MinHash, MinHashLSH
+    import zlib
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.neighbors import NearestNeighbors
+
+    if validation_dataset != "v0":
+        raise ValueError("these datasets reuse the frozen V0 validation set")
+    if not 0 < compact_char_similarity < 1 or not 0 < compact_word_similarity < 1:
+        raise ValueError("compact similarity thresholds must be in (0, 1)")
+    if minhash_permutations < 16 or tfidf_diagnostic_sample < 0:
+        raise ValueError("invalid MinHash or diagnostic sample setting")
+    source_path, output_dir = Path(source_path), Path(output_dir)
+    if not source_path.is_file():
+        raise FileNotFoundError(source_path)
+    data = pd.read_parquet(source_path).reset_index(drop=True)
+    required = {"id", "text", "model", "source_dataset", "prompt_id"}
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(f"source dataset missing required columns: {sorted(missing)}")
+    if data.model.nunique(dropna=True) != 18:
+        raise ValueError(f"expected 18 model labels; found {data.model.nunique(dropna=True)}")
+    original_classes = set(data.model.dropna().astype(str))
+    data["_original_row_index"] = np.arange(len(data), dtype=np.int64)
+    data["_normalized_text"] = data.text.fillna("").astype(str).map(_normal_text)
+
+    # Dataset-level counts and baseline distributions are collected before curation.
+    def descriptive_stats(frame):
+        texts = frame.text.fillna("").astype(str)
+        lengths = texts.str.len()
+        words = texts.str.findall(r"\b[\w'-]+\b").str.len()
+        markdown = texts.str.contains(r"(?m)^\s{0,3}(?:#{1,6}\s|[-*+]\s|\d+[.)]\s)|```|\|", regex=True)
+        code = texts.str.contains("```")
+        urls = texts.str.contains(r"https?://", case=False, regex=True)
+        def boundary_signature(value, from_end=False):
+            tokens = re.findall(r"[a-z0-9]+|[^\w\s]", value.casefold())
+            tokens = tokens[-8:] if from_end else tokens[:8]
+            return " ".join(re.sub(r"\d+", "<n>", token) for token in tokens)
+        openings = texts.map(boundary_signature).value_counts()
+        endings = texts.map(lambda value: boundary_signature(value, True)).value_counts()
+        paragraphs = texts.str.count(r"\n\s*\n") + 1
+        return {
+            "rows": int(len(frame)),
+            "prompt_groups": int(frame.prompt_id.nunique(dropna=True)),
+            "unique_sources": int(frame.source_dataset.nunique(dropna=True)),
+            "length_chars": {str(q): float(lengths.quantile(q)) for q in (0, .1, .5, .9, 1)},
+            "length_words": {str(q): float(words.quantile(q)) for q in (0, .1, .5, .9, 1)},
+            "mean_lexical_diversity": float(texts.map(lambda t: len(set(re.findall(r"[a-z]+", t.casefold()))) /
+                                                       max(1, len(re.findall(r"[a-z]+", t.casefold())))).mean()),
+            "markdown_fraction": float(markdown.mean()), "code_block_fraction": float(code.mean()),
+            "url_fraction": float(urls.mean()),
+            "paragraph_count_median": float(paragraphs.median()),
+            "repeated_openings_10plus": int((openings >= 10).sum()),
+            "repeated_opening_rows_10plus": int(openings[openings >= 10].sum()),
+            "repeated_endings_10plus": int((endings >= 10).sum()),
+            "repeated_ending_rows_10plus": int(endings[endings >= 10].sum()),
+        }
+
+    before_stats = descriptive_stats(data)
+    clean = data.copy()
+    clean["_keep"] = True
+    clean_removals = []
+
+    def remove_clean(mask, reason, evidence):
+        mask = pd.Series(mask, index=clean.index).fillna(False).astype(bool) & clean._keep
+        for idx in clean.index[mask]:
+            row = clean.loc[idx].copy()
+            row["removal_reason"] = reason
+            row["evidence"] = str(evidence(row)) if callable(evidence) else str(evidence)
+            row["representative_id"] = ""
+            clean_removals.append(row)
+        clean.loc[mask, "_keep"] = False
+        return int(mask.sum())
+
+    clean_reasons = {}
+    valid = (clean.id.notna() & clean.id.astype(str).str.strip().ne("") & clean.model.notna()
+             & clean.text.notna() & clean._normalized_text.str.len().gt(0)
+             & clean.source_dataset.notna() & clean.source_dataset.astype(str).str.strip().ne("")
+             & clean.prompt_id.notna() & clean.prompt_id.astype(str).str.strip().ne(""))
+    clean_reasons["missing_or_empty_required_field"] = remove_clean(
+        ~valid, "missing_or_empty_required_field", "one or more required fields are null/empty")
+    clean_reasons["duplicate_row_id"] = remove_clean(
+        clean.id.astype(str).duplicated(keep="first"), "duplicate_row_id", "duplicate id; first source row retained")
+
+    # Only unmistakable serialization/log artifacts are removed. Content that merely
+    # discusses tools, errors, truncation, or code remains untouched.
+    artifact_re = re.compile(
+        r"(?is)(?:\[object object\]|\x00)"
+        r"|(?:^\s*<\|im_start\|>(?:system|user|assistant|tool)\b)"
+        r"|(?:<\|im_start\|>.*?<\|im_end\|>)"
+        r"|(?:^\s*(?:tool call|tool response|function call|execution log)\s*:\s*\{.{0,100}\}\s*$)"
+    )
+    clean_reasons["serialized_envelope_or_extraction_artifact"] = remove_clean(
+        clean._normalized_text.map(lambda value: bool(artifact_re.search(value))),
+        "serialized_envelope_or_extraction_artifact", "matched explicit serialized role/object/tool-log marker")
+    trunc_re = re.compile(r"(?i)(?:\[(?:truncated|incomplete response|generation failed)\]|\((?:truncated|generation failed)\)|\.\.\.\s*\[end\])\s*$")
+    clean_reasons["explicit_truncation_or_failure_marker"] = remove_clean(
+        clean._normalized_text.map(lambda value: bool(trunc_re.search(value))),
+        "explicit_truncation_or_failure_marker", "response ends with an explicit truncation/failure marker")
+
+    # Cross-label identical normalized text is a direct ambiguity; remove all members
+    # and retain the row IDs as evidence. Same-label duplicates keep the best-backed row.
+    active = clean.loc[clean._keep]
+    label_n = active.groupby("_normalized_text", sort=True).model.nunique()
+    conflict_texts = set(label_n[label_n.gt(1)].index)
+    conflict_ids = active.loc[active._normalized_text.isin(conflict_texts)].groupby("_normalized_text").id.apply(
+        lambda values: ",".join(sorted(values.astype(str))))
+    clean_reasons["conflicting_labels_for_identical_response"] = remove_clean(
+        clean._normalized_text.isin(conflict_texts), "conflicting_labels_for_identical_response",
+        lambda row: f"normalized text assigned to IDs {conflict_ids.get(row._normalized_text, '')}")
+
+    def provenance_score(row):
+        fields = ("source_dataset", "source_file", "source_license", "origin_hint", "provider", "model_version", "route")
+        return sum(c in clean and pd.notna(row.get(c)) and str(row.get(c)).strip().casefold() not in {"", "nan", "none", "n/s"} for c in fields)
+
+    active = clean.loc[clean._keep]
+    exact_groups = active.groupby("_normalized_text", sort=True)
+    exact_duplicate_indices = set()
+    exact_representative = {}
+    for text_key, group in exact_groups:
+        if len(group) < 2:
+            continue
+        ordered = sorted(group.index, key=lambda i: (provenance_score(clean.loc[i]),
+                          len(clean.at[i, "_normalized_text"]), str(clean.at[i, "id"])), reverse=True)
+        exact_representative.update({i: str(clean.at[ordered[0], "id"]) for i in ordered[1:]})
+        exact_duplicate_indices.update(ordered[1:])
+    n = remove_clean(clean.index.isin(exact_duplicate_indices), "normalized_duplicate_response",
+                     lambda row: f"normalized text equals retained representative {exact_representative.get(row.name, '')}")
+    clean_reasons["normalized_duplicate_response"] = n
+
+    # Direct contradictions only: model_version must normalize exactly to a known
+    # canonical class name. Other provenance strings are retained as ambiguous.
+    if "model_version" in clean:
+        canonical = {re.sub(r"[^a-z0-9]", "", str(label).casefold()): str(label) for label in original_classes}
+        version = clean.model_version.fillna("").astype(str).map(
+            lambda value: re.sub(r"[^a-z0-9]", "", value.casefold()))
+        identified = version.map(canonical)
+        contradictions = identified.notna() & identified.ne(clean.model.astype(str))
+    else:
+        contradictions = pd.Series(False, index=clean.index)
+    clean_reasons["contradictory_model_version"] = remove_clean(
+        contradictions, "contradictory_model_version", "model_version exactly names a different canonical class")
+
+    # Prompt-copy rule requires a long canonical prompt reproduced at the start and
+    # at least 80% of response characters to be copied; no short/common prefix hits.
+    prompt = clean.get("prompt_canon", pd.Series("", index=clean.index)).fillna("").astype(str).map(_normal_text)
+    copied = pd.Series([len(p) >= 100 and text.startswith(p) and len(text) > 0 and len(p) / len(text) >= .8
+                        for p, text in zip(prompt, clean._normalized_text)], index=clean.index)
+    clean_reasons["response_is_copied_prompt"] = remove_clean(
+        copied, "response_is_copied_prompt", "canonical prompt is >=80% of response and repeated at its start")
+
+    clean_rows = clean.loc[clean._keep].drop(columns=["_keep", "_normalized_text", "_original_row_index"], errors="ignore")
+    if set(clean_rows.model.astype(str)) != original_classes:
+        raise ValueError("clean curation must preserve all 18 model labels")
+    if clean_rows.id.astype(str).duplicated().any():
+        raise ValueError("clean dataset still contains duplicate IDs")
+    if clean_rows.text.isna().any() or clean_rows.text.astype(str).str.strip().eq("").any():
+        raise ValueError("clean dataset contains empty responses")
+
+    # Freeze V0 validation identity and enforce ID, prompt ID and canonical prompt isolation.
+    v0_profile_path = output_dir / "dataset_profile.json"
+    v0_split_path = output_dir / "splits_v0.parquet"
+    v0_data_path = output_dir / "dataset_v0.parquet"
+    if not all(path.is_file() for path in (v0_profile_path, v0_split_path, v0_data_path)):
+        raise FileNotFoundError("prepare V0 first; its frozen validation rows are required")
+    v0_profile = json.loads(v0_profile_path.read_text(encoding="utf-8"))
+    v0_assignments = pd.read_parquet(v0_split_path)
+    v0 = pd.read_parquet(v0_data_path)
+    v0_val_ids = set(v0_assignments.loc[v0_assignments.split.eq("validation"), "id"].astype(str))
+    v0_val = v0[v0.id.astype(str).isin(v0_val_ids)]
+    if len(v0_val) != int(v0_profile.get("validation_rows", -1)):
+        raise ValueError("V0 validation assignments do not match the frozen profile")
+    v0_prompt_ids = set(v0_val.prompt_id.astype(str))
+    canonical_overlap = set()
+    if "prompt_canon" in v0_val and "prompt_canon" in clean_rows:
+        canonical_overlap = (set(clean_rows.prompt_canon.fillna("").astype(str).map(_normal_text)) - {""}) & \
+                            (set(v0_val.prompt_canon.fillna("").astype(str).map(_normal_text)) - {""})
+    id_overlap = set(clean_rows.id.astype(str)) & v0_val_ids
+    prompt_overlap = (set(clean_rows.prompt_id.astype(str)) & v0_prompt_ids) | canonical_overlap
+    if id_overlap or prompt_overlap:
+        raise ValueError(f"V1-all overlaps frozen V0 validation: {len(id_overlap)} IDs, {len(prompt_overlap)} prompt groups")
+    if set(clean_rows.model.astype(str)) != set(v0_val.model.astype(str)):
+        raise ValueError("curated datasets must preserve all V0 model labels")
+
+    # Compact: union character and word-trigram MinHash candidates, then verify
+    # exact character 5-gram and word-trigram Jaccard. Only within-label pairs qualify.
+    active = clean_rows.reset_index(drop=True).copy()
+    active["_normalized_text"] = active.text.astype(str).map(_normal_text)
+    n_perm = int(minhash_permutations)
+    word_lsh = MinHashLSH(threshold=min(.80, compact_word_similarity),
+                          num_perm=n_perm, params=(n_perm // 4, 4))
+    char_lsh = MinHashLSH(threshold=min(.80, compact_char_similarity),
+                          num_perm=n_perm, params=(n_perm // 4, 4))
+    char_sets, word_sets, signatures = {}, {}, {}
+    for i, text in enumerate(active._normalized_text):
+        chars = {text[k:k+5] for k in range(max(1, len(text)-4))}
+        words = text.split()
+        word_grams = {" ".join(words[j:j+3]) for j in range(max(1, len(words)-2))}
+        char_sets[i], word_sets[i] = chars, word_grams
+        word_sig = MinHash(num_perm=n_perm, seed=seed, hashfunc=lambda value: zlib.crc32(value))
+        word_sig.update_batch([gram.encode("utf-8") for gram in word_grams])
+        char_sig = MinHash(num_perm=n_perm, seed=seed, hashfunc=lambda value: zlib.crc32(value))
+        char_sig.update_batch([gram.encode("utf-8") for gram in chars])
+        signatures[i] = (char_sig, word_sig)
+        word_lsh.insert(str(i), word_sig)
+        char_lsh.insert(str(i), char_sig)
+
+    parent = list(range(len(active)))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    verified_pairs = []
+    candidate_similarity = []
+    for i in range(len(active)):
+        matches = set(char_lsh.query(signatures[i][0])) | set(word_lsh.query(signatures[i][1]))
+        for match in matches:
+            j = int(match)
+            if j <= i or str(active.at[i, "model"]) != str(active.at[j, "model"]):
+                continue
+            char_sim = len(char_sets[i] & char_sets[j]) / max(1, len(char_sets[i] | char_sets[j]))
+            word_sim = len(word_sets[i] & word_sets[j]) / max(1, len(word_sets[i] | word_sets[j]))
+            candidate_similarity.append((float(char_sim), float(word_sim)))
+            if char_sim >= compact_char_similarity and word_sim >= compact_word_similarity:
+                same_prompt = str(active.at[i, "prompt_id"]) == str(active.at[j, "prompt_id"])
+                verified_pairs.append((i, j, float(char_sim), float(word_sim), same_prompt))
+                union(i, j)
+    clusters = {}
+    for i in range(len(active)):
+        clusters.setdefault(find(i), []).append(i)
+    redundant_indices = {}
+    cluster_records = []
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        def representative_key(i):
+            row = active.iloc[i]
+            prov = provenance_score(row)
+            complete_text = int(bool(re.search(r"[A-Za-z0-9]", str(row.text))) and
+                                str(row.text).rstrip()[-1:] in ".!?`)'\"”’)]}")
+            tokens = re.findall(r"[a-z]+", str(row.text).casefold())
+            lexical = len(set(tokens)) / max(1, len(tokens))
+            return (prov, complete_text, lexical, len(str(row.text)), hashlib.sha256(str(row.id).encode()).hexdigest())
+        rep_idx = max(members, key=representative_key)
+        rep_id = str(active.at[rep_idx, "id"])
+        for idx in members:
+            if idx != rep_idx:
+                redundant_indices[idx] = rep_id
+        pairs = [item for item in verified_pairs if item[0] in members and item[1] in members]
+        cluster_records.append({"representative_id": rep_id, "members": [str(active.at[i, "id"]) for i in members],
+                                "size": len(members),
+                                "max_char_jaccard": max((item[2] for item in pairs), default=1.0),
+                                "max_word_jaccard": max((item[3] for item in pairs), default=1.0),
+                                "same_prompt_pair_count": sum(bool(item[4]) for item in pairs)})
+
+    compact_removed = active.iloc[sorted(redundant_indices)].copy() if redundant_indices else active.iloc[:0].copy()
+    if len(compact_removed):
+        compact_removed["removal_reason"] = "verified_same_label_near_duplicate"
+        compact_removed["evidence"] = compact_removed.index.map(lambda i: next(
+            (f"char5_jaccard={c:.4f}; word3_jaccard={w:.4f}" for a,b,c,w,_same_prompt in verified_pairs
+             if i in (a,b) and str(active.at[a if b == i else b, "id"]) == redundant_indices[i]), "verified cluster member"))
+        compact_removed["representative_id"] = compact_removed.index.map(redundant_indices)
+    compact = active.loc[~active.index.isin(redundant_indices)].drop(columns="_normalized_text")
+    if set(compact.id.astype(str)) - set(clean_rows.id.astype(str)):
+        raise RuntimeError("compact contains rows absent from clean")
+    if set(compact.model.astype(str)) != original_classes:
+        raise ValueError("compact curation must preserve all 18 model labels")
+
+    # Diagnostic template and prompt redundancy counts; these are not removal rules.
+    def template_key(text):
+        value = _normal_text(text)
+        value = re.sub(r"https?://\S+", " <url> ", value)
+        value = re.sub(r"\b\d+(?:[.,]\d+)*\b", " <num> ", value)
+        return re.sub(r"\s+", " ", value).strip()
+    templates = active.assign(_template=active.text.map(template_key))
+    template_sizes = templates.groupby(["model", "_template"], sort=True).size()
+    repeated_templates = template_sizes[template_sizes.ge(3)]
+    same_prompt_sizes = active.groupby(["model", "prompt_id"], dropna=False).size()
+    prompt_repeated = same_prompt_sizes[same_prompt_sizes.gt(1)]
+
+    # TF-IDF nearest-neighbor diagnostic is deterministic and sampled, never a selector.
+    tfidf_report = {"method": "word unigram/bigram TF-IDF cosine nearest-neighbor on deterministic sample",
+                    "sample_size": 0, "nearest_cosine_p50": None, "nearest_cosine_p90": None,
+                    "nearest_cosine_max": None, "note": "diagnostic only; not used for selection"}
+    if tfidf_diagnostic_sample and len(active) > 1:
+        sample = active.sort_values("id", kind="stable").sample(
+            min(int(tfidf_diagnostic_sample), len(active)), random_state=seed)
+        vectorizer = TfidfVectorizer(ngram_range=(1, 2), max_features=100_000, min_df=2,
+                                     sublinear_tf=True, dtype=np.float32)
+        matrix = vectorizer.fit_transform(sample.text.astype(str))
+        if matrix.shape[1] and matrix.shape[0] > 1:
+            nn = NearestNeighbors(n_neighbors=2, metric="cosine", algorithm="brute", n_jobs=1).fit(matrix)
+            distances, _ = nn.kneighbors(matrix)
+            nearest = np.clip(1.0 - distances[:, 1], 0, 1)
+            tfidf_report = {"method": tfidf_report["method"], "sample_size": int(len(sample)),
+                            "nearest_cosine_p50": float(np.quantile(nearest, .5)),
+                            "nearest_cosine_p90": float(np.quantile(nearest, .9)),
+                            "nearest_cosine_max": float(nearest.max()),
+                            "note": "diagnostic only; not used for selection"}
+
+    def similarity_summary(values, column):
+        scores = np.asarray([item[column] for item in values], dtype=float)
+        return {"count": int(len(scores)), "p50": float(np.quantile(scores, .5)) if len(scores) else None,
+                "p90": float(np.quantile(scores, .9)) if len(scores) else None,
+                "max": float(scores.max()) if len(scores) else None}
+
+    clean_removals = (pd.DataFrame(clean_removals) if clean_removals else
+                      pd.DataFrame(columns=[*data.columns, "removal_reason", "evidence", "representative_id"]))
+    compact_removed = compact_removed.reset_index(drop=False).rename(columns={"index": "_compact_row_index"})
+    clean_rows = clean_rows.sort_values("id", kind="stable").reset_index(drop=True)
+    compact = compact.sort_values("id", kind="stable").reset_index(drop=True)
+    clean_stats, compact_stats = descriptive_stats(clean_rows), descriptive_stats(compact)
+    source_hash = _hash_file(source_path)
+    split_hash = str(v0_profile["split_sha256"])
+    val_ids_hash = hashlib.sha256("\n".join(sorted(v0_val_ids)).encode()).hexdigest()
+
+    def write_dataset(frame, version, removals, summary, parent_version=None):
+        if frame.id.astype(str).duplicated().any():
+            raise ValueError(f"{version} contains duplicate IDs")
+        dataset_file, profile_file = _dataset_artifact_names(version)
+        out_path, prof_path = output_dir / dataset_file, output_dir / profile_file
+        audit_path = output_dir / f"{version}_removals.csv"
+        if any(path.exists() for path in (out_path, prof_path, audit_path)):
+            raise FileExistsError(f"refusing to overwrite existing artifacts for {version}")
+        public = frame.copy()
+        public.to_parquet(out_path, index=False)
+        audit_columns = [c for c in ("_original_row_index", "_compact_row_index", "id", "model",
+            "source_dataset", "source_file", "prompt_id", "removal_reason", "evidence", "representative_id") if c in removals]
+        audit = removals[audit_columns].copy() if len(removals) else pd.DataFrame(columns=audit_columns or
+            ["original_row_index", "id", "model", "source_dataset", "source_file", "prompt_id",
+             "removal_reason", "evidence", "representative_id"])
+        audit.to_csv(audit_path, index=False, lineterminator="\n")
+        profile = {
+            "dataset_version": version, "rows": int(len(public)),
+            "dataset_sha256": hashlib.sha256(public.to_csv(index=False, lineterminator="\n").encode()).hexdigest(),
+            "source_dataset_path": str(source_path), "source_dataset_sha256": source_hash,
+            "parent_dataset_version": parent_version, "parent_dataset_sha256": (
+                hashlib.sha256(clean_rows.to_csv(index=False, lineterminator="\n").encode()).hexdigest()
+                if parent_version else None),
+            "classes": sorted(public.model.astype(str).unique()),
+            "class_counts": {str(k): int(v) for k,v in public.model.value_counts().sort_index().items()},
+            "prompt_groups": int(public.prompt_id.nunique()), "unique_sources": int(public.source_dataset.nunique()),
+            "training_only": True, "curation_method": f"v1_all_{'defect_clean' if version.endswith('_clean') else 'verified_redundancy_compact'}",
+            "seed": seed, "removals_by_reason": summary,
+            "removed_rows": int(len(audit)), "removal_audit_path": str(audit_path),
+            "removed_rows_with_representative": int(audit.representative_id.fillna("").astype(str).str.strip().ne("").sum())
+                if "representative_id" in audit else 0,
+            "removal_manifest_sha256": _hash_file(audit_path),
+            "validation_dataset_version": "v0", "validation_split_sha256": split_hash,
+            "validation_rows": int(len(v0_val)), "validation_ids_sha256": val_ids_hash,
+            "validation_id_overlap": 0, "validation_prompt_overlap": 0,
+        }
+        prof_path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+        return profile
+
+    clean_removed = pd.concat([clean_removals], ignore_index=True) if len(clean_removals) else pd.DataFrame()
+    clean_profile = write_dataset(clean_rows, "v1-all_clean", clean_removed, clean_reasons)
+    compact_profile = write_dataset(compact, "v1-all_compact", compact_removed,
+                                    {"verified_same_label_near_duplicate": int(len(compact_removed))},
+                                    parent_version="v1-all_clean")
+    return {
+        "source_dataset_path": str(source_path), "source_dataset_sha256": source_hash,
+        "clean": clean_profile, "compact": compact_profile,
+        "before_stats": before_stats, "clean_stats": clean_stats, "compact_stats": compact_stats,
+        "verified_near_duplicate_pairs": int(len(verified_pairs)),
+        "minhash_candidate_pair_count": int(len(candidate_similarity)),
+        "candidate_similarity": {"character_5gram_jaccard": similarity_summary(candidate_similarity, 0),
+                                 "word_3gram_jaccard": similarity_summary(candidate_similarity, 1)},
+        "verified_similarity": {"character_5gram_jaccard": similarity_summary(verified_pairs, 2),
+                                "word_3gram_jaccard": similarity_summary(verified_pairs, 3)},
+        "verified_pairs_same_prompt": int(sum(bool(item[4]) for item in verified_pairs)),
+        "near_duplicate_clusters": int(len(cluster_records)),
+        "near_duplicate_cluster_sizes": sorted([row["size"] for row in cluster_records]),
+        "near_duplicate_clusters_detail": cluster_records,
+        "similarity_thresholds": {"character_5gram_jaccard": compact_char_similarity,
+                                  "word_3gram_jaccard": compact_word_similarity,
+                                  "minhash_permutations": n_perm, "minhash_candidate_threshold": .80,
+                                  "seed": seed},
+        "template_diagnostic": {"templates_repeated_3plus": int(len(repeated_templates)),
+                                 "rows_in_repeated_templates": int(template_sizes[template_sizes.ge(3)].sum()),
+                                 "removed_by_template_alone": 0},
+        "prompt_redundancy_diagnostic": {"model_prompt_groups_with_multiple_rows": int(len(prompt_repeated)),
+                                         "rows_in_repeated_model_prompt_groups": int(prompt_repeated.sum()),
+                                         "removed_by_prompt_alone": 0},
+        "tfidf_diagnostic": tfidf_report,
+        "class_counts_before": {str(k): int(v) for k,v in data.model.value_counts().sort_index().items()},
+        "class_counts_clean": clean_profile["class_counts"], "class_counts_compact": compact_profile["class_counts"],
+        "before_stats": before_stats,
+    }
+
+
+def _source_concentration(frame: pd.DataFrame) -> dict:
+    out = {}
+    for label, group in frame.groupby("model", sort=True):
+        counts = group.source_dataset.value_counts(normalize=True)
+        out[str(label)] = {"largest_source_fraction": float(counts.max()),
+                           "top3_source_fraction": float(counts.head(3).sum()),
+                           "source_count": int(group.source_dataset.nunique())}
+    return out
+
+
 def assemble_openpool_mix(input_dir: str | Path, output_dir: str | Path, *,
                           dataset_version: str, openpool_version: str = "v1",
                           expected_classes: int = 18) -> dict:

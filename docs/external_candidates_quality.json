@@ -1,0 +1,1592 @@
+{
+  "seed": 2026,
+  "source_fingerprint": "f7b4c975ed9fe0be9d4046ad5da396d71b4002df809761e3af4ea487dd619d49",
+  "normalization": "Unicode NFKC, casefold, collapse whitespace; no punctuation removal",
+  "near_duplicate": {
+    "method": "64-permutation word-trigram MinHash LSH candidates, verified by exact character 5-gram Jaccard; candidate length ratio >= 0.75",
+    "threshold": 0.9,
+    "unique_responses_indexed": 202992,
+    "verified_pairs": 77,
+    "clusters_with_2plus": 26,
+    "pairs_by_scope": {
+      "within:glm53_flash": 5,
+      "within:gpt56_sol_luna": 72
+    }
+  },
+  "glm": {
+    "name": "glm53_flash",
+    "rows": 86006,
+    "schema": {
+      "glm53_harvest.parquet": {
+        "rows": 46611,
+        "columns": [
+          {
+            "name": "id",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "register",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "lang",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "thinking",
+            "dtype": "bool",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "turns",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "temp",
+            "dtype": "float",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "prompt",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "response",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "tokens",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "messages_json",
+            "dtype": "string",
+            "missing": 46611,
+            "missing_pct": 100.0
+          }
+        ]
+      },
+      "glm53_harvest_r2.parquet": {
+        "rows": 18858,
+        "columns": [
+          {
+            "name": "id",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "register",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "lang",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "thinking",
+            "dtype": "bool",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "turns",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "temp",
+            "dtype": "float",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "prompt",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "response",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "tokens",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "messages_json",
+            "dtype": "string",
+            "missing": 18768,
+            "missing_pct": 99.5227489659561
+          }
+        ]
+      },
+      "glm53_harvest_r3.parquet": {
+        "rows": 15337,
+        "columns": [
+          {
+            "name": "id",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "register",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "lang",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "thinking",
+            "dtype": "bool",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "turns",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "temp",
+            "dtype": "float",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "prompt",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "response",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "tokens",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "messages_json",
+            "dtype": "string",
+            "missing": 13291,
+            "missing_pct": 86.6597118080459
+          }
+        ]
+      },
+      "glm53_harvest_r4.parquet": {
+        "rows": 5200,
+        "columns": [
+          {
+            "name": "id",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "register",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "lang",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "thinking",
+            "dtype": "bool",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "turns",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "temp",
+            "dtype": "float",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "prompt",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "response",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "tokens",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "messages_json",
+            "dtype": "string",
+            "missing": 2152,
+            "missing_pct": 41.38461538461539
+          }
+        ]
+      }
+    },
+    "unique_normalized_nonempty_responses": 85998,
+    "parse_errors": 0,
+    "rows_by_model": {
+      "glm-5.3-flash": 86006
+    },
+    "empty_prompts": 0,
+    "empty_responses": 0,
+    "duplicates": {
+      "exact_duplicate_extra_rows": 8,
+      "exact_duplicate_texts": 6,
+      "normalized_duplicate_extra_rows": 8,
+      "normalized_duplicate_texts": 6,
+      "identical_texts_across_models": 0,
+      "rows_in_cross_model_identical_texts": 0
+    },
+    "models": {
+      "glm-5.3-flash": {
+        "rows": 86006,
+        "valid_prompt_response": 86006,
+        "empty_prompts": 0,
+        "empty_responses": 0,
+        "attributed": 86006,
+        "source_rows": {},
+        "lang": {
+          "en": 84297,
+          "zh": 1709
+        },
+        "response_lengths": {
+          "chars": {
+            "p10": 2146.0,
+            "median": 6412.0,
+            "p90": 20567.0,
+            "max": 841540.0
+          },
+          "words": {
+            "p10": 353.0,
+            "median": 941.0,
+            "p90": 3407.0,
+            "max": 38353.0
+          },
+          "approx_tokens": {
+            "p10": 353.0,
+            "median": 941.0,
+            "p90": 3407.0,
+            "max": 38353.0
+          }
+        },
+        "source_token_metadata": {
+          "p10": 541.0,
+          "median": 1600.0,
+          "p90": 6144.0,
+          "max": 49114.0
+        },
+        "unique_prompts": 40988,
+        "duplicate_text_groups": 6,
+        "duplicate_extra_rows": 8,
+        "cross_model_identical_text_groups": 0,
+        "prompt_multi_response_groups": 38604,
+        "formatting": {
+          "has_markdown": {
+            "rows": 76351,
+            "pct": 88.77403902053345
+          },
+          "has_code": {
+            "rows": 34302,
+            "pct": 39.88326395832849
+          },
+          "has_url": {
+            "rows": 6125,
+            "pct": 7.12159616770923
+          },
+          "has_list": {
+            "rows": 54165,
+            "pct": 62.97816431411762
+          },
+          "has_structured": {
+            "rows": 20644,
+            "pct": 24.00297653652071
+          },
+          "has_think_tag": {
+            "rows": 29536,
+            "pct": 34.34179010766691
+          }
+        },
+        "top_prefixes_120": {
+          "<think>the user asks me to find the flaw in the argument: \"all fast code is short; this code is short, so it is fast.\" t": 194,
+          "<think>the user wants me to plan a task: check tomorrow's weather in three cities and message the team which one suits a": 71,
+          "<think>the user wants me to find the flaw in the argument: \"all fast code is short; this code is short, so it is fast.\" ": 65,
+          "<think>the user wants me to identify the logical flaw in the argument: \"all fast code is short; this code is short, so i": 54,
+          "<think>the user wants me to simulate an agent transcript for renaming a feature flag 'beta_x' to 'launch_x' across a rep": 54,
+          "<think>the user wants me to find the flaw in the syllogism: \"all fast code is short; this code is short, so it is fast.\"": 53,
+          "<think>the user asks me to find the flaw in the syllogism: \"all fast code is short; this code is short, so it is fast.\" ": 46,
+          "<think>the user wants me to respond with exact tool calls in json format, in order, with a one-line rationale before eac": 40,
+          "<think>the user wants me to: 1. find the flaw in the argument: \"all fast code is short; this code is short, so it is fas": 37,
+          "<think>the user wants me to identify the flaw in the argument: \"all fast code is short; this code is short, so it is fas": 36
+        },
+        "top_suffixes_120": {
+          "<fatal-error>lp failure</fatal-error>": 4,
+          " three cases, design consumers to be **idempotent** — with at-least-once delivery, duplicates are a *when*, not an *if*.": 2,
+          "j = 0; j < colsb; j++) { for (let k = 0; k < colsa; k++) { result[i][j] += a[i][k] * b[k][j]; } } } return result; } ```": 2,
+          " input `z` → `z` is not in `'aeiou'` → prints `consonant` ✓ - input `s` → `s` is not in `'aeiou'` → prints `consonant` ✓": 2,
+          "since $3 \\ge -2$, we use the second piece of the function: $f(3) = 5 - 2(3) = 5 - 6 = -1$.": 2,
+          "{ years old}$$ ## step 2: find her age in 10 years $$16 + 10 = 26$$ ## answer lara will be **26 years old** in 10 years.": 2,
+          "rting business road distance road access population density pedestrian traffic population income the center of the crowd": 2,
+          "l** | **24** | **finding the advertising time:** $$30 - 24 = 6$$ there are **6 minutes** of advertising in the newscast.": 2,
+          "had 300 pages. **check:** last week: 5 × 300 = 1500 pages. this week: 2 × 1500 = 3000 pages. total: 1500 + 3000 = 4500 ✓": 2,
+          " - monday: 2 pages - tuesday: 45 ÷ 15 = 3 pages - wednesday: 5 pages - total: 2 + 3 + 5 = 10 ✓ **the value of x is 45.**": 2
+        },
+        "response_vocab": 5213674,
+        "mean_word_length": 4.481197940585002
+      }
+    }
+  },
+  "gpt": {
+    "name": "gpt56_sol_luna",
+    "rows": 15353,
+    "schema": {
+      "rows": 15353,
+      "columns": [
+        {
+          "name": "row_hash",
+          "dtype": "string",
+          "missing": 0,
+          "missing_pct": 0.0
+        },
+        {
+          "name": "first_source_dataset",
+          "dtype": "string",
+          "missing": 0,
+          "missing_pct": 0.0
+        },
+        {
+          "name": "first_source_config",
+          "dtype": "string",
+          "missing": 0,
+          "missing_pct": 0.0
+        },
+        {
+          "name": "first_source_split",
+          "dtype": "string",
+          "missing": 0,
+          "missing_pct": 0.0
+        },
+        {
+          "name": "first_source_row_index",
+          "dtype": "int64",
+          "missing": 0,
+          "missing_pct": 0.0
+        },
+        {
+          "name": "seen_count",
+          "dtype": "int64",
+          "missing": 0,
+          "missing_pct": 0.0
+        },
+        {
+          "name": "row_json",
+          "dtype": "string",
+          "missing": 0,
+          "missing_pct": 0.0
+        }
+      ]
+    },
+    "unique_normalized_nonempty_responses": 7030,
+    "parse_errors": 0,
+    "rows_by_model": {
+      "gpt-5.6-sol": 14467,
+      "gpt-5.6-luna": 886
+    },
+    "empty_prompts": 0,
+    "empty_responses": 8313,
+    "duplicates": {
+      "exact_duplicate_extra_rows": 10,
+      "exact_duplicate_texts": 10,
+      "normalized_duplicate_extra_rows": 10,
+      "normalized_duplicate_texts": 10,
+      "identical_texts_across_models": 0,
+      "rows_in_cross_model_identical_texts": 0
+    },
+    "models": {
+      "gpt-5.6-luna": {
+        "rows": 886,
+        "valid_prompt_response": 886,
+        "empty_prompts": 0,
+        "empty_responses": 0,
+        "attributed": 886,
+        "source_rows": {
+          "empero-ai/gpt-5.6-luna-sft-900x": 886
+        },
+        "lang": {
+          "[missing]": 886
+        },
+        "response_lengths": {
+          "chars": {
+            "p10": 1219.5,
+            "median": 2068.0,
+            "p90": 4103.5,
+            "max": 10390.0
+          },
+          "words": {
+            "p10": 198.5,
+            "median": 338.0,
+            "p90": 628.0,
+            "max": 1443.0
+          },
+          "approx_tokens": {
+            "p10": 198.5,
+            "median": 338.0,
+            "p90": 628.0,
+            "max": 1443.0
+          }
+        },
+        "source_token_metadata": {
+          "p10": null,
+          "median": null,
+          "p90": null,
+          "max": null
+        },
+        "unique_prompts": 886,
+        "duplicate_text_groups": 0,
+        "duplicate_extra_rows": 0,
+        "cross_model_identical_text_groups": 0,
+        "prompt_multi_response_groups": 0,
+        "formatting": {
+          "has_markdown": {
+            "rows": 535,
+            "pct": 60.38374717832957
+          },
+          "has_code": {
+            "rows": 87,
+            "pct": 9.81941309255079
+          },
+          "has_url": {
+            "rows": 9,
+            "pct": 1.0158013544018059
+          },
+          "has_list": {
+            "rows": 380,
+            "pct": 42.88939051918736
+          },
+          "has_structured": {
+            "rows": 127,
+            "pct": 14.334085778781038
+          },
+          "has_think_tag": {
+            "rows": 886,
+            "pct": 100.0
+          }
+        },
+        "top_prefixes_120": {
+          "<think> this is a two-sided one-sample t test because the population standard deviation is unknown and the sample standa": 2,
+          "<think> the rewrite should preserve the two essential facts: the hybrid model begins immediately, and employees are expe": 1,
+          "<think> the notes provide four shipments and all required fields. “still moving” indicates in_transit, while “held up at": 1,
+          "<think> the task requires extracting five tickets into a fixed schema and inferring plan tier, category, and urgency fro": 1,
+          "<think> the constraints can be satisfied by treating a and d as a consecutive block, ad, because d must occur immediatel": 1,
+          "<think> each note is mapped to the named customer and any explicitly identified product. the soundpod pairing failure af": 1,
+          "<think> the task requires extracting seven specified elements from the abstract and presenting them as a structured tabl": 1,
+          "<think> the function must first handle the empty case before accessing the first element. it should also avoid processin": 1,
+          "<think> the explanation should connect four mechanisms: nighttime radiation, vertical mixing, clouds, and terrain. after": 1,
+          "<think> the passage’s central claim is that convenience should not be treated as the highest measure of progress because": 1
+        },
+        "top_suffixes_120": {
+          "rrangement. send any questions to your manager or hr so we can support you through the transition. thank you, management": 1,
+          "\",\"origin_city\":\"austin\",\"destination_city\":\"dallas\",\"weight_kg\":0.5,\"status\":\"delivered\",\"delivery_date\":\"2025-03-06\"}]": 1,
+          "ry\":\"the enterprise customer was charged twice on the monthly invoice and requests a refund for the duplicate charge.\"}]": 1,
+          "- b is not first or last: b is 4th. - e is first or second: e is 1st. - c and e are not adjacent: c is 5th and e is 1st.": 1,
+          "},{\"customer_name\":\"chen wei\",\"product\":null,\"issue_category\":\"billing\",\"sentiment\":\"negative\",\"refund_requested\":true}]": 1,
+          " xr-12 versus 2.1% with placebo (p<0.001) | | main limitation | single academic-center setting limits generalizability |": 1,
+          "xisting end with `end` instead of taking the maximum. the maximum is necessary when one interval fully contains another.": 1,
+          " of cold air. that is why a valley floor can be much colder—and sometimes foggier or frostier—than nearby higher ground.": 1,
+          "e moral force, encouraging readers to view technological convenience with skepticism rather than unqualified admiration.": 1,
+          "crease. these figures exclude slab losses, thermal bridges, deliberate ventilation, and any startup or warm-up capacity.": 1
+        },
+        "response_vocab": 38431,
+        "mean_word_length": 4.776876141765941
+      },
+      "gpt-5.6-sol": {
+        "rows": 14467,
+        "valid_prompt_response": 6154,
+        "empty_prompts": 0,
+        "empty_responses": 8313,
+        "attributed": 14467,
+        "source_rows": {
+          "greghavens/gpt-5.6-sol-coding-and-debugging-traces": 14467
+        },
+        "lang": {
+          "code-review": 3551,
+          "python": 2920,
+          "go": 1757,
+          "ts": 1576,
+          "java": 766,
+          "csharp": 607,
+          "powershell": 605,
+          "rust": 520,
+          "multi": 498,
+          "bash": 349,
+          "c": 242,
+          "py": 226,
+          "ruby": 197,
+          "cpp": 179,
+          "seed-authoring": 177,
+          "zsh": 165,
+          "js": 70,
+          "asm": 39,
+          "typescript": 22,
+          "hcl": 1
+        },
+        "response_lengths": {
+          "chars": {
+            "p10": 0.0,
+            "median": 0.0,
+            "p90": 749.3999999999996,
+            "max": 21682.0
+          },
+          "words": {
+            "p10": 0.0,
+            "median": 0.0,
+            "p90": 95.0,
+            "max": 3196.0
+          },
+          "approx_tokens": {
+            "p10": 0.0,
+            "median": 0.0,
+            "p90": 95.0,
+            "max": 3196.0
+          }
+        },
+        "source_token_metadata": {
+          "p10": null,
+          "median": null,
+          "p90": null,
+          "max": null
+        },
+        "unique_prompts": 1426,
+        "duplicate_text_groups": 10,
+        "duplicate_extra_rows": 10,
+        "cross_model_identical_text_groups": 0,
+        "prompt_multi_response_groups": 1424,
+        "formatting": {
+          "has_markdown": {
+            "rows": 4348,
+            "pct": 30.054607036704223
+          },
+          "has_code": {
+            "rows": 208,
+            "pct": 1.4377548904403123
+          },
+          "has_url": {
+            "rows": 178,
+            "pct": 1.2303863966268058
+          },
+          "has_list": {
+            "rows": 736,
+            "pct": 5.087440381558029
+          },
+          "has_structured": {
+            "rows": 2775,
+            "pct": 19.18158567774936
+          },
+          "has_think_tag": {
+            "rows": 0,
+            "pct": 0.0
+          }
+        },
+        "top_prefixes_120": {
+          "{\"verdict\":\"needs_human\",\"scope_creep\":{\"found\":false,\"evidence\":[]},\"missed_requirements\":{\"found\":false,\"evidence\":[]}": 540,
+          "{ \"verdict\": \"needs_human\", \"scope_creep\": { \"found\": false, \"evidence\": [] }, \"missed_requirements\": { \"found\": false, ": 69,
+          "{\"verdict\":\"accept\",\"scope_creep\":{\"found\":false,\"evidence\":[\"`git status --short --untracked-files=all` reported only `": 30,
+          "{\"verdict\":\"needs_human\",\"scope_creep\":{\"found\":false,\"evidence\":[\"`git status --short` in the workspace reported only `": 24,
+          "{\"verdict\":\"reject\",\"scope_creep\":{\"found\":false,\"evidence\":[\"`git status --short --untracked-files=all` reported only `": 20,
+          "{\"verdict\":\"needs_human\",\"scope_creep\":{\"found\":false,\"evidence\":[\"`git status --short` in the workspace showed only `a ": 19,
+          "{\"verdict\":\"needs_human\",\"scope_creep\":{\"found\":false,\"evidence\":[\"`git status --short` in the candidate workspace repor": 17,
+          "{\"verdict\":\"needs_human\",\"scope_creep\":{\"found\":false,\"evidence\":[\"`git status --short` in the workspace reports only `m": 13,
+          "{\"verdict\":\"needs_human\",\"scope_creep\":{\"found\":false,\"evidence\":[\"`git status --short` in the workspace showed only ` a": 12,
+          "{\"verdict\":\"needs_human\",\"scope_creep\":{\"found\":false,\"evidence\":[\"`git status --short` in the live workspace reports on": 12
+        },
+        "top_suffixes_120": {
+          "\"evidence\":[]},\"non_working_code\":{\"found\":false,\"evidence\":[]},\"requirements\":[],\"summary\":\"verification in progress.\"}": 32,
+          "idence\":[]},\"non_working_code\":{\"found\":false,\"evidence\":[]},\"requirements\":[],\"summary\":\"verification is in progress.\"}": 7,
+          "tation paths, and the required race-enabled test command. i’ll return only the strict json verdict after verification.\"}": 4,
+          " run the acceptance command exactly once and audit the implementation and shipped patch against every contract clause.\"}": 4,
+          "patch, implementation details, and the required test run. i’ll return only the strict json verdict after verification.\"}": 3,
+          "plementation paths, and one clean test run. i’ll return only the required json verdict after the evidence is complete.\"}": 2,
+          "\":[]},\"non_working_code\":{\"found\":false,\"evidence\":[]},\"requirements\":[],\"summary\":\"starting independent verification.\"}": 2,
+          "]},\"non_working_code\":{\"found\":false,\"evidence\":[]},\"requirements\":[],\"summary\":\"independent verification in progress.\"}": 2,
+          " with exit code 0. no scope creep, missed requirement, regression, latent contract bug, or non-working code was found.\"}": 2,
+          "and the required race-enabled test command. i’ll return only the requested json verdict once verification is complete.\"}": 2
+        },
+        "response_vocab": 96620,
+        "mean_word_length": 2.3645516337651564
+      }
+    }
+  },
+  "comparison": {
+    "glm53_flash": {
+      "rows": 86006,
+      "exact_raw_response_overlap_rows": 0,
+      "normalized_response_overlap_rows": 0,
+      "normalized_overlap_unique_texts": 0,
+      "unique_candidate_normalized_responses": 85998,
+      "unique_candidate_not_in_v1all": 85998,
+      "prompt_overlap_rows": 0,
+      "overlap_by_model": {
+        "glm-5.3-flash": 0
+      },
+      "model_detail": {
+        "glm-5.3-flash": {
+          "rows": 86006,
+          "normalized_overlap_rows": 0,
+          "unique_normalized_responses": 85998,
+          "unique_not_in_v1all": 85998
+        }
+      },
+      "length_chars": {
+        "p10": 2146.0,
+        "median": 6412.0,
+        "p90": 20567.0,
+        "max": 841540.0
+      },
+      "length_words": {
+        "p10": 353.0,
+        "median": 941.0,
+        "p90": 3407.0,
+        "max": 38353.0
+      },
+      "formatting": {
+        "has_markdown": {
+          "rows": 76351,
+          "pct": 88.77403902053345
+        },
+        "has_code": {
+          "rows": 34302,
+          "pct": 39.88326395832849
+        },
+        "has_url": {
+          "rows": 6125,
+          "pct": 7.12159616770923
+        },
+        "has_list": {
+          "rows": 54165,
+          "pct": 62.97816431411762
+        },
+        "has_structured": {
+          "rows": 20644,
+          "pct": 24.00297653652071
+        }
+      }
+    },
+    "gpt56_sol_luna": {
+      "rows": 15353,
+      "exact_raw_response_overlap_rows": 0,
+      "normalized_response_overlap_rows": 0,
+      "normalized_overlap_unique_texts": 0,
+      "unique_candidate_normalized_responses": 7030,
+      "unique_candidate_not_in_v1all": 7030,
+      "prompt_overlap_rows": 0,
+      "overlap_by_model": {
+        "gpt-5.6-luna": 0,
+        "gpt-5.6-sol": 0
+      },
+      "model_detail": {
+        "gpt-5.6-luna": {
+          "rows": 886,
+          "normalized_overlap_rows": 0,
+          "unique_normalized_responses": 886,
+          "unique_not_in_v1all": 886
+        },
+        "gpt-5.6-sol": {
+          "rows": 14467,
+          "normalized_overlap_rows": 0,
+          "unique_normalized_responses": 6144,
+          "unique_not_in_v1all": 6144
+        }
+      },
+      "length_chars": {
+        "p10": 0.0,
+        "median": 0.0,
+        "p90": 1275.6000000000022,
+        "max": 21682.0
+      },
+      "length_words": {
+        "p10": 0.0,
+        "median": 0.0,
+        "p90": 191.0,
+        "max": 3196.0
+      },
+      "formatting": {
+        "has_markdown": {
+          "rows": 4883,
+          "pct": 31.804858985214615
+        },
+        "has_code": {
+          "rows": 295,
+          "pct": 1.9214485768253762
+        },
+        "has_url": {
+          "rows": 187,
+          "pct": 1.2180029961571028
+        },
+        "has_list": {
+          "rows": 1116,
+          "pct": 7.268937666905491
+        },
+        "has_structured": {
+          "rows": 2902,
+          "pct": 18.90184328795675
+        }
+      }
+    }
+  },
+  "v1_all_rows": 109967,
+  "glm_provenance_nonmissing": {
+    "temp": 25016,
+    "round": 25016,
+    "source": 25016,
+    "mode": 25016,
+    "turn": 2710,
+    "conv_id": 2710,
+    "has_system": 25016,
+    "tokens": 25016,
+    "finish": 13873,
+    "cap_hit": 25016,
+    "legacy_cap": 25016,
+    "truncated": 25016,
+    "think_tag_in_off": 25016,
+    "meta_json": 25016
+  },
+  "glm_provenance_duplicate_ids_first_kept": 9480,
+  "glm_by_primary_file": {
+    "glm53_harvest.parquet": 46611,
+    "glm53_harvest_r2.parquet": 18858,
+    "glm53_harvest_r3.parquet": 15337,
+    "glm53_harvest_r4.parquet": 5200
+  },
+  "glm_register": {
+    "code": 17985,
+    "prose": 15923,
+    "structured": 12161,
+    "reasoning": 10632,
+    "chat": 10141,
+    "agentic": 5640,
+    "multiturn": 4846,
+    "music": 4400,
+    "zh": 1709,
+    "agentic_coding": 810,
+    "agentic_tooling": 565,
+    "long_context": 543,
+    "code_edit": 476,
+    "deep_reasoning": 96,
+    "operator": 79
+  },
+  "glm_round": {
+    "NaN": 60990,
+    "3.0": 19816,
+    "4.0": 5200
+  },
+  "glm_source": {
+    "NaN": 60990,
+    "r3-bank-seed43": 19816,
+    "open-perfectblend-glm5.2-regen": 2710,
+    "github-code-clean": 1019,
+    "swe-bench-verified": 810,
+    "synthetic": 565,
+    "hendrycks-math": 96
+  },
+  "glm_finish": {
+    "NaN": 72133,
+    "stop": 12974,
+    "length": 899
+  },
+  "glm_truncated": {
+    "NaN": 60990,
+    "false": 24103,
+    "true": 913
+  },
+  "glm_cap_hit": {
+    "NaN": 60990,
+    "false": 24208,
+    "true": 808
+  },
+  "glm_thinking": {
+    "false": 63990,
+    "true": 22016
+  },
+  "glm_language": {
+    "en": 84297,
+    "zh": 1709
+  },
+  "schemas": {
+    "glm": {
+      "glm53_harvest.parquet": {
+        "rows": 46611,
+        "columns": [
+          {
+            "name": "id",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "register",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "lang",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "thinking",
+            "dtype": "bool",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "turns",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "temp",
+            "dtype": "float",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "prompt",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "response",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "tokens",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "messages_json",
+            "dtype": "string",
+            "missing": 46611,
+            "missing_pct": 100.0
+          }
+        ]
+      },
+      "glm53_harvest_r2.parquet": {
+        "rows": 18858,
+        "columns": [
+          {
+            "name": "id",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "register",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "lang",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "thinking",
+            "dtype": "bool",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "turns",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "temp",
+            "dtype": "float",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "prompt",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "response",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "tokens",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "messages_json",
+            "dtype": "string",
+            "missing": 18768,
+            "missing_pct": 99.5227489659561
+          }
+        ]
+      },
+      "glm53_harvest_r3.parquet": {
+        "rows": 15337,
+        "columns": [
+          {
+            "name": "id",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "register",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "lang",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "thinking",
+            "dtype": "bool",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "turns",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "temp",
+            "dtype": "float",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "prompt",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "response",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "tokens",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "messages_json",
+            "dtype": "string",
+            "missing": 13291,
+            "missing_pct": 86.6597118080459
+          }
+        ]
+      },
+      "glm53_harvest_r4.parquet": {
+        "rows": 5200,
+        "columns": [
+          {
+            "name": "id",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "register",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "lang",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "thinking",
+            "dtype": "bool",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "turns",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "temp",
+            "dtype": "float",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "prompt",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "response",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "tokens",
+            "dtype": "int32",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "messages_json",
+            "dtype": "string",
+            "missing": 2152,
+            "missing_pct": 41.38461538461539
+          }
+        ]
+      }
+    },
+    "gpt": {
+      "train.parquet": {
+        "rows": 15353,
+        "columns": [
+          {
+            "name": "row_hash",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "first_source_dataset",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "first_source_config",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "first_source_split",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "first_source_row_index",
+            "dtype": "int64",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "seen_count",
+            "dtype": "int64",
+            "missing": 0,
+            "missing_pct": 0.0
+          },
+          {
+            "name": "row_json",
+            "dtype": "string",
+            "missing": 0,
+            "missing_pct": 0.0
+          }
+        ]
+      }
+    }
+  },
+  "glm_turns": {
+    "1": 81552,
+    "3": 1970,
+    "5": 942,
+    "7": 387,
+    "9": 328,
+    "11": 283,
+    "13": 222,
+    "15": 168,
+    "17": 103,
+    "19": 51
+  },
+  "gpt_source_dataset": {
+    "greghavens/gpt-5.6-sol-coding-and-debugging-traces": 14467,
+    "empero-ai/gpt-5.6-luna-sft-900x": 886
+  },
+  "gpt_seen_count": {
+    "1": 15353
+  },
+  "gpt_metadata_language": {
+    "code-review": 3551,
+    "python": 2920,
+    "go": 1757,
+    "ts": 1576,
+    "NaN": 886,
+    "java": 766,
+    "csharp": 607,
+    "powershell": 605,
+    "rust": 520,
+    "multi": 498,
+    "bash": 349,
+    "c": 242,
+    "py": 226,
+    "ruby": 197,
+    "cpp": 179,
+    "seed-authoring": 177,
+    "zsh": 165,
+    "js": 70,
+    "asm": 39,
+    "typescript": 22,
+    "hcl": 1
+  },
+  "gpt_language_by_model": {
+    "gpt-5.6-luna": {
+      "NaN": 886
+    },
+    "gpt-5.6-sol": {
+      "code-review": 3551,
+      "python": 2920,
+      "go": 1757,
+      "ts": 1576,
+      "java": 766,
+      "csharp": 607,
+      "powershell": 605,
+      "rust": 520,
+      "multi": 498,
+      "bash": 349,
+      "c": 242,
+      "py": 226,
+      "ruby": 197,
+      "cpp": 179,
+      "seed-authoring": 177,
+      "zsh": 165,
+      "js": 70,
+      "asm": 39,
+      "typescript": 22,
+      "hcl": 1
+    }
+  },
+  "v1all_response_lengths": {
+    "chars": {
+      "p10": 325.0,
+      "median": 645.0,
+      "p90": 1302.0,
+      "max": 2123.0
+    },
+    "words": {
+      "p10": 50.0,
+      "median": 102.0,
+      "p90": 208.0,
+      "max": 306.0
+    }
+  },
+  "v1all_formatting": {
+    "has_markdown": {
+      "rows": 33,
+      "pct": 0.030009002700810243
+    },
+    "has_code": {
+      "rows": 0,
+      "pct": 0.0
+    },
+    "has_url": {
+      "rows": 5,
+      "pct": 0.004546818591031855
+    },
+    "has_list": {
+      "rows": 0,
+      "pct": 0.0
+    },
+    "has_structured": {
+      "rows": 4,
+      "pct": 0.003637454872825484
+    }
+  },
+  "gpt_message_count": {
+    "3": 2323,
+    "6": 1446,
+    "11": 1156,
+    "13": 914,
+    "8": 857,
+    "9": 840,
+    "16": 718,
+    "18": 650,
+    "14": 558,
+    "15": 537,
+    "20": 482,
+    "4": 459,
+    "22": 350,
+    "17": 340,
+    "12": 288,
+    "19": 248,
+    "10": 245,
+    "24": 245,
+    "21": 207,
+    "26": 193,
+    "23": 185,
+    "28": 147,
+    "25": 138,
+    "7": 134,
+    "27": 126,
+    "30": 123,
+    "29": 112,
+    "31": 102,
+    "32": 95,
+    "33": 91,
+    "35": 80,
+    "34": 76,
+    "37": 69,
+    "36": 61,
+    "38": 55,
+    "40": 53,
+    "39": 49,
+    "42": 39,
+    "41": 35,
+    "44": 35,
+    "43": 29,
+    "46": 27,
+    "45": 26,
+    "48": 23,
+    "47": 18,
+    "50": 16,
+    "51": 16,
+    "49": 16,
+    "54": 14,
+    "53": 13,
+    "60": 13,
+    "56": 13,
+    "57": 12,
+    "52": 12,
+    "5": 11,
+    "55": 11,
+    "59": 11,
+    "58": 11,
+    "64": 10,
+    "62": 10,
+    "61": 8,
+    "63": 8,
+    "70": 8,
+    "74": 8,
+    "67": 8,
+    "72": 7,
+    "76": 7,
+    "65": 7,
+    "78": 5,
+    "92": 5,
+    "77": 5,
+    "66": 4,
+    "68": 4,
+    "80": 4,
+    "84": 4,
+    "86": 4,
+    "88": 4,
+    "90": 4,
+    "94": 4,
+    "96": 4,
+    "98": 4,
+    "100": 4,
+    "102": 4,
+    "79": 4,
+    "81": 4,
+    "82": 3,
+    "104": 3,
+    "69": 3,
+    "71": 3,
+    "73": 3,
+    "83": 3,
+    "85": 3,
+    "106": 2,
+    "108": 2,
+    "110": 2,
+    "112": 2,
+    "114": 2,
+    "75": 2,
+    "87": 2,
+    "116": 1,
+    "105": 1,
+    "107": 1,
+    "109": 1,
+    "111": 1,
+    "113": 1,
+    "115": 1,
+    "117": 1,
+    "119": 1,
+    "121": 1,
+    "124": 1,
+    "126": 1,
+    "89": 1
+  },
+  "gpt_assistant_steps": {
+    "10.0": 1590,
+    "11.0": 1498,
+    "12.0": 1480,
+    "9.0": 1429,
+    "13.0": 944,
+    "NaN": 886,
+    "8.0": 859,
+    "14.0": 741,
+    "16.0": 586,
+    "15.0": 527,
+    "7.0": 515,
+    "19.0": 449,
+    "17.0": 422,
+    "18.0": 381,
+    "21.0": 371,
+    "22.0": 353,
+    "20.0": 268,
+    "24.0": 239,
+    "6.0": 193,
+    "26.0": 189
+  },
+  "gpt_reasoning_effort": {
+    "xhigh": 14467,
+    "NaN": 886
+  },
+  "gpt_empty_text_with_tool_calls": 8313,
+  "gpt_continuation": {
+    "false": 14182,
+    "null": 886,
+    "true": 285
+  },
+  "gpt_original_n_messages": {
+    "18.0": 1389,
+    "16.0": 1269,
+    "20.0": 1262,
+    "22.0": 1086,
+    "NaN": 886,
+    "14.0": 563,
+    "24.0": 544,
+    "26.0": 496,
+    "23.0": 415,
+    "13.0": 374,
+    "19.0": 361,
+    "21.0": 348,
+    "15.0": 342,
+    "25.0": 291,
+    "29.0": 282,
+    "17.0": 271,
+    "39.0": 262,
+    "31.0": 258,
+    "32.0": 257,
+    "27.0": 250,
+    "30.0": 250,
+    "28.0": 243,
+    "34.0": 238,
+    "40.0": 230,
+    "37.0": 214,
+    "11.0": 188,
+    "35.0": 178,
+    "48.0": 170,
+    "36.0": 163,
+    "33.0": 162,
+    "46.0": 143,
+    "44.0": 137,
+    "12.0": 133,
+    "42.0": 132,
+    "41.0": 129,
+    "43.0": 119,
+    "64.0": 115,
+    "38.0": 97,
+    "59.0": 80,
+    "50.0": 72,
+    "47.0": 61,
+    "116.0": 60,
+    "115.0": 60,
+    "126.0": 59,
+    "63.0": 58,
+    "45.0": 57,
+    "60.0": 53,
+    "92.0": 50,
+    "102.0": 47,
+    "87.0": 39,
+    "86.0": 39,
+    "81.0": 36,
+    "77.0": 36,
+    "78.0": 35,
+    "76.0": 34,
+    "68.0": 31,
+    "62.0": 27,
+    "55.0": 25,
+    "56.0": 24,
+    "54.0": 24,
+    "52.0": 23,
+    "51.0": 23,
+    "49.0": 22,
+    "9.0": 13,
+    "6.0": 12,
+    "8.0": 4,
+    "3.0": 2
+  },
+  "gpt_original_n_messages_stats": {
+    "p10": 15.0,
+    "median": 22.0,
+    "p90": 45.0,
+    "max": 126.0
+  },
+  "gpt_model_source_mismatch_rows": 0,
+  "gpt_missing_model": 0,
+  "metadata": {
+    "glm": {
+      "license": "mit",
+      "card": [
+        "---",
+        "license: mit",
+        "language:",
+        "- en",
+        "- zh",
+        "task_categories:",
+        "- text-generation",
+        "pretty_name: GLM-5.3-Flash On-Policy Harvest",
+        "tags:",
+        "- speculative-decoding",
+        "- drafter-training",
+        "- on-policy",
+        "- glm",
+        "- glm-5.3",
+        "- eagle3",
+        "- dflash",
+        "- dspark",
+        "- reasoning",
+        "- thinking",
+        "- synthetic",
+        "- distillation",
+        "size_categories:",
+        "- 10K<n<100K",
+        "configs:",
+        "- config_name: default",
+        "  data_files: data/glm53_harvest*.parquet",
+        "- config_name: round1",
+        "  data_files: data/glm53_harvest.parquet",
+        "- config_name: round2",
+        "  data_files: data/glm53_harvest_r2.parquet",
+        "- config_name: round3",
+        "  data_files: data/glm53_harvest_r3.parquet",
+        "- config_name: round4",
+        "  data_files: data/glm53_harvest_r4.parquet",
+        "- config_name: thinking_on"
+      ]
+    },
+    "gpt": {
+      "license": "cc-by-4.0",
+      "card": [
+        "---",
+        "license: cc-by-4.0",
+        "pretty_name: GPT-5.6 Sol · Terra · Luna Library",
+        "language:",
+        "- en",
+        "task_categories:",
+        "- text-generation",
+        "size_categories:",
+        "- 10K<n<100K",
+        "tags:",
+        "- agent-traces",
+        "- gpt-5.6",
+        "- gpt-5.6-sol",
+        "- gpt-5.6-terra",
+        "- gpt-5.6-luna",
+        "- openai",
+        "- codex",
+        "- tool-use",
+        "- coding-agent",
+        "- chain-of-thought",
+        "- sft",
+        "- content-verified",
+        "- maintained-mirror",
+        "configs:",
+        "- config_name: default",
+        "  data_files:",
+        "  - split: train",
+        "    path: data/train.parquet",
+        "---",
+        "<p align=\"center\">",
+        "  <img src=\"https://huggingface.co/datasets/Crownelius/GPT-5.6-Sol-Luna-Terra-Traces/resolve/main/assets/stl_banner.png\" alt=\"GPT-5.6 Sol Terra Luna Library\" width=\"100%\">",
+        "</p>",
+        "",
+        "<div align=\"center\">",
+        ""
+      ]
+    }
+  }
+}
