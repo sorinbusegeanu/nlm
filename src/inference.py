@@ -284,6 +284,16 @@ def predict_prediction_bundle(bundle_dir, texts, *, base_model_overrides=None):
         members = selection["selected_members"]
         combined = np.mean(np.stack([probabilities[name] for name in members]), axis=0)
         predictions = np.asarray(classes)[combined.argmax(axis=1)]
+    elif selection["selected_strategy"] == "optimized_probability_blend":
+        members = selection["selected_members"]
+        weight_map = selection.get("selected_weights", {})
+        weights = np.asarray([weight_map.get(name) for name in members], dtype=float)
+        if (weights.shape != (len(members),) or not np.isfinite(weights).all() or
+                np.any(weights < 0) or not np.isclose(weights.sum(), 1.0, atol=1e-6)):
+            raise ValueError("weighted prediction bundle has invalid or unnormalized member weights")
+        combined = np.einsum("m,mnc->nc", weights,
+                             np.stack([probabilities[name] for name in members]))
+        predictions = np.asarray(classes)[combined.argmax(axis=1)]
     elif selection["selected_strategy"] == "per_response_reliability":
         predictions = predict_from_trust_table(probabilities, classes, selection["trust_table"],
             minimum_support=selection["minimum_support"],
@@ -307,20 +317,24 @@ def package_prediction_bundle(selection_manifest, output_zip, *, include_base_mo
     strategy = report["selected_strategy"]
     if strategy == "equal_probability_blend":
         required = list(report["selected_members"])
+    elif strategy == "optimized_probability_blend":
+        required = list(report["selected_members"])
     elif strategy == "per_response_reliability":
         required = sorted({row["candidate_id"] for row in pd.read_csv(report["trust_table_path"]).to_dict("records")
                            if row["eligible"]})
     else:
         raise ValueError(f"unsupported selected strategy: {strategy}")
-    fallback_candidate = max(report["candidates"],
-        key=lambda item: (item.get("training_balanced_accuracy") or 0.0,
-                          item["candidate_id"]))["candidate_id"]
-    if fallback_candidate not in required:
-        required.append(fallback_candidate)
+    fallback_candidate = None
     trust_rows = []
-    for row in pd.read_csv(report["trust_table_path"]).to_dict("records"):
-        trust_rows.append({key: (None if pd.isna(value) else value.item() if isinstance(value, np.generic) else value)
-                           for key, value in row.items()})
+    if strategy == "per_response_reliability":
+        fallback_candidate = max(report["candidates"],
+            key=lambda item: (item.get("training_balanced_accuracy") or 0.0,
+                              item["candidate_id"]))["candidate_id"]
+        if fallback_candidate not in required:
+            required.append(fallback_candidate)
+        for row in pd.read_csv(report["trust_table_path"]).to_dict("records"):
+            trust_rows.append({key: (None if pd.isna(value) else value.item() if isinstance(value, np.generic) else value)
+                               for key, value in row.items()})
     root_module = Path(__file__).resolve().parent
     output_zip = Path(output_zip)
     output_zip.parent.mkdir(parents=True, exist_ok=True)
@@ -421,6 +435,7 @@ def package_prediction_bundle(selection_manifest, output_zip, *, include_base_mo
             candidates.append(spec)
         portable = {"experiment_id": report["experiment_id"], "classes": report["classes"],
             "selected_strategy": strategy, "selected_members": report["selected_members"],
+            "selected_weights": report.get("selected_weights", {}),
             "required_candidates": required, "candidate_models": candidates,
             "trust_table": trust_rows, "minimum_support": report["reliability_rule"]["minimum_support"],
             "fallback_candidate": fallback_candidate,

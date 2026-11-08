@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, log_loss
+from sklearn.model_selection import GroupKFold
+from .ensemble_factory import fit_weights
 
 
 def _sha(value):
@@ -65,6 +66,7 @@ def _read_candidates(artifact_dir, *, min_validation_rows=1, candidate_ids=None)
                     not np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-4)):
                 problems.append(f"invalid probabilities: {prediction_path}")
                 continue
+            probabilities = probabilities / probabilities.sum(axis=1, keepdims=True)
             ordered = frame[["id", "prompt_id", "y_true"]].copy()
             ordered["id"] = ordered.id.astype(str)
             ordered["prompt_id"] = ordered.prompt_id.astype(str)
@@ -218,44 +220,94 @@ def _lookup_predictions(candidates, classes, table_rows, *, minimum_support=10):
     return outputs, predicted, used_candidate_ids
 
 
-def _search_equal_blends(candidates, y_true, classes, *, batch_size=64, top_k=100):
-    """Exhaustively score all non-empty equal blends by balanced accuracy."""
-    names = [candidate["candidate_id"] for candidate in candidates]
-    probability_stack = np.stack([candidate["probabilities"] for candidate in candidates]).astype(np.float32)
-    y_indexes = np.asarray([classes.index(label) for label in y_true], dtype=np.int64)
-    best = None
-    top = []
-    total = 0
-    for size in range(1, len(candidates) + 1):
-        iterator = itertools.combinations(range(len(candidates)), size)
-        while True:
-            batch = list(itertools.islice(iterator, batch_size))
-            if not batch:
-                break
-            indexes = np.asarray(batch, dtype=np.int16)
-            averages = probability_stack[indexes].mean(axis=1)
-            pred_indexes = averages.argmax(axis=2)
-            accuracies = np.mean(pred_indexes == y_indexes[None, :], axis=1)
-            recalls = np.stack([
-                np.mean(pred_indexes[:, y_indexes == class_index] == class_index, axis=1)
-                for class_index in range(len(classes))
-            ], axis=1)
-            scores = recalls.mean(axis=1)
-            for subset, score, accuracy, probs in zip(batch, scores, accuracies, averages):
-                total += 1
-                member_names = tuple(names[index] for index in subset)
-                record = {"members": list(member_names), "accuracy": float(accuracy),
-                          "balanced_accuracy": float(score), "size": len(subset)}
-                key = (float(score), -len(subset), tuple(member_names))
-                if (best is None or key[:2] > best[0][:2] or
-                        (key[:2] == best[0][:2] and key[2] < best[0][2])):
-                    best = (key, record, probs.copy())
-                top.append((key, record))
-            if len(top) > 2 * top_k:
-                top.sort(key=lambda item: (-item[0][0], -item[0][1], item[0][2]))
-                top = top[:top_k]
-    top.sort(key=lambda item: (-item[0][0], -item[0][1], item[0][2]))
-    return best[1], best[2], [item[1] for item in top[:top_k]], total
+def _probability_metrics(probabilities, y_true, classes):
+    predicted = np.asarray(classes)[np.asarray(probabilities).argmax(axis=1)]
+    return {"accuracy": float(accuracy_score(y_true, predicted)),
+            "balanced_accuracy": float(balanced_accuracy_score(y_true, predicted)),
+            "log_loss": float(log_loss(y_true, probabilities, labels=list(classes)))}
+
+
+def _forward_select(candidates, y_true, classes):
+    """Greedily add candidates by accuracy, then log loss, with stable name ties."""
+    if not candidates:
+        raise ValueError("forward selection needs at least one candidate")
+    candidates = sorted(candidates, key=lambda item: item["candidate_id"])
+    remaining = list(candidates)
+    individual = []
+    for candidate in candidates:
+        metric = _probability_metrics(candidate["probabilities"], y_true, classes)
+        individual.append({"candidate_id": candidate["candidate_id"], **metric})
+    first = min(individual, key=lambda row: (-row["accuracy"], row["log_loss"], row["candidate_id"]))
+    selected = [next(item for item in candidates if item["candidate_id"] == first["candidate_id"])]
+    remaining = [item for item in remaining if item["candidate_id"] != first["candidate_id"]]
+    current_probs = selected[0]["probabilities"].copy()
+    current = _probability_metrics(current_probs, y_true, classes)
+    steps = [{"step": 1, "added_candidate_id": first["candidate_id"],
+              "selected_candidate_ids": [first["candidate_id"]], **current}]
+    while remaining:
+        trials = []
+        for candidate in remaining:
+            probs = np.mean(np.stack([item["probabilities"] for item in selected + [candidate]]), axis=0)
+            metric = _probability_metrics(probs, y_true, classes)
+            trials.append((metric, candidate, probs))
+        metric, candidate, probs = min(
+            trials, key=lambda trial: (-trial[0]["accuracy"], trial[0]["log_loss"],
+                                       len(selected) + 1, trial[1]["candidate_id"]))
+        improves = (metric["accuracy"] > current["accuracy"] or
+                    (metric["accuracy"] == current["accuracy"] and
+                     metric["log_loss"] < current["log_loss"] - 1e-12))
+        if not improves:
+            break
+        selected.append(candidate)
+        remaining = [item for item in remaining if item["candidate_id"] != candidate["candidate_id"]]
+        current, current_probs = metric, probs
+        steps.append({"step": len(selected), "added_candidate_id": candidate["candidate_id"],
+                      "selected_candidate_ids": [item["candidate_id"] for item in selected], **current})
+    return selected, current_probs, steps, individual
+
+
+def _weighted_probabilities(candidates, weights):
+    return np.einsum("m,mnc->nc", np.asarray(weights, dtype=float),
+                     np.stack([item["probabilities"] for item in candidates]))
+
+
+def _grouped_strategy_comparison(candidates, y_true, groups, classes, champion_ids=None,
+                                 *, folds=5, l2=.05):
+    """Out-of-fold evaluation of selection and weight fitting, grouped by prompt."""
+    unique_groups = np.unique(np.asarray(groups, dtype=str))
+    n_splits = min(int(folds), len(unique_groups))
+    if n_splits < 2:
+        raise ValueError("at least two prompt groups are required for grouped comparison")
+    outputs = {"previous_champion": np.zeros((len(y_true), len(classes)), dtype=float),
+               "equal_probability_blend": np.zeros((len(y_true), len(classes)), dtype=float),
+               "optimized_probability_blend": np.zeros((len(y_true), len(classes)), dtype=float)}
+    fold_records = []
+    splitter = GroupKFold(n_splits=n_splits)
+    for fold_index, (train_idx, valid_idx) in enumerate(splitter.split(np.zeros(len(y_true)), y_true, groups), 1):
+        fold_candidates = [{**candidate, "probabilities": candidate["probabilities"][train_idx]}
+                           for candidate in candidates]
+        selected, _, _, _ = _forward_select(fold_candidates, y_true[train_idx], classes)
+        selected_ids = [item["candidate_id"] for item in selected]
+        lookup = {item["candidate_id"]: item for item in candidates}
+        selected_valid = [lookup[item] for item in selected_ids]
+        equal = np.mean(np.stack([item["probabilities"][valid_idx] for item in selected_valid]), axis=0)
+        weights = fit_weights([item["probabilities"] for item in selected],
+                              y_true[train_idx], classes, l2=l2)
+        weighted = np.einsum("m,mnc->nc", weights,
+                             np.stack([item["probabilities"][valid_idx] for item in selected_valid]))
+        champion = [lookup[item] for item in (champion_ids or []) if item in lookup]
+        if champion:
+            champion_probs = np.mean(np.stack([item["probabilities"][valid_idx] for item in champion]), axis=0)
+        else:
+            champion_probs = equal
+        outputs["previous_champion"][valid_idx] = champion_probs
+        outputs["equal_probability_blend"][valid_idx] = equal
+        outputs["optimized_probability_blend"][valid_idx] = weighted
+        fold_records.append({"fold": fold_index, "held_out_prompt_groups": int(len(set(np.asarray(groups)[valid_idx]))),
+            "selected_candidate_ids": selected_ids, "optimized_weights": dict(zip(selected_ids, weights.tolist()))})
+    metrics = {name: _probability_metrics(probabilities, y_true, classes)
+               for name, probabilities in outputs.items()}
+    return metrics, outputs, fold_records
 
 
 def _training_reliability_predictions(candidates, *, data_dir="data/processed", output_dir=None):
@@ -351,8 +403,9 @@ def _training_reliability_predictions(candidates, *, data_dir="data/processed", 
 def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
                                    reference_dataset="v0", minimum_support=10,
                                    blend_batch_size=64, top_k=100, candidate_ids=None,
-                                   data_dir="data/processed"):
-    """Compare equal blends with a train-fitted per-response reliability selector."""
+                                   data_dir="data/processed", previous_champion=None,
+                                   group_folds=5, weight_l2=.05):
+    """Select a compact equal or weighted blend from saved validation probabilities."""
     artifact_dir = Path(artifact_dir)
     output_dir = Path(output_dir) if output_dir else artifact_dir / "predictions"
     all_candidates, read_problems = _read_candidates(artifact_dir / "predictions")
@@ -368,55 +421,70 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
             raise FileNotFoundError(f"active candidate manifests or predictions are missing: {sorted(missing_ids)}")
     classes, y_true, groups, candidates, excluded, reference_ids = _align_candidates(
         candidates, reference_dataset=reference_dataset, reference_frame=reference_frame)
-    training_predictions, training_labels, training_ids_sha256 = _training_reliability_predictions(
-        candidates, data_dir=data_dir, output_dir=output_dir)
-    table = _reliability_table(candidates, training_predictions, classes,
-                               minimum_support=minimum_support)
-    lookup_rows, lookup_pred, used_ids = _lookup_predictions(
-        candidates, classes, table, minimum_support=minimum_support)
-    lookup_accuracy = float(accuracy_score(y_true, lookup_pred))
-    lookup_balanced_accuracy = float(balanced_accuracy_score(y_true, lookup_pred))
-    lookup_log_loss = None
-    blend_best, blend_probabilities, top_blends, combination_count = _search_equal_blends(
-        candidates, y_true, classes, batch_size=blend_batch_size, top_k=top_k)
-    blend_pred = np.asarray(classes)[blend_probabilities.argmax(axis=1)]
-    blend_accuracy = float(accuracy_score(y_true, blend_pred))
-    blend_balanced_accuracy = float(balanced_accuracy_score(y_true, blend_pred))
-    blend_log_loss = float(log_loss(y_true, blend_probabilities, labels=classes))
-
-    choices = [
-        {"strategy": "per_response_reliability", "accuracy": lookup_accuracy,
-         "balanced_accuracy": lookup_balanced_accuracy, "log_loss": lookup_log_loss,
-         "members": sorted(used_ids), "prediction": lookup_pred},
-        {"strategy": "equal_probability_blend", "accuracy": blend_accuracy,
-         "balanced_accuracy": blend_balanced_accuracy, "log_loss": blend_log_loss,
-         "members": blend_best["members"], "prediction": blend_pred},
-    ]
-    choices.sort(key=lambda item: (-item["balanced_accuracy"], len(item["members"]),
-                                   item["strategy"], tuple(item["members"])))
-    winner = choices[0]
+    selected, equal_probabilities, selection_steps, individual_scores = _forward_select(candidates, y_true, classes)
+    selected_ids = [item["candidate_id"] for item in selected]
+    selected_weights = fit_weights([item["probabilities"] for item in selected], y_true, classes, l2=weight_l2)
+    weighted_probabilities = _weighted_probabilities(selected, selected_weights)
+    champion = previous_champion or {}
+    champion_ids = list(champion.get("selected_candidate_ids") or [
+        item.get("candidate_id") for item in champion.get("selected_members", [])
+        if isinstance(item, dict)])
+    candidate_by_id = {item["candidate_id"]: item for item in candidates}
+    champion_members = [candidate_by_id[item] for item in champion_ids if item in candidate_by_id]
+    if champion_ids and len(champion_members) != len(champion_ids):
+        missing = sorted(set(champion_ids) - set(candidate_by_id))
+        raise ValueError(f"previous champion candidates are unavailable for comparison: {missing}")
+    if champion_members:
+        champion_probabilities = np.mean(np.stack([item["probabilities"] for item in champion_members]), axis=0)
+    else:
+        champion_probabilities = equal_probabilities
+    oof_metrics, oof_probabilities, fold_records = _grouped_strategy_comparison(
+        candidates, y_true, groups, classes, champion_ids=champion_ids,
+        folds=group_folds, l2=weight_l2)
+    sizes = {"previous_champion": len(champion_members),
+             "equal_probability_blend": len(selected_ids),
+             "optimized_probability_blend": len(selected_ids)}
+    selection_names = {"previous_champion": champion.get("selected_strategy", "previous_champion"),
+                       "equal_probability_blend": "equal_probability_blend",
+                       "optimized_probability_blend": "optimized_probability_blend"}
+    winner_name = min(oof_metrics, key=lambda name: (-oof_metrics[name]["accuracy"],
+        oof_metrics[name]["log_loss"], sizes[name], selection_names[name], tuple(
+            champion_ids if name == "previous_champion" else selected_ids)))
+    final_probs = {"previous_champion": champion_probabilities,
+                   "equal_probability_blend": equal_probabilities,
+                   "optimized_probability_blend": weighted_probabilities}[winner_name]
+    full_metrics = {name: _probability_metrics(probs, y_true, classes) for name, probs in {
+        "previous_champion": champion_probabilities,
+        "equal_probability_blend": equal_probabilities,
+        "optimized_probability_blend": weighted_probabilities}.items()}
+    # Make final inference payload correspond to the selected strategy.
+    if winner_name == "previous_champion" and champion_members:
+        final_members = champion_members
+        final_weights = [1.0 / len(final_members)] * len(final_members)
+    else:
+        final_members = selected
+        final_weights = (selected_weights.tolist() if winner_name == "optimized_probability_blend"
+                         else [1.0 / len(selected)] * len(selected))
+    winner_metrics = full_metrics[winner_name]
+    winner_prediction = np.asarray(classes)[final_probs.argmax(axis=1)]
     validation_ids_sha256 = hashlib.sha256("\n".join(reference_ids).encode()).hexdigest()
     candidate_ids_ordered = [item["candidate_id"] for item in candidates]
     run_hash = _sha({"candidate_ids": candidate_ids_ordered,
                      "validation_ids_sha256": validation_ids_sha256,
-                     "minimum_support": minimum_support,
-                     "prior": [1.0, 1.0], "blend_method": "equal_probability_average"})[:12]
+                     "optimizer": "forward_group_cv_weighted_v1",
+                     "champion_ids": champion_ids, "weight_l2": weight_l2})[:12]
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"prediction_{reference_dataset}_{run_hash}"
-    trust_path = output_dir / f"{prefix}_trust_table.csv"
-    blends_path = output_dir / f"{prefix}_top_blends.csv"
+    summary_path = output_dir / f"{prefix}_summary.json"
+    steps_path = output_dir / f"{prefix}_forward_steps.csv"
     row_path = output_dir / f"{prefix}_validation_predictions.parquet"
     manifest_path = output_dir / f"{prefix}_manifest.json"
-    pd.DataFrame(table).to_csv(trust_path, index=False)
-    pd.DataFrame(top_blends).to_csv(blends_path, index=False)
-    validation_output = pd.DataFrame({"id": reference_ids, "y_true": y_true,
-        "lookup_prediction": lookup_pred, "blend_prediction": blend_pred,
-        "selected_prediction": winner["prediction"]})
-    for i, row in enumerate(lookup_rows):
-        validation_output.loc[i, "lookup_candidate_id"] = row["candidate_id"]
-        validation_output.loc[i, "lookup_confidence"] = row["confidence"]
-        validation_output.loc[i, "lookup_smoothed_trust"] = row["smoothed_trust"]
-        validation_output.loc[i, "lookup_fallback"] = row["fallback"]
+    pd.DataFrame(selection_steps).to_csv(steps_path, index=False)
+    validation_output = pd.DataFrame({"id": reference_ids, "prompt_id": groups, "y_true": y_true,
+        "champion_prediction": np.asarray(classes)[champion_probabilities.argmax(axis=1)],
+        "equal_blend_prediction": np.asarray(classes)[equal_probabilities.argmax(axis=1)],
+        "weighted_blend_prediction": np.asarray(classes)[weighted_probabilities.argmax(axis=1)],
+        "selected_prediction": winner_prediction})
     validation_output.to_parquet(row_path, index=False)
     candidate_records = []
     for item in candidates:
@@ -434,39 +502,48 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
             "model_revision": manifest.get("model_revision"), "config": manifest.get("config", {}),
             "calibration_temperature": manifest.get("calibration_temperature", 1.0),
             "classes": classes, "validation_balanced_accuracy": item["validation_score"],
-            "training_balanced_accuracy": item.get("training_balanced_accuracy"),
-            "training_prediction_path": item.get("training_prediction_path"),
+            "individual_accuracy": next(score["accuracy"] for score in individual_scores
+                                         if score["candidate_id"] == item["candidate_id"]),
         })
-    metrics = {}
-    for choice in choices:
-        metrics[choice["strategy"]] = {key: choice[key] for key in
-            ("accuracy", "balanced_accuracy", "log_loss", "members")}
     report = {
         "experiment_id": prefix, "module": "prediction_factory", "reference_dataset": reference_dataset,
         "split": "validation", "classes": classes, "validation_rows": len(y_true),
         "validation_ids_sha256": validation_ids_sha256,
         "validation_prompt_groups": int(len(set(groups))),
         "candidate_count": len(candidates), "candidate_ids": candidate_ids_ordered,
-        "combination_count": combination_count,
         "candidates": candidate_records, "excluded_candidates": excluded,
         "read_problems": read_problems,
-        "reliability_rule": {"fit_split": "v0_train", "fit_ids_sha256": training_ids_sha256,
-            "fit_rows": int(len(training_labels)), "metric": "precision_given_prediction",
-            "true_positive": "prediction equals true label",
-            "false_positive": "prediction differs from true label", "prior_alpha": 1.0,
-            "prior_beta": 1.0, "minimum_support": minimum_support,
-            "score": "(true_positive + 1) / (predicted_count + 2)",
-            "fallback": "highest_training_balanced_accuracy_candidate_argmax"},
-        "blend_rule": "uniform mean of member class-probability vectors",
-        "strategy_metrics": metrics, "selected_strategy": winner["strategy"],
-        "selected_members": winner["members"],
-        "selected_validation_accuracy": float(accuracy_score(y_true, winner["prediction"])),
-        "selected_validation_balanced_accuracy": winner["balanced_accuracy"],
-        "selection_tiebreak": ["higher_balanced_accuracy", "fewer_members", "strategy_name", "candidate_id_order"],
-        "trust_table_path": str(trust_path), "top_blends_path": str(blends_path),
+        "selection_method": "greedy_forward_selection",
+        "selection_steps": selection_steps,
+        "individual_accuracy": {row["candidate_id"]: row["accuracy"] for row in individual_scores},
+        "selected_candidate_ids": selected_ids,
+        "selected_weights": dict(zip([item["candidate_id"] for item in final_members], final_weights)),
+        "previous_champion_candidate_ids": champion_ids,
+        "previous_champion_strategy": champion.get("selected_strategy"),
+        "strategy_metrics": {name: {**oof_metrics[name], "ensemble_size": sizes[name]}
+                             for name in oof_metrics},
+        "full_data_strategy_metrics_exploratory": {name: {**full_metrics[name], "ensemble_size": sizes[name]}
+                                                   for name in full_metrics},
+        "strategy_fold_details": fold_records,
+        "selected_strategy": winner_name,
+        "selected_members": [item["candidate_id"] for item in final_members],
+        "selected_validation_accuracy": winner_metrics["accuracy"],
+        "selected_validation_balanced_accuracy": winner_metrics["balanced_accuracy"],
+        "selected_validation_log_loss": winner_metrics["log_loss"],
+        "selected_full_data_exploratory_metrics": full_metrics[winner_name],
+        "weight_l2": weight_l2,
+        "blend_rule": "weighted mean of member class-probability vectors",
+        "selection_tiebreak": ["higher_group_oof_accuracy", "lower_group_oof_log_loss", "fewer_models", "strategy_name", "candidate_id_order"],
+        "forward_steps_path": str(steps_path), "summary_path": str(summary_path),
         "validation_predictions_path": str(row_path),
-        "validation_selection_note": "Reliability statistics use only V0 training rows. The winning strategy is selected from validation results; its score is exploratory and may be optimistic.",
+        "validation_selection_note": "Group out-of-fold metrics hold out prompt groups during selection and weight fitting. The final full-data fit metrics are exploratory and may be optimistic.",
     }
+    summary_path.write_text(json.dumps({"available_models": len(candidates),
+        "selected_models": report["selected_members"], "individual_accuracy": report["individual_accuracy"],
+        "strategy_metrics_group_oof": report["strategy_metrics"],
+        "strategy_metrics_full_data_exploratory": report["full_data_strategy_metrics_exploratory"],
+        "selected_weights": report["selected_weights"], "selected_strategy": winner_name,
+        "forward_selection_steps": selection_steps}, indent=2) + "\n")
     manifest_path.write_text(json.dumps(report, indent=2, default=str) + "\n")
     report["manifest_path"] = str(manifest_path)
     return report

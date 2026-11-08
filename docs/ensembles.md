@@ -3,8 +3,8 @@
 <!-- ensemble-registry:start -->
 ```yaml
 active_candidate_roster_hash: f2752084813d54f83b54918f5b1abf965d245087c792999dee6bce59527eb66a
-active_candidate_roster: &id028
-- &id029
+active_candidate_roster: &id037
+- &id038
   model: catboost_stylometry
   candidate_id: catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0
   training_dataset: v1
@@ -21,7 +21,7 @@ active_candidate_roster: &id028
   checkpoint_filename: embeddinggemma2_foldvalidation
   selected_epoch: 8
   validation_balanced_accuracy: 0.41851851851851857
-- &id030
+- &id039
   model: gemma4_e2b
   candidate_id: gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0
   training_dataset: v1.1
@@ -38,7 +38,7 @@ active_candidate_roster: &id028
   checkpoint_filename: granite4_350m_foldvalidation
   selected_epoch: 4
   validation_balanced_accuracy: 0.4388888888888889
-- &id031
+- &id040
   model: granite4_h_micro
   candidate_id: granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0
   training_dataset: v1.1
@@ -47,7 +47,7 @@ active_candidate_roster: &id028
   checkpoint_filename: granite4_h_micro_foldvalidation
   selected_epoch: 3
   validation_balanced_accuracy: 0.5148148148148148
-- &id032
+- &id041
   model: llama32_3b
   candidate_id: llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0
   training_dataset: v1.1
@@ -56,7 +56,7 @@ active_candidate_roster: &id028
   checkpoint_filename: llama32_3b_foldvalidation
   selected_epoch: 3
   validation_balanced_accuracy: 0.5111111111111111
-- &id033
+- &id042
   model: ministral3_3b
   candidate_id: ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0
   training_dataset: v1.1
@@ -65,7 +65,7 @@ active_candidate_roster: &id028
   checkpoint_filename: ministral3_3b_foldvalidation
   selected_epoch: 3
   validation_balanced_accuracy: 0.5092592592592593
-- &id034
+- &id043
   model: qwen06
   candidate_id: qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0
   training_dataset: v1.5
@@ -90,7 +90,7 @@ active_candidate_roster: &id028
   checkpoint_filename: qwen4_foldvalidation
   selected_epoch: 9
   validation_balanced_accuracy: 0.2833333333333333
-- &id035
+- &id044
   model: smollm3_3b
   candidate_id: smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0
   training_dataset: v1.5
@@ -99,7 +99,7 @@ active_candidate_roster: &id028
   checkpoint_filename: smollm3_3b_foldvalidation
   selected_epoch: 5
   validation_balanced_accuracy: 0.5074074074074074
-- &id036
+- &id045
   model: svc
   candidate_id: svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0
   training_dataset: v1
@@ -108,7 +108,7 @@ active_candidate_roster: &id028
   checkpoint_filename: svc_foldvalidation.joblib
   selected_epoch: null
   validation_balanced_accuracy: 0.4166666666666667
-- &id037
+- &id046
   model: ultrabert380
   candidate_id: ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0
   training_dataset: v1.5
@@ -121,6 +121,7 @@ checkpoint_replacement_policy: replace a model checkpoint only when validation b
   accuracy is higher
 reliability_fit_split: V0 train
 last_recorded_active_roster_hash: f2752084813d54f83b54918f5b1abf965d245087c792999dee6bce59527eb66a
+optimizer_protocol: forward_group_cv_weighted_v1
 ensembles:
 - version: v1
   created_at_utc: '2026-11-03'
@@ -706,9 +707,123 @@ ensembles:
   created_at_utc: '2026-11-08T02:54:49.391686+00:00'
   trigger_experiment_id: granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0
   candidate_roster_hash: f2752084813d54f83b54918f5b1abf965d245087c792999dee6bce59527eb66a
-  candidate_checkpoints: *id028
+  candidate_checkpoints:
+  - &id028
+    model: catboost_stylometry
+    candidate_id: catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0
+    training_dataset: v1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0/checkpoints/catboost_stylometry_foldvalidation
+    checkpoint_filename: catboost_stylometry_foldvalidation
+    selected_epoch: null
+    validation_balanced_accuracy: 0.3444444444444444
+  - model: embeddinggemma2
+    candidate_id: embeddinggemma2_v1.5_data490fe052_split215fd0d0_seed2026_cfgd46e5fd0_code667e2d0
+    training_dataset: v1.5
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/embeddinggemma2_v1.5_data490fe052_split215fd0d0_seed2026_cfgd46e5fd0_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/embeddinggemma2_v1.5_data490fe052_split215fd0d0_seed2026_cfgd46e5fd0_code667e2d0/checkpoints/embeddinggemma2_foldvalidation
+    checkpoint_filename: embeddinggemma2_foldvalidation
+    selected_epoch: 8
+    validation_balanced_accuracy: 0.41851851851851857
+  - &id029
+    model: gemma4_e2b
+    candidate_id: gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0
+    training_dataset: v1.1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0/checkpoints/gemma4_e2b_foldvalidation
+    checkpoint_filename: gemma4_e2b_foldvalidation
+    selected_epoch: 7
+    validation_balanced_accuracy: 0.5277777777777778
+  - model: granite4_350m
+    candidate_id: granite4_350m_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgd8cbfdb7_code667e2d0
+    training_dataset: v1.1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/granite4_350m_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgd8cbfdb7_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/granite4_350m_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgd8cbfdb7_code667e2d0/checkpoints/granite4_350m_foldvalidation
+    checkpoint_filename: granite4_350m_foldvalidation
+    selected_epoch: 4
+    validation_balanced_accuracy: 0.4388888888888889
+  - &id030
+    model: granite4_h_micro
+    candidate_id: granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0
+    training_dataset: v1.1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0/checkpoints/granite4_h_micro_foldvalidation
+    checkpoint_filename: granite4_h_micro_foldvalidation
+    selected_epoch: 3
+    validation_balanced_accuracy: 0.5148148148148148
+  - &id031
+    model: llama32_3b
+    candidate_id: llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0
+    training_dataset: v1.1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0/checkpoints/llama32_3b_foldvalidation
+    checkpoint_filename: llama32_3b_foldvalidation
+    selected_epoch: 3
+    validation_balanced_accuracy: 0.5111111111111111
+  - &id032
+    model: ministral3_3b
+    candidate_id: ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0
+    training_dataset: v1.1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0/checkpoints/ministral3_3b_foldvalidation
+    checkpoint_filename: ministral3_3b_foldvalidation
+    selected_epoch: 3
+    validation_balanced_accuracy: 0.5092592592592593
+  - &id033
+    model: qwen06
+    candidate_id: qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0
+    training_dataset: v1.5
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0/checkpoints/qwen06_foldvalidation
+    checkpoint_filename: qwen06_foldvalidation
+    selected_epoch: 6
+    validation_balanced_accuracy: 0.47777777777777775
+  - model: qwen17
+    candidate_id: qwen17_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfg793e1ab7_code667e2d0
+    training_dataset: v1.1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/qwen17_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfg793e1ab7_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/qwen17_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfg793e1ab7_code667e2d0/checkpoints/qwen17_foldvalidation
+    checkpoint_filename: qwen17_foldvalidation
+    selected_epoch: 3
+    validation_balanced_accuracy: 0.4629629629629629
+  - model: qwen4
+    candidate_id: qwen4_v0_data40a22ce8_split147ce64e_seed2026_cfg54d18b01_code667e2d0
+    training_dataset: v0
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/qwen4_v0_data40a22ce8_split147ce64e_seed2026_cfg54d18b01_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/qwen4_v0_data40a22ce8_split147ce64e_seed2026_cfg54d18b01_code667e2d0/checkpoints/qwen4_foldvalidation
+    checkpoint_filename: qwen4_foldvalidation
+    selected_epoch: 9
+    validation_balanced_accuracy: 0.2833333333333333
+  - &id034
+    model: smollm3_3b
+    candidate_id: smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0
+    training_dataset: v1.5
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0/checkpoints/smollm3_3b_foldvalidation
+    checkpoint_filename: smollm3_3b_foldvalidation
+    selected_epoch: 5
+    validation_balanced_accuracy: 0.5074074074074074
+  - &id035
+    model: svc
+    candidate_id: svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0
+    training_dataset: v1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0/checkpoints/svc_foldvalidation.joblib
+    checkpoint_filename: svc_foldvalidation.joblib
+    selected_epoch: null
+    validation_balanced_accuracy: 0.4166666666666667
+  - &id036
+    model: ultrabert380
+    candidate_id: ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0
+    training_dataset: v1.5
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0/checkpoints/ultrabert380_continued
+    checkpoint_filename: ultrabert380_continued
+    selected_epoch: 5
+    validation_balanced_accuracy: 0.5314814814814814
   selected_strategy: equal_probability_blend
   selected_members:
+  - *id028
   - *id029
   - *id030
   - *id031
@@ -717,12 +832,59 @@ ensembles:
   - *id034
   - *id035
   - *id036
-  - *id037
   predicted_balanced_accuracy: 0.6000000000000001
   validation_accuracy: 0.6
   submitted_balanced_accuracy: 0.0
   prediction_experiment_id: prediction_v0_c770dff0b016
   prediction_manifest: artifacts/predictions/prediction_v0_c770dff0b016_manifest.json
+  validation_rows: 540
+- version: v6
+  created_at_utc: '2026-11-08T05:23:04.151109+00:00'
+  trigger_experiment_id: null
+  candidate_roster_hash: f2752084813d54f83b54918f5b1abf965d245087c792999dee6bce59527eb66a
+  candidate_checkpoints: *id037
+  selected_strategy: previous_champion
+  selected_members:
+  - *id038
+  - *id039
+  - *id040
+  - *id041
+  - *id042
+  - *id043
+  - *id044
+  - *id045
+  - *id046
+  predicted_balanced_accuracy: 0.6000000000000001
+  validation_accuracy: 0.6
+  group_oof_metrics:
+    previous_champion:
+      accuracy: 0.6
+      balanced_accuracy: 0.6000000000000001
+      log_loss: 1.1764712402418676
+      ensemble_size: 9
+    equal_probability_blend:
+      accuracy: 0.562962962962963
+      balanced_accuracy: 0.5629629629629629
+      log_loss: 1.2439472447437963
+      ensemble_size: 10
+    optimized_probability_blend:
+      accuracy: 0.5370370370370371
+      balanced_accuracy: 0.537037037037037
+      log_loss: 1.2010960067975542
+      ensemble_size: 10
+  selected_weights:
+    catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0: 0.1111111111111111
+    gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0: 0.1111111111111111
+    granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0: 0.1111111111111111
+    llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0: 0.1111111111111111
+    ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0: 0.1111111111111111
+    qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0: 0.1111111111111111
+    smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0: 0.1111111111111111
+    svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0: 0.1111111111111111
+    ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0: 0.1111111111111111
+  submitted_balanced_accuracy: 0.0
+  prediction_experiment_id: prediction_v0_27e1439c9742
+  prediction_manifest: artifacts/predictions/prediction_v0_27e1439c9742_manifest.json
   validation_rows: 540
 ```
 <!-- ensemble-registry:end -->

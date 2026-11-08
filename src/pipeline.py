@@ -1077,14 +1077,16 @@ def main(argv=None):
     elif a.command=="ensemble": result=evaluate_ensembles(a.dataset,a.artifact_dir,bootstrap_replicates=a.bootstrap_replicates,model_names=a.models,force=a.force)
     elif a.command=="prediction":
         if a.action=="evaluate":
-            from .ensemble_registry import read_active_roster
+            from .ensemble_registry import read_active_roster, read_ensemble_registry
             from .prediction_factory import evaluate_prediction_strategies
             active = read_active_roster(Path(a.artifact_dir) / "predictions" / "active_model_roster.json")
+            history = read_ensemble_registry()
             candidate_ids = ([item["candidate_id"] for item in active["candidates"]]
                              if active else None)
             result=evaluate_prediction_strategies(a.artifact_dir,reference_dataset=a.dataset,
                 minimum_support=a.minimum_support,blend_batch_size=a.blend_batch_size,top_k=a.top_k,
-                candidate_ids=candidate_ids)
+                candidate_ids=candidate_ids,
+                previous_champion=history["ensembles"][-1] if history["ensembles"] else None)
         elif a.action=="refresh":
             from .ensemble_registry import refresh_prediction_factory
             result=refresh_prediction_factory(artifact_dir=a.artifact_dir,data_dir=a.data_dir,

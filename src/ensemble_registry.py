@@ -172,7 +172,9 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
     latest_registry = read_ensemble_registry(registry_path)
     latest_entries = latest_registry["ensembles"]
     last_hash = latest_registry.get("last_recorded_active_roster_hash")
-    record_needed = last_hash != roster_hash
+    optimizer_protocol = "forward_group_cv_weighted_v1"
+    record_needed = (last_hash != roster_hash or
+                     latest_registry.get("optimizer_protocol") != optimizer_protocol)
     if not changed and not evaluate_if_unchanged and not record_needed:
         return {"status": "unchanged", "roster_changed": False,
                 "candidate_count": len(candidate_records), "ensemble_version": None}
@@ -180,7 +182,8 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
     report = evaluate_prediction_strategies(
         artifact_dir, reference_dataset=reference_dataset,
         candidate_ids=[item["candidate_id"] for item in candidate_records],
-        data_dir=data_dir)
+        data_dir=data_dir,
+        previous_champion=latest_entries[-1] if latest_entries else None)
     roster["last_prediction_experiment_id"] = report["experiment_id"]
 
     if record_needed:
@@ -201,6 +204,8 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
             "selected_members": selected,
             "predicted_balanced_accuracy": float(report["selected_validation_balanced_accuracy"]),
             "validation_accuracy": float(report["selected_validation_accuracy"]),
+            "group_oof_metrics": report["strategy_metrics"],
+            "selected_weights": report["selected_weights"],
             "submitted_balanced_accuracy": 0.0,
             "prediction_experiment_id": report["experiment_id"],
             "prediction_manifest": report["manifest_path"],
@@ -212,8 +217,8 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
             "active_candidate_roster_hash": roster_hash,
             "active_candidate_roster": candidate_records,
             "last_recorded_active_roster_hash": roster_hash,
+            "optimizer_protocol": optimizer_protocol,
             "checkpoint_replacement_policy": "replace a model checkpoint only when validation balanced accuracy is higher",
-            "reliability_fit_split": "V0 train",
         })
         write_ensemble_registry(latest_entries, registry_path, metadata=metadata)
         roster["last_recorded_roster_hash"] = roster_hash
