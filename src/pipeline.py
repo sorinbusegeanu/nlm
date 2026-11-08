@@ -1028,6 +1028,14 @@ def main(argv=None):
     ts.add_argument("--stage1-iterations",type=int,default=800)
     ts.add_argument("--stage2-iterations",type=int,default=200)
     ts.add_argument("--run-id",help="optional unique run identifier; defaults to current UTC timestamp")
+    cc=m.add_parser("compare-checkpoints",help="compare two same-model checkpoints on frozen V0 validation")
+    cc.add_argument("--previous",required=True,help="previous experiment ID or model manifest path")
+    cc.add_argument("--new",required=True,help="new experiment ID or model manifest path")
+    cc.add_argument("--dataset",default="v0",choices=["v0"],help="frozen validation dataset")
+    cc.add_argument("--data-dir",default="data/processed")
+    cc.add_argument("--artifact-dir",default="artifacts")
+    cc.add_argument("--registry",default="experiments/registry.sqlite")
+    cc.add_argument("--output",default="docs/checkpoint_comparison.md")
     ft=m.add_parser("fit-final");ft.add_argument("--model",choices=MODEL_CONFIGS,default="svc");ft.add_argument("--dataset",default="v0");ft.add_argument("--config");ft.add_argument("--registry",default="experiments/registry.sqlite");ft.add_argument("--accept-config-defaults",action="store_true")
     e=sub.add_parser("ensemble").add_subparsers(dest="action",required=True);q=e.add_parser("evaluate");q.add_argument("--dataset",default="v0");q.add_argument("--artifact-dir",default="artifacts");q.add_argument("--bootstrap-replicates",type=int,default=2000);q.add_argument("--models",nargs="+",choices=ENSEMBLE_MODEL_CHOICES);q.add_argument("--force",action="store_true")
     pred=sub.add_parser("prediction").add_subparsers(dest="action",required=True)
@@ -1076,6 +1084,11 @@ def main(argv=None):
             ensemble_registry_path=a.ensemble_registry,
             config=cfg,seed=a.seed,stage1_iterations=a.stage1_iterations,
             stage2_iterations=a.stage2_iterations,run_id=a.run_id)
+    elif a.command=="models" and a.action=="compare-checkpoints":
+        from .checkpoint_comparison import compare_checkpoints
+        result=compare_checkpoints(a.previous,a.new,data_dir=a.data_dir,
+            artifact_dir=a.artifact_dir,registry_path=a.registry,
+            output_path=a.output,dataset=a.dataset)
     elif a.command=="models" and a.action=="continue-qwen":
         cfg = _model_cfg("qwen06", a.config); cfg["epochs"] = a.epochs
         overrides = _confirm_training_config("qwen06", cfg, accept_defaults=a.accept_config_defaults)
