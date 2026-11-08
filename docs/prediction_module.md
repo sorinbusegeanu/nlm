@@ -31,13 +31,13 @@ The factory loads saved validation probabilities and does not load model checkpo
 
 After selection, it compares an equal-weight blend and a nonnegative weighted blend. Weight fitting reuses `fit_weights()`: multiclass log loss is minimized with weights summing to one and L2 regularization toward equal weights. The previous champion is evaluated as a fixed comparison.
 
-Selection and weight fitting are evaluated using five prompt-group folds over saved validation probabilities. Each fold holds out complete prompt groups from both selection and weight fitting. Ordinary accuracy is the primary metric; log loss and ensemble size break ties. The selected final weights are then fitted on all available validation rows for inference. Full-data scores are recorded as exploratory; the grouped out-of-fold scores are the development estimate. This does not replace an untouched competition test score.
+Selection and weight fitting are evaluated using five prompt-group folds over saved validation probabilities. Each fold holds out complete prompt groups from both selection and weight fitting. Ordinary accuracy is the primary metric; log loss and ensemble size break ties. The selected final weights are then fitted on all available validation rows for inference. Full-data scores are recorded as exploratory; the grouped out-of-fold scores are the development estimate. The saved checkpoints and active roster may themselves have been selected using this validation set, so these folds do not make the entire comparison independent. Only an untouched competition test score is an independent final estimate.
 
 The existing per-response reliability implementation remains available to read historical manifests and prediction bundles, but new optimization runs do not generate in-sample training predictions or select that strategy.
 
 ## Current baseline
 
-The existing champion selected a nine-checkpoint equal-weight blend. Its full V0 validation accuracy was 0.600; its submitted Kaggle score was 0.546. The updated optimizer records the grouped out-of-fold comparison separately. See [`ensembles.md`](ensembles.md) for checkpoint lists and version history.
+The current recorded champion is a nine-checkpoint equal-weight blend with full V0 validation accuracy 0.600. The earlier submitted `v1` ensemble scored 0.546 on Kaggle; the current champion has not been submitted. The updated optimizer records grouped out-of-fold comparisons separately. See [`ensembles.md`](ensembles.md) for checkpoint lists and version history.
 
 ## Prediction bundles
 

@@ -185,11 +185,11 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
         data_dir=data_dir,
         previous_champion=latest_entries[-1] if latest_entries else None)
     roster["last_prediction_experiment_id"] = report["experiment_id"]
+    candidate_by_id = {item["candidate_id"]: item for item in candidate_records}
 
     if record_needed:
         next_number = 1 + max((int(str(item.get("version", "v0")).lstrip("v"))
                                for item in latest_entries), default=0)
-        candidate_by_id = {item["candidate_id"]: item for item in candidate_records}
         selected = [candidate_by_id[item] for item in report["selected_members"]]
         completed_id = None
         if completed_manifest:
@@ -201,15 +201,23 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
             "candidate_roster_hash": roster_hash,
             "candidate_checkpoints": candidate_records,
             "selected_strategy": report["selected_strategy"],
+            "selected_comparison": report.get("selected_comparison", report["selected_strategy"]),
             "selected_members": selected,
             "predicted_balanced_accuracy": float(report["selected_validation_balanced_accuracy"]),
             "validation_accuracy": float(report["selected_validation_accuracy"]),
             "group_oof_metrics": report["strategy_metrics"],
             "selected_weights": report["selected_weights"],
+            "individual_accuracy": report["individual_accuracy"],
+            "forward_selection_steps": [{key: step[key] for key in
+                ("step", "added_candidate_id", "accuracy", "log_loss")}
+                for step in report["selection_steps"]],
+            "optimization_summary": report["summary_path"],
+            "forward_steps_artifact": report["forward_steps_path"],
             "submitted_balanced_accuracy": 0.0,
             "prediction_experiment_id": report["experiment_id"],
             "prediction_manifest": report["manifest_path"],
             "validation_rows": int(report["validation_rows"]),
+            "optimizer_protocol": optimizer_protocol,
         }
         latest_entries.append(entry)
         metadata = {key: value for key, value in latest_registry.items() if key != "ensembles"}
@@ -224,6 +232,30 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
         roster["last_recorded_roster_hash"] = roster_hash
     elif latest_entries:
         roster["last_recorded_roster_hash"] = last_hash or roster_hash
+        latest = latest_entries[-1]
+        if (latest.get("candidate_roster_hash") == roster_hash and
+                latest.get("optimizer_protocol", optimizer_protocol) == optimizer_protocol):
+            latest.update({
+                "selected_strategy": report["selected_strategy"],
+                "selected_comparison": report.get("selected_comparison", report["selected_strategy"]),
+                "selected_members": [candidate_by_id[item] for item in report["selected_members"]],
+                "predicted_balanced_accuracy": float(report["selected_validation_balanced_accuracy"]),
+                "validation_accuracy": float(report["selected_validation_accuracy"]),
+                "group_oof_metrics": report["strategy_metrics"],
+                "selected_weights": report["selected_weights"],
+                "individual_accuracy": report["individual_accuracy"],
+                "forward_selection_steps": [{key: step[key] for key in
+                    ("step", "added_candidate_id", "accuracy", "log_loss")}
+                    for step in report["selection_steps"]],
+                "optimization_summary": report["summary_path"],
+                "forward_steps_artifact": report["forward_steps_path"],
+                "prediction_experiment_id": report["experiment_id"],
+                "prediction_manifest": report["manifest_path"],
+                "optimizer_protocol": optimizer_protocol,
+            })
+            metadata = {key: value for key, value in latest_registry.items() if key != "ensembles"}
+            metadata["optimizer_protocol"] = optimizer_protocol
+            write_ensemble_registry(latest_entries, registry_path, metadata=metadata)
 
     write_active_roster(roster, roster_path)
     return {"status": "recorded" if record_needed else "evaluated",
@@ -232,5 +264,6 @@ def refresh_prediction_factory(*, artifact_dir="artifacts", data_dir="data/proce
             "prediction_experiment_id": report["experiment_id"],
             "predicted_balanced_accuracy": report["selected_validation_balanced_accuracy"],
             "selected_strategy": report["selected_strategy"],
+            "selected_comparison": report.get("selected_comparison", report["selected_strategy"]),
             "selected_members": report["selected_members"],
             "excluded_candidates": excluded}

@@ -4,8 +4,7 @@
 ```yaml
 active_candidate_roster_hash: f2752084813d54f83b54918f5b1abf965d245087c792999dee6bce59527eb66a
 active_candidate_roster: &id037
-- &id038
-  model: catboost_stylometry
+- model: catboost_stylometry
   candidate_id: catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0
   training_dataset: v1
   source_manifest: /home/zodrak/nlm/artifacts/predictions/catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0_manifest.json
@@ -21,8 +20,7 @@ active_candidate_roster: &id037
   checkpoint_filename: embeddinggemma2_foldvalidation
   selected_epoch: 8
   validation_balanced_accuracy: 0.41851851851851857
-- &id039
-  model: gemma4_e2b
+- model: gemma4_e2b
   candidate_id: gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0
   training_dataset: v1.1
   source_manifest: /home/zodrak/nlm/artifacts/predictions/gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0_manifest.json
@@ -38,8 +36,7 @@ active_candidate_roster: &id037
   checkpoint_filename: granite4_350m_foldvalidation
   selected_epoch: 4
   validation_balanced_accuracy: 0.4388888888888889
-- &id040
-  model: granite4_h_micro
+- model: granite4_h_micro
   candidate_id: granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0
   training_dataset: v1.1
   source_manifest: /home/zodrak/nlm/artifacts/predictions/granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0_manifest.json
@@ -47,8 +44,7 @@ active_candidate_roster: &id037
   checkpoint_filename: granite4_h_micro_foldvalidation
   selected_epoch: 3
   validation_balanced_accuracy: 0.5148148148148148
-- &id041
-  model: llama32_3b
+- model: llama32_3b
   candidate_id: llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0
   training_dataset: v1.1
   source_manifest: /home/zodrak/nlm/artifacts/predictions/llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0_manifest.json
@@ -56,8 +52,7 @@ active_candidate_roster: &id037
   checkpoint_filename: llama32_3b_foldvalidation
   selected_epoch: 3
   validation_balanced_accuracy: 0.5111111111111111
-- &id042
-  model: ministral3_3b
+- model: ministral3_3b
   candidate_id: ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0
   training_dataset: v1.1
   source_manifest: /home/zodrak/nlm/artifacts/predictions/ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0_manifest.json
@@ -65,8 +60,7 @@ active_candidate_roster: &id037
   checkpoint_filename: ministral3_3b_foldvalidation
   selected_epoch: 3
   validation_balanced_accuracy: 0.5092592592592593
-- &id043
-  model: qwen06
+- model: qwen06
   candidate_id: qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0
   training_dataset: v1.5
   source_manifest: /home/zodrak/nlm/artifacts/predictions/qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0_manifest.json
@@ -90,8 +84,7 @@ active_candidate_roster: &id037
   checkpoint_filename: qwen4_foldvalidation
   selected_epoch: 9
   validation_balanced_accuracy: 0.2833333333333333
-- &id044
-  model: smollm3_3b
+- model: smollm3_3b
   candidate_id: smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0
   training_dataset: v1.5
   source_manifest: /home/zodrak/nlm/artifacts/predictions/smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0_manifest.json
@@ -99,8 +92,7 @@ active_candidate_roster: &id037
   checkpoint_filename: smollm3_3b_foldvalidation
   selected_epoch: 5
   validation_balanced_accuracy: 0.5074074074074074
-- &id045
-  model: svc
+- model: svc
   candidate_id: svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0
   training_dataset: v1
   source_manifest: /home/zodrak/nlm/artifacts/predictions/svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0_manifest.json
@@ -108,8 +100,7 @@ active_candidate_roster: &id037
   checkpoint_filename: svc_foldvalidation.joblib
   selected_epoch: null
   validation_balanced_accuracy: 0.4166666666666667
-- &id046
-  model: ultrabert380
+- model: ultrabert380
   candidate_id: ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0
   training_dataset: v1.5
   source_manifest: /home/zodrak/nlm/artifacts/predictions/ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0_manifest.json
@@ -843,17 +834,80 @@ ensembles:
   trigger_experiment_id: null
   candidate_roster_hash: f2752084813d54f83b54918f5b1abf965d245087c792999dee6bce59527eb66a
   candidate_checkpoints: *id037
-  selected_strategy: previous_champion
+  selected_strategy: equal_probability_blend
   selected_members:
-  - *id038
-  - *id039
-  - *id040
-  - *id041
-  - *id042
-  - *id043
-  - *id044
-  - *id045
-  - *id046
+  - model: catboost_stylometry
+    candidate_id: catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0
+    training_dataset: v1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0/checkpoints/catboost_stylometry_foldvalidation
+    checkpoint_filename: catboost_stylometry_foldvalidation
+    selected_epoch: null
+    validation_balanced_accuracy: 0.3444444444444444
+  - model: gemma4_e2b
+    candidate_id: gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0
+    training_dataset: v1.1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0/checkpoints/gemma4_e2b_foldvalidation
+    checkpoint_filename: gemma4_e2b_foldvalidation
+    selected_epoch: 7
+    validation_balanced_accuracy: 0.5277777777777778
+  - model: granite4_h_micro
+    candidate_id: granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0
+    training_dataset: v1.1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0/checkpoints/granite4_h_micro_foldvalidation
+    checkpoint_filename: granite4_h_micro_foldvalidation
+    selected_epoch: 3
+    validation_balanced_accuracy: 0.5148148148148148
+  - model: llama32_3b
+    candidate_id: llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0
+    training_dataset: v1.1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0/checkpoints/llama32_3b_foldvalidation
+    checkpoint_filename: llama32_3b_foldvalidation
+    selected_epoch: 3
+    validation_balanced_accuracy: 0.5111111111111111
+  - model: ministral3_3b
+    candidate_id: ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0
+    training_dataset: v1.1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0/checkpoints/ministral3_3b_foldvalidation
+    checkpoint_filename: ministral3_3b_foldvalidation
+    selected_epoch: 3
+    validation_balanced_accuracy: 0.5092592592592593
+  - model: qwen06
+    candidate_id: qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0
+    training_dataset: v1.5
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0/checkpoints/qwen06_foldvalidation
+    checkpoint_filename: qwen06_foldvalidation
+    selected_epoch: 6
+    validation_balanced_accuracy: 0.47777777777777775
+  - model: smollm3_3b
+    candidate_id: smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0
+    training_dataset: v1.5
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0/checkpoints/smollm3_3b_foldvalidation
+    checkpoint_filename: smollm3_3b_foldvalidation
+    selected_epoch: 5
+    validation_balanced_accuracy: 0.5074074074074074
+  - model: svc
+    candidate_id: svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0
+    training_dataset: v1
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0/checkpoints/svc_foldvalidation.joblib
+    checkpoint_filename: svc_foldvalidation.joblib
+    selected_epoch: null
+    validation_balanced_accuracy: 0.4166666666666667
+  - model: ultrabert380
+    candidate_id: ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0
+    training_dataset: v1.5
+    source_manifest: /home/zodrak/nlm/artifacts/predictions/ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0_manifest.json
+    checkpoint_path: /home/zodrak/nlm/artifacts/runs/ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0/checkpoints/ultrabert380_continued
+    checkpoint_filename: ultrabert380_continued
+    selected_epoch: 5
+    validation_balanced_accuracy: 0.5314814814814814
   predicted_balanced_accuracy: 0.6000000000000001
   validation_accuracy: 0.6
   group_oof_metrics:
@@ -886,5 +940,64 @@ ensembles:
   prediction_experiment_id: prediction_v0_27e1439c9742
   prediction_manifest: artifacts/predictions/prediction_v0_27e1439c9742_manifest.json
   validation_rows: 540
+  selected_comparison: previous_champion
+  optimizer_protocol: forward_group_cv_weighted_v1
+  individual_accuracy:
+    catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0: 0.34444444444444444
+    embeddinggemma2_v1.5_data490fe052_split215fd0d0_seed2026_cfgd46e5fd0_code667e2d0: 0.4185185185185185
+    gemma4_e2b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgdeb08f01_code667e2d0: 0.5277777777777778
+    granite4_350m_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgd8cbfdb7_code667e2d0: 0.4388888888888889
+    granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0: 0.5148148148148148
+    llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0: 0.5111111111111111
+    ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0: 0.5092592592592593
+    qwen06_v1.5_data490fe052_split215fd0d0_seed2026_cfg088db19e_code667e2d0: 0.4777777777777778
+    qwen17_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfg793e1ab7_code667e2d0: 0.46296296296296297
+    qwen4_v0_data40a22ce8_split147ce64e_seed2026_cfg54d18b01_code667e2d0: 0.2833333333333333
+    smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0: 0.5074074074074074
+    svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0: 0.42962962962962964
+    ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0: 0.5314814814814814
+  forward_selection_steps:
+  - step: 1
+    added_candidate_id: ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0
+    accuracy: 0.5314814814814814
+    log_loss: 13.499685231497619
+  - step: 2
+    added_candidate_id: granite4_h_micro_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgf29156ed_code667e2d0
+    accuracy: 0.5388888888888889
+    log_loss: 2.145115570629925
+  - step: 3
+    added_candidate_id: qwen17_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfg793e1ab7_code667e2d0
+    accuracy: 0.562962962962963
+    log_loss: 1.3218938920400825
+  - step: 4
+    added_candidate_id: embeddinggemma2_v1.5_data490fe052_split215fd0d0_seed2026_cfgd46e5fd0_code667e2d0
+    accuracy: 0.5666666666666667
+    log_loss: 1.2508851432339219
+  - step: 5
+    added_candidate_id: smollm3_3b_v1.5_data490fe052_split215fd0d0_seed2026_cfg297336a7_code667e2d0
+    accuracy: 0.5703703703703704
+    log_loss: 1.1964635679066657
+  - step: 6
+    added_candidate_id: ministral3_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgcc9e4f28_code667e2d0
+    accuracy: 0.5777777777777777
+    log_loss: 1.1750316221267798
+  - step: 7
+    added_candidate_id: granite4_350m_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgd8cbfdb7_code667e2d0
+    accuracy: 0.5777777777777777
+    log_loss: 1.1696117942021995
+  - step: 8
+    added_candidate_id: svc_v1_datada64f007_split147ce64e_seed2026_cfgbd998651_code667e2d0
+    accuracy: 0.5796296296296296
+    log_loss: 1.1899919480111998
+  - step: 9
+    added_candidate_id: llama32_3b_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfgbe4d02d0_code667e2d0
+    accuracy: 0.5796296296296296
+    log_loss: 1.1743364385215964
+  - step: 10
+    added_candidate_id: catboost_stylometry_v1_datada64f007_split147ce64e_seed2026_cfgdb877fc5_code667e2d0
+    accuracy: 0.5814814814814815
+    log_loss: 1.202693369493464
+  optimization_summary: artifacts/predictions/prediction_v0_27e1439c9742_summary.json
+  forward_steps_artifact: artifacts/predictions/prediction_v0_27e1439c9742_forward_steps.csv
 ```
 <!-- ensemble-registry:end -->

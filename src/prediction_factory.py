@@ -465,6 +465,12 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
         final_members = selected
         final_weights = (selected_weights.tolist() if winner_name == "optimized_probability_blend"
                          else [1.0 / len(selected)] * len(selected))
+    selected_rule = (champion.get("selected_strategy", "equal_probability_blend")
+                     if winner_name == "previous_champion" else winner_name)
+    if selected_rule == "previous_champion":
+        # Older registry entries can store the comparison label rather than
+        # the executable rule. The pre-optimizer champion used equal averaging.
+        selected_rule = "equal_probability_blend"
     winner_metrics = full_metrics[winner_name]
     winner_prediction = np.asarray(classes)[final_probs.argmax(axis=1)]
     validation_ids_sha256 = hashlib.sha256("\n".join(reference_ids).encode()).hexdigest()
@@ -525,7 +531,8 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
         "full_data_strategy_metrics_exploratory": {name: {**full_metrics[name], "ensemble_size": sizes[name]}
                                                    for name in full_metrics},
         "strategy_fold_details": fold_records,
-        "selected_strategy": winner_name,
+        "selected_strategy": selected_rule,
+        "selected_comparison": winner_name,
         "selected_members": [item["candidate_id"] for item in final_members],
         "selected_validation_accuracy": winner_metrics["accuracy"],
         "selected_validation_balanced_accuracy": winner_metrics["balanced_accuracy"],
@@ -536,13 +543,15 @@ def evaluate_prediction_strategies(artifact_dir="artifacts", *, output_dir=None,
         "selection_tiebreak": ["higher_group_oof_accuracy", "lower_group_oof_log_loss", "fewer_models", "strategy_name", "candidate_id_order"],
         "forward_steps_path": str(steps_path), "summary_path": str(summary_path),
         "validation_predictions_path": str(row_path),
-        "validation_selection_note": "Group out-of-fold metrics hold out prompt groups during selection and weight fitting. The final full-data fit metrics are exploratory and may be optimistic.",
+        "validation_selection_note": "Group out-of-fold metrics hold out prompt groups during each fold's model selection and weight fitting. Base checkpoint and roster selection may already have used the full validation set, and the previous champion was selected on it; strategy selection among these metrics can also be optimistic. The final full-data fit metrics are exploratory. Only a separate untouched test score is an independent final estimate.",
+        "oof_scope_note": "Meta-level cross-fitting only; it does not undo prior checkpoint, roster, or historical champion selection on this validation set.",
     }
     summary_path.write_text(json.dumps({"available_models": len(candidates),
         "selected_models": report["selected_members"], "individual_accuracy": report["individual_accuracy"],
         "strategy_metrics_group_oof": report["strategy_metrics"],
         "strategy_metrics_full_data_exploratory": report["full_data_strategy_metrics_exploratory"],
-        "selected_weights": report["selected_weights"], "selected_strategy": winner_name,
+        "selected_weights": report["selected_weights"], "selected_strategy": selected_rule,
+        "selected_comparison": winner_name,
         "forward_selection_steps": selection_steps}, indent=2) + "\n")
     manifest_path.write_text(json.dumps(report, indent=2, default=str) + "\n")
     report["manifest_path"] = str(manifest_path)
