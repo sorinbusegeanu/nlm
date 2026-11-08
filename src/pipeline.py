@@ -1309,6 +1309,14 @@ def main(argv=None):
     ta.add_argument("--minimum-support", type=int, default=10)
     ta.add_argument("--prior-alpha", type=float, default=1.0)
     ta.add_argument("--prior-beta", type=float, default=1.0)
+    za = analysis.add_parser("zod01", help="run sequential precision-ranked checkpoint rules with prompt-group OOF evaluation")
+    za.add_argument("--artifact-dir", default="artifacts/predictions")
+    za.add_argument("--data-dir", default="data/processed")
+    za.add_argument("--output-dir", default="artifacts/analysis/zod01_ultrabert")
+    za.add_argument("--report", default="docs/zod01_ultrabert.md")
+    za.add_argument("--minimum-support", type=int, default=10)
+    za.add_argument("--prior-alpha", type=float, default=1.0)
+    za.add_argument("--prior-beta", type=float, default=1.0)
     a=parser.parse_args(argv)
     if a.command=="restart": result=restart_mvp(models=a.models,seed=a.seed,bootstrap_replicates=a.bootstrap_replicates)
     elif a.command=="data" and a.action=="prepare": result=prepare_data(a.config)
@@ -1364,6 +1372,11 @@ def main(argv=None):
         result=run_ultrabert_trusted_checkpoint_ensemble(artifact_dir=a.artifact_dir,
             data_dir=a.data_dir,output_dir=a.output_dir,report_path=a.report,
             minimum_support=a.minimum_support,prior_alpha=a.prior_alpha,prior_beta=a.prior_beta)
+    elif a.command=="analysis" and a.action=="zod01":
+        from .zod01 import run_ultrabert_zod01
+        result=run_ultrabert_zod01(artifact_dir=a.artifact_dir,data_dir=a.data_dir,
+            output_dir=a.output_dir,report_path=a.report,minimum_support=a.minimum_support,
+            prior_alpha=a.prior_alpha,prior_beta=a.prior_beta)
     elif a.command=="models" and a.action=="continue-qwen":
         cfg = _model_cfg("qwen06", a.config); cfg["epochs"] = a.epochs
         overrides = _confirm_training_config("qwen06", cfg, accept_defaults=a.accept_config_defaults)

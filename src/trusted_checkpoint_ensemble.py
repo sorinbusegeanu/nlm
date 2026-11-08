@@ -333,7 +333,11 @@ def run_trusted_checkpoint_ensemble(*, candidates, y_true, groups, classes,
     for label in classes:
         counts = assignment_frame.loc[assignment_frame.label.eq(label), "specialist_candidate_id"].value_counts()
         majority = min(order, key=lambda candidate_id: (-int(counts.get(candidate_id, 0)), order.index(candidate_id)))
-        summary_assignments[label] = {"majority_specialist": majority,
+        pooled = pooled_candidate_label[label]
+        best_recall_candidate = pooled["best_recall_candidate_id"]
+        summary_assignments[label] = {"best_recall_candidate_id": best_recall_candidate,
+            "best_recall_candidate_metrics": individual_metrics[best_recall_candidate]["per_class"][label],
+            "majority_fold_specialist": majority,
             "fold_assignment_counts": {candidate_id: int(counts.get(candidate_id, 0)) for candidate_id in order},
             "specialist_stream_oof": specialist_oof_stats[label]}
 
@@ -350,6 +354,21 @@ def run_trusted_checkpoint_ensemble(*, candidates, y_true, groups, classes,
             "both_ge_80": sum(value["precision"] >= .80 and value["recall"] >= .80 for value in stats.values()),
             "both_ge_90": sum(value["precision"] >= .90 and value["recall"] >= .90 for value in stats.values()),
         }
+    pooled_any = {}
+    for label in classes:
+        stats = [individual_metrics[candidate_id]["per_class"][label] for candidate_id in order]
+        pooled_any[label] = {
+            "recall_ge_80": any(value["recall"] >= .80 for value in stats),
+            "recall_ge_90": any(value["recall"] >= .90 for value in stats),
+            "precision_ge_80": any(value["predicted_count"] >= minimum_support and value["precision"] >= .80 for value in stats),
+            "precision_ge_90": any(value["predicted_count"] >= minimum_support and value["precision"] >= .90 for value in stats),
+            "both_ge_80": any(value["predicted_count"] >= minimum_support and value["precision"] >= .80 and value["recall"] >= .80 for value in stats),
+            "both_ge_90": any(value["predicted_count"] >= minimum_support and value["precision"] >= .90 and value["recall"] >= .90 for value in stats),
+        }
+    threshold_metrics["any_individual_checkpoint_pooled"] = {
+        key: sum(value[key] for value in pooled_any.values())
+        for key in next(iter(pooled_any.values()))
+    }
     counts_by_selected = {}
     for candidate_id in order:
         mask = oof_selected == candidate_id
@@ -457,15 +476,15 @@ def _write_report(path, metrics, order, validation_ids):
         f"Reliability rule: minimum predicted-label support **{metrics['minimum_support']}**. Precision is smoothed with Beta(α={metrics['precision_smoothing']['prior_alpha']:g}, β={metrics['precision_smoothing']['prior_beta']:g}): `(TP+α)/(predicted_count+α+β)`. For each label the specialist is selected by highest fitting-fold recall, then raw precision, then F1; exact ties use candidate order `{', '.join(order)}`. For routing, eligible proposals rank by assigned-specialist flag, smoothed precision, specialist recall, candidate order and canonical label order. If none meet support, route to D.", "",
         f"Split SHA-256: `{metrics.get('validation_split_sha256')}`. Validation ID SHA-256: `{metrics.get('validation_ids_sha256')}`.", "",
         "## A. Specialist coverage matrix", "",
-        "The recall specialist is the most frequently assigned checkpoint across fitting folds; metrics are from the pooled fold-assigned one-vs-rest specialist stream. The best-precision checkpoint is descriptive and selected from pooled OOF individual predictions; it does not affect routing.", "",
-        "| Label | Recall specialist | Recall | Precision | Best precision checkpoint | Precision | Recall | Fold assignments |", "|---|---|---:|---:|---|---:|---:|---|"]
+        "The highest-recall checkpoint and best-precision checkpoint columns are descriptive measurements over all 540 saved predictions (the checkpoints were already selected using V0). Fold assignments show the independently re-fit experts used by the OOF router; their OOF specialist-only metrics are reported in section C.", "",
+        "| Label | Highest recall checkpoint | Recall | Precision | Best precision checkpoint | Precision | Recall | Fold assignment counts |", "|---|---|---:|---:|---|---:|---:|---|"]
     for label in metrics["classes"]:
         specialist = specialist_matrix[label]
-        stream = specialist_stats[label]
+        best_recall = specialist["best_recall_candidate_metrics"]
         pooled = assignments[label]
-        recall_mark = " **≥90%**" if stream["recall"] >= .90 else " **≥80%**" if stream["recall"] >= .80 else ""
+        recall_mark = " **≥90%**" if best_recall["recall"] >= .90 else " **≥80%**" if best_recall["recall"] >= .80 else ""
         counts_text = ", ".join(f"{key}:{value}" for key, value in specialist["fold_assignment_counts"].items() if value)
-        lines.append(f"| {label} | {specialist['majority_specialist']} | {stream['recall']:.1%}{recall_mark} | {stream['precision']:.1%} | {pooled['best_precision_candidate_id']} | {pooled['best_precision']:.1%} | {pooled['best_precision_recall']:.1%} | {counts_text} |")
+        lines.append(f"| {label} | {specialist['best_recall_candidate_id']} | {best_recall['recall']:.1%}{recall_mark} | {best_recall['precision']:.1%} | {pooled['best_precision_candidate_id']} | {pooled['best_precision']:.1%} | {pooled['best_precision_recall']:.1%} | {counts_text} |")
     lines.extend(["", "## B. Trusted ensemble per-label performance", "",
         "TP counts are out of 30 true examples per label. The specialist column shows the most frequently fitted expert, its fold count, and which checkpoint actually supplied this label's routed predictions.", "",
         "| Label | D recall (TP/30) | Best individual specialist recall (TP/30) | Trusted recall (TP/30) | Trusted precision | Selected expert / routed rows |", "|---|---:|---:|---:|---:|---|"])
@@ -480,17 +499,17 @@ def _write_report(path, metrics, order, validation_ids):
                 selected_for_label.append(f"{candidate_id}:{info['selected']}")
         selected_text = ", ".join(selected_for_label) if selected_for_label else "none"
         best = specialist_matrix[label]
-        lines.append(f"| {label} | {d['recall']:.1%} ({d['true_positive']}/30) | {individual['recall']:.1%} ({individual['true_positive']}/30) | {trusted['recall']:.1%} ({trusted['true_positive']}/30) | {trusted['precision']:.1%} | {best['majority_specialist']} ({best['fold_assignment_counts'][best['majority_specialist']]}/5); {selected_text} |")
+        lines.append(f"| {label} | {d['recall']:.1%} ({d['true_positive']}/30) | {individual['recall']:.1%} ({individual['true_positive']}/30) | {trusted['recall']:.1%} ({trusted['true_positive']}/30) | {trusted['precision']:.1%} | {best['majority_fold_specialist']} ({best['fold_assignment_counts'][best['majority_fold_specialist']]}/5); {selected_text} |")
     lines.extend(["", "## C. High-accuracy label coverage", "",
-        "For Best individual specialists, precision and recall are cross-fitted one-vs-rest results: each label uses the specialist selected on that fold's fitting partition. For D and the trusted router, these are ordinary multiclass one-vs-rest metrics.", "",
-        "| Metric | D | Best individual specialists | Trusted ensemble |", "|---|---:|---:|---:|"])
+        "Best individual specialists are selected within each fitting fold and measured on held-out rows. The additional any-individual-checkpoint column is a pooled descriptive diagnostic over all V0 predictions and is optimistic because it selects the best checkpoint per label after seeing these same labels. Precision requires at least the configured minimum predicted-label support. D and trusted-router values are ordinary multiclass one-vs-rest metrics.", "",
+        "| Metric | D | Best individual specialists (OOF) | Any individual checkpoint (pooled) | Trusted ensemble (OOF) |", "|---|---:|---:|---:|---:|"])
     captions = [("recall_ge_80", "Labels with recall ≥80%"), ("recall_ge_90", "Labels with recall ≥90%"),
         ("precision_ge_80", "Labels with precision ≥80%"), ("precision_ge_90", "Labels with precision ≥90%"),
         ("both_ge_80", "Labels with both precision and recall ≥80%"),
         ("both_ge_90", "Labels with both precision and recall ≥90%")]
     for key, caption in captions:
         values = metrics["high_accuracy_label_coverage"]
-        lines.append(f"| {caption} | {values['D'][key]} | {values['best_individual_specialists'][key]} | {values['trusted_checkpoint_ensemble'][key]} |")
+        lines.append(f"| {caption} | {values['D'][key]} | {values['best_individual_specialists'][key]} | {values['any_individual_checkpoint_pooled'][key]} | {values['trusted_checkpoint_ensemble'][key]} |")
     lines.extend(["", "## D. Routing analysis", "",
         "### Checkpoint usage", "",
         "| Checkpoint | Selected predictions | Correct | Incorrect |", "|---|---:|---:|---:|"])
@@ -519,14 +538,14 @@ def _write_report(path, metrics, order, validation_ids):
     bd = metrics["baselines"]["B_plus_D_equal_probability"]
     trusted = metrics["trusted_checkpoint_ensemble"]
     oracle = metrics["baselines"]["four_checkpoint_top1_oracle"]
-    lines.append(f"| D | {d['balanced_accuracy']:.1%} | {d['total_correct']}/540 | {d['macro_f1']:.1%} | {d.get('top3_accuracy', 'N/A')} | {d.get('mrr', 'N/A')} | {d.get('log_loss', 'N/A')} | {d.get('multiclass_brier', 'N/A')} |")
+    lines.append(f"| D | {d['balanced_accuracy']:.1%} | {d['total_correct']}/540 | {d['macro_f1']:.1%} | {d['top3_accuracy']:.1%} | {d['mrr']:.4f} | {d['log_loss']:.4f} | {d['multiclass_brier']:.4f} |")
     lines.append(f"| B+D equal probability | {bd['balanced_accuracy']:.1%} | {int(round(bd['accuracy']*540))}/540 | {bd['macro_f1']:.1%} | {bd['top3_accuracy']:.1%} | {bd['mrr']:.4f} | {bd['log_loss']:.4f} | {bd['multiclass_brier']:.4f} |")
     lines.append(f"| Trusted checkpoint ensemble | {trusted['balanced_accuracy']:.1%} | {trusted['total_correct']}/540 | {trusted['macro_f1']:.1%} | N/A | N/A | N/A | N/A |")
     lines.append(f"| Four-checkpoint top-1 oracle (theoretical) | {oracle['accuracy']:.1%} | {oracle['total_correct']}/540 | N/A | N/A | N/A | N/A | N/A |")
     lines.extend(["", "## F. Conclusions", "",
         f"1. **Labels at ≥80% recall:** {metrics['high_accuracy_label_coverage']['trusted_checkpoint_ensemble']['recall_ge_80']} of 18 after routing.",
         f"2. **Labels at ≥90% recall:** {metrics['high_accuracy_label_coverage']['trusted_checkpoint_ensemble']['recall_ge_90']} of 18 after routing.",
-        "3. **Reliable specialists:** See the coverage matrix and fold counts; routing chooses by fold-fitted recall specialist status, smoothed precision and specialist recall.",
+        "3. **Reliable specialists:** The coverage matrix shows best observed per-label checkpoints; fold assignment counts show which specialists the OOF fitting folds selected.",
         f"4. **Recall/precision trade-off:** trusted routing yields {metrics['high_accuracy_label_coverage']['trusted_checkpoint_ensemble']['both_ge_80']} labels with both precision and recall ≥80%, and {metrics['high_accuracy_label_coverage']['trusted_checkpoint_ensemble']['both_ge_90']} with both ≥90%. The routed predictions' false positives are shown per label above.",
         f"5. **Overall balanced accuracy:** {trusted['balanced_accuracy']:.1%} versus D {d['balanced_accuracy']:.1%} and B+D {bd['balanced_accuracy']:.1%}.",
         f"6. **Main limit:** {metrics['routing_movement']['rows_with_multiple_distinct_proposals']} rows had competing labels; see corrected/regressed counts and class-specific false positives to assess whether conflicts or weak expert coverage dominate.",
