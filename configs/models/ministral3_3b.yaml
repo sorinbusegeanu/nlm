@@ -5,7 +5,7 @@ checkpoint: mistralai/Ministral-3-3B-Base-2512
 revision: 6f9c4b12a95b139af68670a6713616b757923735
 training_mode: lora
 early_stopping_patience: 3
-epochs: 10
+epochs: 20
 batch_size: 1
 auto_batch_size: true
 max_batch_size: 1024

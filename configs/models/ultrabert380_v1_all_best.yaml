@@ -3,7 +3,7 @@
 model: ultrabert380
 checkpoint: dmis-lab/UltraBERT-380M
 revision: 671a38c087233c0cc72c5bfceea6fffa2822f1db
-epochs: 10
+epochs: 20
 early_stopping_patience: 3
 batch_size: 8
 auto_batch_size: false

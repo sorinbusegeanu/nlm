@@ -15,7 +15,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.registry import Registry
-from src.ensemble_registry import read_ensemble_registry
+from src.checkpoint_catalog import sort_catalog_for_dashboard
 from dashboard.training_lineage import training_lineage
 
 st.set_page_config(page_title="Name That LLM experiments", layout="wide")
@@ -29,6 +29,13 @@ if not records:
 profile_path = Path("data/processed/dataset_profile.json")
 profile_data = json.loads(profile_path.read_text()) if profile_path.exists() else {}
 profile_validation_rows = profile_data.get("validation_rows")
+DATASET_PROFILES = {
+    "V0 — Kaggle baseline": ("data/processed/dataset_profile.json", "data/processed/dataset_v0.parquet"),
+    "V1 — Balanced Open Pool": ("data/processed/dataset_profile_v1.json", "data/processed/dataset_v1.parquet"),
+    "V1-all": ("data/processed/dataset_profile_v1_all.json", "data/processed/dataset_v1_all.parquet"),
+    "V1.2-BM": ("data/processed/dataset_profile_v1.2_bm.json", "data/processed/dataset_v1.2_bm.parquet"),
+    "V1.3": ("data/processed/dataset_profile_v1.3.json", "data/processed/dataset_v1.3.parquet"),
+}
 
 def metrics(row): return json.loads(row["metrics_json"])
 
@@ -326,133 +333,48 @@ def render_current_training():
                  use_container_width=True, hide_index=True)
 
 def render_prediction_factory():
-    st.subheader("Recorded prediction ensembles")
+    st.subheader("Checkpoint accuracy by model label")
+    catalog_path = Path(__file__).resolve().parents[1] / "docs" / "checkpoint_label_catalog.csv"
     try:
-        ensemble_entries = read_ensemble_registry().get("ensembles", [])
-        ensemble_rows = []
-        for entry in ensemble_entries:
-            checkpoints = []
-            for member in entry.get("selected_members", []):
-                model = model_display(member.get("model", "model"))
-                checkpoint = member.get("checkpoint_filename") or Path(
-                    member.get("checkpoint_path", "")).name
-                checkpoints.append(f"{model}: {checkpoint}" if checkpoint else model)
-            ensemble_rows.append({
-                "Ensemble": entry.get("version"),
-                "Model checkpoints": "\n".join(checkpoints),
-                "Predicted accuracy": entry.get("predicted_balanced_accuracy"),
-                "Submitted accuracy": entry.get("submitted_balanced_accuracy", 0.0),
-            })
-        if ensemble_rows:
-            st.dataframe(pd.DataFrame(ensemble_rows, columns=[
-                "Ensemble", "Model checkpoints", "Predicted accuracy", "Submitted accuracy"]),
-                use_container_width=True, hide_index=True)
-        else:
-            st.caption("No prediction ensembles are recorded yet.")
-    except (OSError, ValueError, TypeError, KeyError) as exc:
-        st.error(f"Could not read docs/ensembles.md: {exc}")
-
-    st.subheader("Latest prediction factory evaluation")
-    project_root = Path(__file__).resolve().parents[1]
-    prediction_dir = project_root / "artifacts" / "predictions"
-    reports = sorted(prediction_dir.glob("prediction_v0_*_manifest.json"),
-                     key=lambda path: path.stat().st_mtime, reverse=True)
-    if not reports:
-        st.info("No prediction factory evaluation has been recorded yet.")
-    else:
-        try:
-            report_path = reports[0]
-            report = json.loads(report_path.read_text())
-            metrics = report.get("strategy_metrics", {})
-            summary = st.columns(4)
-            grouped = report.get("selected_validation_metric_scope") == "prompt_group_out_of_fold"
-            summary[0].metric("Group OOF balanced accuracy" if grouped else "Predicted balanced accuracy",
-                              f"{float(report.get('selected_validation_balanced_accuracy', 0)):.4f}")
-            summary[1].metric("Group OOF accuracy" if grouped else "Validation accuracy",
-                              f"{float(report.get('selected_validation_accuracy', 0)):.4f}")
-            summary[2].metric("Candidate checkpoints", report.get("candidate_count", "—"))
-            summary[3].metric("Validation rows", report.get("validation_rows", "—"))
-            st.caption(f"Run: {report.get('experiment_id', report_path.stem)} · "
-                       f"Selected strategy: {report.get('selected_strategy', '—')}")
-            if grouped:
-                st.caption("Group OOF scores evaluate the selection procedure. Fold members can differ from the final full-data ensemble; earlier checkpoint and champion selection may have used these validation rows.")
-
-            candidate_by_id = {item.get("candidate_id"): item
-                               for item in report.get("candidates", [])}
-            strategy_rows = []
-            for name, value in metrics.items():
-                member_ids = value.get("members")
-                if member_ids is None:
-                    member_ids = (report.get("previous_champion_candidate_ids", []) if name == "previous_champion"
-                                  else report.get("forward_selected_candidate_ids", []))
-                member_names = []
-                for candidate_id in member_ids:
-                    item = candidate_by_id.get(candidate_id, {})
-                    model = model_display(item.get("model", candidate_id))
-                    checkpoint = item.get("checkpoint_filename") or Path(
-                        item.get("checkpoint_path", "")).name
-                    member_names.append(f"{model} ({checkpoint})" if checkpoint else model)
-                strategy_rows.append({
-                    "Strategy": name,
-                    "Accuracy": value.get("accuracy"),
-                    "Balanced accuracy": value.get("balanced_accuracy"),
-                    "Log loss": value.get("log_loss"),
-                    "Full-data members": "; ".join(member_names),
-                })
-            if strategy_rows:
-                st.markdown("**Strategy comparison**")
-                st.dataframe(pd.DataFrame(strategy_rows), use_container_width=True, hide_index=True)
-
-            selected_ids = report.get("selected_members", [])
-            selected_rows = []
-            for candidate_id in selected_ids:
-                item = candidate_by_id.get(candidate_id, {})
-                selected_rows.append({
-                    "Model": model_display(item.get("model", candidate_id)),
-                    "Training dataset": item.get("training_dataset"),
-                    "Checkpoint": item.get("checkpoint_filename") or Path(
-                        item.get("checkpoint_path", "")).name,
-                    "Validation balanced accuracy": item.get("validation_balanced_accuracy"),
-                    "Training balanced accuracy": item.get("training_balanced_accuracy"),
-                })
-            st.markdown("**Selected checkpoints**")
-            st.dataframe(pd.DataFrame(selected_rows), use_container_width=True, hide_index=True)
-            fit_rule = report.get("reliability_rule", {})
-            if fit_rule:
-                st.caption(f"Reliability weights fit on {fit_rule.get('fit_split', '—')} "
-                           f"({fit_rule.get('fit_rows', '—')} rows); validation is used for comparison.")
-        except (OSError, ValueError, TypeError, KeyError) as exc:
-            st.error(f"Could not read the latest prediction factory report: {exc}")
-
-    st.subheader("Active prediction factory inputs")
-    roster_path = prediction_dir / "active_model_roster.json"
-    try:
-        if not roster_path.is_file():
-            st.caption("No active model roster has been created yet.")
+        if not catalog_path.is_file():
+            st.info("The checkpoint label catalog has not been created yet.")
             return
-        roster = json.loads(roster_path.read_text())
-        registry = read_ensemble_registry()
-        active_hash = roster.get("roster_hash")
-        recorded_hash = registry.get("last_recorded_active_roster_hash")
-        if active_hash != recorded_hash:
-            current = active_training(project_root)
-            if current:
-                st.info(f"The active roster is awaiting prediction evaluation after "
-                        f"{model_display(current['model'])} training finishes.")
-            else:
-                st.info("The active roster has changed and is awaiting its prediction factory evaluation.")
-        roster_rows = [{
-            "Model": model_display(item.get("model", "")),
-            "Training dataset": item.get("training_dataset"),
-            "Checkpoint": item.get("checkpoint_filename") or Path(
-                item.get("checkpoint_path", "")).name,
-            "Validation balanced accuracy": item.get("validation_balanced_accuracy"),
-        } for item in roster.get("candidates", [])]
-        if roster_rows:
-            st.dataframe(pd.DataFrame(roster_rows).sort_values("Model", kind="stable"),
-                         use_container_width=True, hide_index=True)
+        catalog = pd.read_csv(catalog_path)
+        if catalog.empty:
+            st.info("No checkpoint label results are recorded yet.")
+            return
+        catalog = sort_catalog_for_dashboard(catalog)
+        catalog["prediction_count"] = pd.to_numeric(catalog["prediction_count"], errors="coerce")
+        catalog["validation_training_overlap"] = pd.to_numeric(
+            catalog["validation_training_overlap"], errors="coerce").fillna(0)
+        catalog["checkpoint_model_display"] = catalog["model"].map(model_display)
+        catalog["validation_note"] = catalog.apply(
+            lambda row: (f"V0 training overlap: {int(row['validation_training_overlap'])} rows"
+                         if row["validation_training_overlap"] else
+                         (str(row.get("evaluation_note") or "Not eligible for ranking")
+                          if str(row.get("evaluation_eligible", "True")).lower() not in {"true", "1"} else "")),
+            axis=1)
+        catalog["checkpoint_status"] = catalog["checkpoint_available"].map(
+            lambda value: "Available" if str(value).lower() in {"true", "1"} else "Missing")
+        catalog = catalog.rename(columns={
+            "sequence_id": "ID", "target_label": "Model label",
+            "checkpoint_model_display": "Checkpoint model", "checkpoint": "Checkpoint",
+            "dataset_lineage": "Training dataset", "checkpoint_date": "Date (MM.DD)",
+            "precision": "Label accuracy (precision)", "recall": "Recall",
+            "prediction_count": "Predicted rows", "validation_note": "Validation note",
+            "checkpoint_status": "Checkpoint status",
+        })
+        columns = ["ID", "Model label", "Checkpoint model", "Checkpoint", "Training dataset",
+                   "Date (MM.DD)", "Label accuracy (precision)", "Recall", "Predicted rows",
+                   "Checkpoint status", "Validation note"]
+        table = catalog[columns].style.format({
+            "Label accuracy (precision)": "{:.1%}", "Recall": "{:.1%}",
+            "Predicted rows": "{:.0f}",
+        }, na_rep="—")
+        st.caption("Metrics use the frozen V0 validation set. Each ID identifies one checkpoint; its rows show results for each target model label.")
+        st.dataframe(table, use_container_width=True, hide_index=True)
     except (OSError, ValueError, TypeError, KeyError) as exc:
-        st.error(f"Could not read the active prediction factory roster: {exc}")
+        st.error(f"Could not read checkpoint label catalog: {exc}")
 
 columns = st.columns(4)
 columns[0].metric("Experiments", len(records))
@@ -614,10 +536,15 @@ with tabs[6]:
                 st.plotly_chart(px.line(history_frame, x="Epoch", y="Accuracy", markers=True), use_container_width=True)
 
 with tabs[7]:
-    if not profile_path.exists(): st.info("Run dataset preparation to create the V0 profile.")
+    available_datasets = [name for name, (profile, _) in DATASET_PROFILES.items() if Path(profile).exists()]
+    if not available_datasets:
+        st.info("Run dataset preparation to create dataset profiles.")
     else:
-        data = profile_data
-        st.caption(f"Dataset {data.get('dataset_version')} · SHA-256 {data.get('dataset_sha256')}")
+        selected_dataset = st.selectbox("Dataset", available_datasets, key="data_tab_dataset")
+        profile_file, dataset_file = DATASET_PROFILES[selected_dataset]
+        data = json.loads(Path(profile_file).read_text())
+        st.caption(f"Dataset {data.get('dataset_version')} · {dataset_file} · SHA-256 {data.get('dataset_sha256')}")
+        if not Path(dataset_file).exists(): st.warning(f"Dataset artifact not found: {dataset_file}")
         st.json(data)
         counts = data.get("class_counts", {})
         if counts: st.plotly_chart(px.bar(pd.DataFrame({"Class": list(counts), "Rows": list(counts.values())}), x="Class", y="Rows"), use_container_width=True)

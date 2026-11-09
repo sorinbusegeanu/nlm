@@ -66,7 +66,9 @@ def _inference_for_candidate(candidate, texts, classes):
             max_length=int(config.get("max_length", 384)), temperature=temperature,
             base_checkpoint=config.get("checkpoint"), revision=manifest.get("model_revision"),
             fix_mistral_regex=bool(config.get("fix_mistral_regex", False)),
-            text_only_backbone=bool(config.get("text_only_backbone", False)))
+            text_only_backbone=bool(config.get("text_only_backbone", False)),
+            quantization=config.get("quantization", manifest.get("quantization")),
+            attention_backend=config.get("attention_backend", manifest.get("attention_backend")))
     return _validated_probabilities(probabilities, len(texts), len(classes), candidate["candidate_id"])
 
 

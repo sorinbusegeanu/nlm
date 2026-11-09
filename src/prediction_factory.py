@@ -375,7 +375,7 @@ def _training_reliability_predictions(candidates, *, data_dir="data/processed", 
                 configured_batch = int(manifest.get("effective_batch_size") or
                                        config.get("effective_batch_size") or
                                        config.get("batch_size") or 8)
-                inference_batch = max(1, min(configured_batch, 4 if model_name in {
+                inference_batch = max(1, min(int(config.get("inference_batch_size", configured_batch)), 4 if model_name in {
                     "qwen4", "llama32_3b", "smollm3_3b", "granite4_h_micro",
                     "granite4_350m", "gemma4_e2b", "gemma4_e4b", "ministral3_3b"} else 8))
                 probabilities, returned_classes = _predict_neural(
@@ -385,7 +385,9 @@ def _training_reliability_predictions(candidates, *, data_dir="data/processed", 
                     temperature=float(manifest.get("calibration_temperature", 1.0) or 1.0),
                     base_checkpoint=config.get("checkpoint"), revision=manifest.get("model_revision"),
                     fix_mistral_regex=bool(config.get("fix_mistral_regex", False)),
-                    text_only_backbone=bool(config.get("text_only_backbone", False)))
+                    text_only_backbone=bool(config.get("text_only_backbone", False)),
+                    quantization=config.get("quantization", manifest.get("quantization")),
+                    attention_backend=config.get("attention_backend", manifest.get("attention_backend")))
             if returned_classes != classes:
                 indexes = {label: index for index, label in enumerate(returned_classes)}
                 probabilities = probabilities[:, [indexes[label] for label in classes]]

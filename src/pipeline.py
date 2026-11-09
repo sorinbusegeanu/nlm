@@ -32,6 +32,7 @@ from .registry import Registry
 MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert380": "configs/models/ultrabert380.yaml",
     "phi35_mini": "configs/models/phi35_mini.yaml",
     "qwen06": "configs/models/qwen06.yaml", "qwen17": "configs/models/qwen17.yaml", "qwen4": "configs/models/qwen4.yaml",
+    "qwen8": "configs/models/qwen8.yaml",
     "llama32_3b": "configs/models/llama32_3b.yaml", "smollm3_3b": "configs/models/smollm3_3b.yaml",
     "granite4_h_micro": "configs/models/granite4_h_micro.yaml",
     "granite4_350m": "configs/models/granite4_350m.yaml",
@@ -61,7 +62,7 @@ def _ensemble_member_labels(members):
     display_names = {"svc": "SVC", "ultrabert380": "UltraBERT-380M", "qwen06": "Qwen3-0.6B",
         "qwen06_best_epoch03": "Qwen3-0.6B best checkpoint (epoch 3)",
         "phi35_mini": "Phi-3.5 Mini",
-        "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B", "llama32_3b": "Llama-3.2-3B",
+        "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B", "qwen8": "Qwen3-8B QLoRA", "llama32_3b": "Llama-3.2-3B",
         "smollm3_3b": "SmolLM3-3B",
         "granite4_h_micro": "Granite 4.0 H Micro Base",
         "granite4_350m": "Granite 4.0 350M Base",
@@ -438,6 +439,14 @@ def _refresh_ensemble_after_training(manifest, manifest_path, *, artifact_dir, d
         registry_path=project_root / "docs" / "ensembles.md",
         roster_path=prediction_dir / "active_model_roster.json")
     manifest["prediction_factory_update"] = update
+    try:
+        from .checkpoint_catalog import refresh_catalog
+        manifest["checkpoint_catalog_update"] = refresh_catalog(
+            artifact_root=artifact_dir, data_dir=data_dir)
+    except Exception as exc:
+        # Catalog maintenance must not turn a completed training run into a failed run.
+        manifest["checkpoint_catalog_update"] = {
+            "status": "error", "error": f"{type(exc).__name__}: {exc}"}
     manifest_path = Path(manifest_path)
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
     metrics_path = manifest_path.with_name(manifest_path.name.removesuffix("_manifest.json") + "_metrics.json")
@@ -532,7 +541,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
             fix_mistral_regex=cfg.get("fix_mistral_regex", False))
         result["checkpoint"] = str(checkpoint)
-    elif model in ({"qwen06", "qwen17", "qwen4", "llama32_3b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "phi35_mini"}
+    elif model in ({"qwen06", "qwen17", "qwen4", "qwen8", "llama32_3b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "phi35_mini"}
                    | FROZEN_BACKBONE_MODELS):
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_qwen_lora_fold(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
@@ -561,7 +570,9 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             warmup_epochs=cfg.get("warmup_epochs"),
             optimizer=cfg.get("optimizer", "adamw_torch"),
             weight_decay=cfg.get("weight_decay", 0.0),
-            trust_remote_code=cfg.get("trust_remote_code", False))
+            trust_remote_code=cfg.get("trust_remote_code", False),
+            quantization=cfg.get("quantization", "none"),
+            attention_backend=cfg.get("attention_backend"))
         result["checkpoint"] = str(checkpoint)
     else: raise ValueError(f"unknown model: {model}")
     return result
@@ -647,6 +658,9 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         "dataset_sha256": profile["dataset_sha256"], "split_sha256": profile["split_sha256"],
         "code_revision": code_revision, "model_revision": cfg.get("revision"), "checkpoint_id": cfg.get("checkpoint"),
         "config": config_snapshot, "config_sha256": config_hash, "seed": seed,
+        "quantization": result.get("quantization", cfg.get("quantization", "none")),
+        "quantization_config": result.get("quantization_config"),
+        "attention_backend": result.get("attention_backend", cfg.get("attention_backend")),
         "fit_seconds": float(result["fit_seconds"]), "inference_seconds": result.get("inference_seconds"),
         "inference_rows_per_second": len(valid) / result["inference_seconds"] if result.get("inference_seconds") else None,
         "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"), "checkpoint_size_bytes": artifact_size,
@@ -693,7 +707,7 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
 TRAINING_OVERRIDE_FIELDS = (
     "epochs", "early_stopping_patience", "learning_rate", "learning_rate_decay", "lr_scheduler_type", "warmup_ratio",
     "optimizer", "weight_decay", "batch_size", "gradient_accumulation_steps",
-    "lora_rank", "lora_alpha", "lora_target_modules", "C", "calibration_cv",
+    "lora_rank", "lora_alpha", "lora_target_modules", "quantization", "attention_backend", "C", "calibration_cv",
     "iterations", "depth", "l2_leaf_reg", "early_stopping_rounds",
 )
 
@@ -707,6 +721,12 @@ def _validate_training_overrides(model, cfg):
             raise ValueError(f"{name} must be positive")
     if cfg.get("lr_scheduler_type") not in {None, "linear", "cosine", "constant", "epoch_decay"}:
         raise ValueError("lr_scheduler_type must be linear, cosine, constant, or epoch_decay")
+    if cfg.get("quantization", "none") not in {"none", "qlora4"}:
+        raise ValueError("quantization must be 'none' or 'qlora4'")
+    if cfg.get("attention_backend") not in {None, "sdpa", "flash_attention_2"}:
+        raise ValueError("attention_backend must be 'sdpa', 'flash_attention_2', or unset")
+    if cfg.get("optimizer") == "paged_adamw_8bit" and cfg.get("quantization", "none") != "qlora4":
+        raise ValueError("paged_adamw_8bit is reserved for qlora4 configurations")
     if model == "svc" and (float(cfg.get("C", 0.5)) <= 0 or int(cfg.get("calibration_cv", 3)) < 2):
         raise ValueError("SVC overrides need C > 0 and calibration_cv >= 2")
     if model == "catboost_stylometry" and (int(cfg.get("iterations", 0)) < 1
@@ -746,20 +766,22 @@ def _confirm_training_config(model, cfg, *, accept_defaults=False):
 
 def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifacts",
                   registry_path="experiments/registry.sqlite", *, from_experiment=None, epochs=4, seed=2026,
-                  config_path=None, config_overrides=None):
+                  config_path=None, config_overrides=None, model="qwen06"):
     """Continue a saved Qwen LoRA model and validate after every additional epoch."""
     from .model_factory import train_qwen_lora_fold
-    cfg = _model_cfg("qwen06", config_path)
+    if model not in {"qwen06", "qwen17", "qwen4", "qwen8"}:
+        raise ValueError("continue-qwen supports qwen06, qwen17, qwen4, and qwen8")
+    cfg = _model_cfg(model, config_path)
     if config_overrides:
         cfg.update(config_overrides)
-        _validate_training_overrides("qwen06", cfg)
+        _validate_training_overrides(model, cfg)
     rows, data_dir = _load_dataset(dataset, data_dir)
     profile = _effective_profile(data_dir, dataset, rows)
     manifests_dir = Path(artifact_dir)/"predictions"
     candidates = []
-    for path in manifests_dir.glob(f"qwen06_{dataset}_*_manifest.json"):
+    for path in manifests_dir.glob(f"{model}_{dataset}_*_manifest.json"):
         record = json.loads(path.read_text())
-        if record.get("model") == "qwen06" and record.get("split_sha256") == profile["split_sha256"]:
+        if record.get("model") == model and record.get("split_sha256") == profile["split_sha256"]:
             candidates.append((path, record))
     if from_experiment:
         candidates = [(p, m) for p, m in candidates if m.get("experiment_id") == from_experiment]
@@ -768,7 +790,15 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
     source_checkpoint = Path(source["checkpoint_path"])
     if not source_checkpoint.is_absolute() and not source_checkpoint.exists(): source_checkpoint = Path(artifact_dir)/source_checkpoint
     if not source_checkpoint.is_dir(): raise FileNotFoundError(f"Qwen continuation checkpoint not found: {source_checkpoint}")
-    cfg["max_length"] = _dataset_max_length("qwen06", cfg, rows)
+    # A continuation must use the exact base model revision that produced its
+    # adapter, even if the local model config has since changed.
+    cfg["checkpoint"] = source.get("checkpoint_id", cfg["checkpoint"])
+    cfg["revision"] = source.get("model_revision", cfg["revision"])
+    source_quantization = source.get("quantization", source.get("config", {}).get("quantization", "none"))
+    configured_quantization = cfg.get("quantization", "none")
+    if source_quantization != configured_quantization:
+        raise ValueError(f"continuation quantization mismatch: source={source_quantization}, config={configured_quantization}")
+    cfg["max_length"] = _dataset_max_length(model, cfg, rows)
     if epochs < 1: raise ValueError("additional epochs must be positive")
     cfg["epochs"] = epochs
     snapshot = {k:v for k,v in cfg.items() if not k.startswith("_")}
@@ -776,13 +806,13 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
     snapshot["additional_epochs"] = epochs
     config_hash = _sha(snapshot); code_revision = _revision()
     source_key = hashlib.sha256(source["experiment_id"].encode()).hexdigest()[:8]
-    experiment_id = f"qwen06_{dataset}_continue{epochs}_from{source_key}_seed{seed}_cfg{config_hash[:8]}_code{code_revision[:7]}"
+    experiment_id = f"{model}_{dataset}_continue{epochs}_from{source_key}_seed{seed}_cfg{config_hash[:8]}_code{code_revision[:7]}"
     run_dir = Path(artifact_dir)/"runs"/experiment_id
     if run_dir.exists(): raise FileExistsError(f"continuation run already exists: {run_dir}; choose a new seed or clean generated run")
     train = rows[rows.split.eq("train")].sort_values("id",kind="stable").reset_index(drop=True)
     valid = rows[rows.split.eq("validation")].sort_values("id",kind="stable").reset_index(drop=True)
     if set(train.prompt_id.astype(str)) & set(valid.prompt_id.astype(str)): raise RuntimeError("prompt leakage between train and validation")
-    checkpoint = run_dir/"checkpoints"/"qwen06_continued"
+    checkpoint = run_dir/"checkpoints"/f"{model}_continued"
     result = train_qwen_lora_fold(train.text.tolist(),train.model.tolist(),valid.text.tolist(),
         sorted(rows.model.astype(str).unique()),checkpoint=cfg["checkpoint"],revision=cfg["revision"],
         output_dir=checkpoint,epochs=epochs,batch_size=cfg.get("batch_size",4),max_length=cfg["max_length"],
@@ -801,7 +831,9 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
         warmup_ratio=cfg.get("warmup_ratio",0.0),
         optimizer=cfg.get("optimizer", "adamw_torch"),
         weight_decay=cfg.get("weight_decay", 0.0),
-        early_stopping_patience=cfg.get("early_stopping_patience", 3))
+        early_stopping_patience=cfg.get("early_stopping_patience", 3),
+        quantization=cfg.get("quantization", "none"),
+        attention_backend=cfg.get("attention_backend"))
     classes=sorted(rows.model.astype(str).unique())
     metrics=evaluate(valid.model.astype(str),result["scores"],classes,result["probabilities"])
     metrics["validation_metrics_by_epoch"]=result["validation_metrics_by_epoch"]
@@ -809,12 +841,15 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
     for i,label in enumerate(classes): pred[f"score::{label}"]=result["scores"][:,i];pred[f"prob::{label}"]=result["probabilities"][:,i]
     pred_dir=Path(artifact_dir)/"predictions";pred_dir.mkdir(parents=True,exist_ok=True)
     prediction_path=pred_dir/f"{experiment_id}_validation.parquet";pred.to_parquet(prediction_path,index=False)
-    manifest={"experiment_id":experiment_id,"model":"qwen06","dataset":dataset,"split":"validation",
+    manifest={"experiment_id":experiment_id,"model":model,"dataset":dataset,"split":"validation",
         "continued_from_experiment":source["experiment_id"],"continued_from_checkpoint":str(source_checkpoint),
         "additional_epochs":epochs,"total_epochs":int(source.get("config",{}).get("epochs",0))+epochs,
         "train_rows":len(train),"validation_rows":len(valid),"classes":classes,"config":snapshot,
         "config_sha256":config_hash,"dataset_sha256":profile["dataset_sha256"],"split_sha256":profile["split_sha256"],
         "code_revision":code_revision,"model_revision":cfg["revision"],"checkpoint_id":cfg["checkpoint"],"seed":seed,
+        "quantization":result.get("quantization",cfg.get("quantization","none")),
+        "quantization_config":result.get("quantization_config"),
+        "attention_backend":result.get("attention_backend",cfg.get("attention_backend")),
         "fit_seconds":result["fit_seconds"],"inference_seconds":result["inference_seconds"],
         "early_stopping":result.get("early_stopping"),
         "calibration_temperature":result["calibration_temperature"],"validation_metrics_by_epoch":result["validation_metrics_by_epoch"],
@@ -826,7 +861,7 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
         "created_at_utc":pd.Timestamp.now(tz="UTC").isoformat()}
     manifest_path=pred_dir/f"{experiment_id}_manifest.json";manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
     (pred_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2)+"\n")
-    Registry(registry_path).add(experiment_id,"qwen06","validation",snapshot,metrics,
+    Registry(registry_path).add(experiment_id,model,"validation",snapshot,metrics,
         dataset_hash=profile["dataset_sha256"],split_hash=profile["split_sha256"],model_revision=cfg["revision"],
         code_revision=code_revision,seed=seed,runtime_seconds=result["fit_seconds"],artifact_path=str(prediction_path),
         config_hash=config_hash,description=f"Continued Qwen LoRA from {source['experiment_id']} for {epochs} epochs; validation metrics recorded each epoch.")
@@ -1032,7 +1067,9 @@ def _load_training_predictions(dataset, artifact_dir, manifests):
                 temperature=manifest.get("calibration_temperature", 1.0),
                 base_checkpoint=manifest.get("config", {}).get("checkpoint"), revision=manifest.get("model_revision"),
                 fix_mistral_regex=manifest.get("config", {}).get("fix_mistral_regex", False),
-                text_only_backbone=manifest.get("config", {}).get("text_only_backbone", False))
+                text_only_backbone=manifest.get("config", {}).get("text_only_backbone", False),
+                quantization=manifest.get("config", {}).get("quantization", manifest.get("quantization")),
+                attention_backend=manifest.get("config", {}).get("attention_backend", manifest.get("attention_backend")))
         if probabilities.shape != (len(train), len(classes)) or not np.isfinite(probabilities).all():
             raise ValueError(f"invalid train predictions for {name}")
         if not path.exists():
@@ -1213,6 +1250,7 @@ def main(argv=None):
     t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v0");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--skip-prediction-refresh",action="store_true",help="save the model run without changing the active prediction roster or ensemble history");t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
     cq=m.add_parser("continue-qwen",help="continue the latest Qwen LoRA checkpoint and validate after every epoch")
     cq.add_argument("--dataset",default="v0");cq.add_argument("--epochs",type=int,default=4);cq.add_argument("--seed",type=int,default=2026)
+    cq.add_argument("--model",choices=["qwen06","qwen17","qwen4","qwen8"],default="qwen06")
     cq.add_argument("--from-experiment");cq.add_argument("--config");cq.add_argument("--accept-config-defaults",action="store_true")
     ce=m.add_parser("continue-encoder",help="baseline-validate and continue a saved UltraBERT checkpoint")
     ce.add_argument("--model",choices=["ultrabert380"],default="ultrabert380")
@@ -1308,6 +1346,13 @@ def main(argv=None):
     zs.add_argument("--output-dir", default="artifacts/analysis/zod01_specialist_discovery")
     zs.add_argument("--report", default="docs/zod01_specialist_discovery.md")
     zs.add_argument("--minimum-support", type=int, default=10)
+    zf = analysis.add_parser("zod01-fixed-18", help="run the fixed user-specified 18-label ZOD01 cascade")
+    zf.add_argument("--data-dir", default="data/processed")
+    zf.add_argument("--inventory", default="artifacts/analysis/zod01_specialist_discovery/checkpoint_inventory.csv")
+    zf.add_argument("--predictions-dir", default="artifacts/analysis/zod01_specialist_discovery/predictions")
+    zf.add_argument("--registry", default="experiments/registry.sqlite")
+    zf.add_argument("--output-dir", default="artifacts/analysis/zod01_18label_cascade")
+    zf.add_argument("--report", default="docs/zod01_18label_cascade.md")
     a=parser.parse_args(argv)
     if a.command=="restart": result=restart_mvp(models=a.models,seed=a.seed,bootstrap_replicates=a.bootstrap_replicates)
     elif a.command=="data" and a.action=="prepare": result=prepare_data(a.config)
@@ -1372,12 +1417,17 @@ def main(argv=None):
         from .zod01_specialist_discovery import run_zod01_specialist_discovery
         result=run_zod01_specialist_discovery(artifact_dir=a.artifact_dir,data_dir=a.data_dir,
             output_dir=a.output_dir,report_path=a.report,minimum_support=a.minimum_support)
+    elif a.command=="analysis" and a.action=="zod01-fixed-18":
+        from .zod01_fixed_cascade import run_fixed_zod01_cascade
+        result=run_fixed_zod01_cascade(data_dir=a.data_dir,inventory_path=a.inventory,
+            predictions_dir=a.predictions_dir,registry_path=a.registry,
+            output_dir=a.output_dir,report_path=a.report)
     elif a.command=="models" and a.action=="continue-qwen":
-        cfg = _model_cfg("qwen06", a.config); cfg["epochs"] = a.epochs
-        overrides = _confirm_training_config("qwen06", cfg, accept_defaults=a.accept_config_defaults)
+        cfg = _model_cfg(a.model, a.config); cfg["epochs"] = a.epochs
+        overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
         result=continue_qwen(a.dataset,from_experiment=a.from_experiment,
             epochs=int(overrides.get("epochs", a.epochs)),seed=a.seed,config_path=a.config,
-            config_overrides=overrides)
+            config_overrides=overrides,model=a.model)
     elif a.command=="models" and a.action=="continue-encoder":
         cfg = _model_cfg(a.model); cfg.update({"epochs":a.epochs,"learning_rate":a.learning_rate,
                                                 "learning_rate_decay":a.learning_rate_decay})

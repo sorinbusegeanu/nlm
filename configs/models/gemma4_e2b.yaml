@@ -6,7 +6,7 @@ revision: 433813a669639fd7eaa83155828e9000ed357d53
 training_mode: lora
 early_stopping_patience: 3
 text_only_backbone: true
-epochs: 10
+epochs: 20
 batch_size: 1
 auto_batch_size: true
 max_batch_size: 1024

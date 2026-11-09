@@ -777,7 +777,10 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
             torch.cuda.empty_cache()
 
     try:
-        model.to(device)
+        # BitsAndBytes models are dispatched at load time and cannot be moved
+        # later with nn.Module.to().
+        if not getattr(model, "_qlora_quantized", False):
+            model.to(device)
         model.train()
         successful = 0
         failed = None
@@ -827,6 +830,27 @@ def load_text_only_backbone(transformers_module, checkpoint, revision, *, torch_
     return text_backbone
 
 
+def _require_flash_attention_2_runtime(torch):
+    """Fail closed unless the installed FlashAttention-2 kernel runs on this GPU."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("flash_attention_2 requires CUDA")
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError as exc:
+        raise RuntimeError("flash_attention_2 was requested but flash-attn is not installed") from exc
+    major, minor = torch.cuda.get_device_capability()
+    if major < 8:
+        raise RuntimeError(f"flash_attention_2 needs SM80 or newer; this GPU is SM{major}{minor}")
+    try:
+        q = torch.zeros((1, 8, 1, 64), device="cuda", dtype=torch.bfloat16)
+        flash_attn_func(q, q, q, causal=True)
+        torch.cuda.synchronize()
+    except Exception as exc:
+        raise RuntimeError(
+            f"installed flash-attn has no working kernel for this GPU/CUDA stack: {exc}"
+        ) from exc
+
+
 def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, checkpoint="Qwen/Qwen3-0.6B",
                          revision, output_dir="artifacts/checkpoints/qwen", epochs=3, batch_size=4,
                          max_length=384, learning_rate=1e-4, seed=2026, gradient_accumulation_steps=1,
@@ -839,7 +863,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          lora_exclude_modules=None, text_only_backbone=False,
                          lr_scheduler_type=None, warmup_ratio=0.0,
                          warmup_epochs=None, optimizer="adamw_torch", weight_decay=0.0,
-                         early_stopping_patience=3, trust_remote_code=False):
+                         early_stopping_patience=3, trust_remote_code=False,
+                         quantization="none", attention_backend=None):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
     _force_huggingface_offline()
     torch, tr = _require_neural()
@@ -864,13 +889,50 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
     model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16 if torch.cuda.is_available() else torch.float32
+    quantization = str(quantization or "none").lower()
+    if quantization not in {"none", "qlora4"}:
+        raise ValueError("quantization must be 'none' or 'qlora4'")
+    if attention_backend not in {None, "sdpa", "flash_attention_2"}:
+        raise ValueError("attention_backend must be 'sdpa', 'flash_attention_2', or None")
+    if quantization == "qlora4" and text_only_backbone:
+        raise ValueError("qlora4 currently supports direct backbone loading, not text-only composite loading")
+    load_kwargs = {"attn_implementation": attention_backend} if attention_backend else {}
+    quantization_config = None
+    if attention_backend == "flash_attention_2":
+        _require_flash_attention_2_runtime(torch)
+    if quantization == "qlora4":
+        if not torch.cuda.is_available():
+            raise RuntimeError("qlora4 requires a CUDA GPU")
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("qlora4 requires BF16-capable CUDA hardware")
+        from transformers import BitsAndBytesConfig
+        quantization_config = {"load_in_4bit": True,
+                               "bnb_4bit_quant_type": "nf4",
+                               "bnb_4bit_use_double_quant": True,
+                               "bnb_4bit_compute_dtype": "bfloat16"}
+        load_kwargs.update({
+            "quantization_config": BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            ),
+            "device_map": {"": torch.cuda.current_device()},
+        })
     if text_only_backbone:
         backbone = load_text_only_backbone(tr, checkpoint, revision, torch_dtype=model_dtype,
                                            local_files_only=local_files_only)
     else:
         backbone = tr.AutoModel.from_pretrained(checkpoint, revision=revision, torch_dtype=model_dtype,
                                                  local_files_only=local_files_only,
-                                                 trust_remote_code=trust_remote_code)
+                                                 trust_remote_code=trust_remote_code, **load_kwargs)
+    if quantization == "qlora4":
+        try:
+            from peft import prepare_model_for_kbit_training
+        except ImportError as exc:
+            raise RuntimeError("QLoRA requires PEFT prepare_model_for_kbit_training") from exc
+        backbone = prepare_model_for_kbit_training(
+            backbone, use_gradient_checkpointing=bool(gradient_checkpointing))
     if resume_checkpoint:
         backbone = PeftModel.from_pretrained(backbone, resume_checkpoint, is_trainable=True, local_files_only=True)
     else:
@@ -879,7 +941,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                           exclude_modules=lora_exclude_modules)
         backbone = get_peft_model(backbone, lora)
     backbone.config.use_cache = False
-    if gradient_checkpointing:
+    if gradient_checkpointing and quantization != "qlora4":
         backbone.gradient_checkpointing_enable()
         if hasattr(backbone, "enable_input_require_grads"):
             backbone.enable_input_require_grads()
@@ -893,7 +955,13 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         raise ValueError(f"{checkpoint} needs a configured readout_hidden_size")
     class Head(nn.Module):
         def __init__(self):
-            super().__init__(); self.backbone=backbone; self.classifier=nn.Linear(hidden_size,len(classes))
+            super().__init__(); self.backbone=backbone
+            self.classifier=nn.Linear(hidden_size,len(classes))
+            if quantization == "qlora4":
+                backbone_device = next(backbone.parameters()).device
+                self.classifier.to(backbone_device)
+                self.hf_device_map = getattr(backbone, "hf_device_map", {"": backbone_device.index or 0})
+                self._qlora_quantized = True
         def forward(self,input_ids,attention_mask,labels=None):
             hidden=self.backbone(input_ids=input_ids,attention_mask=attention_mask).last_hidden_state
             mask=attention_mask.unsqueeze(-1).to(hidden.dtype)
@@ -925,6 +993,14 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         return {"accuracy": float(accuracy_score(labels, predicted)),
                 "balanced_accuracy": float(balanced_accuracy_score(labels, predicted))}
     out=Path(output_dir)
+    checkpoint_metadata = {
+        "checkpoint": checkpoint, "revision": revision,
+        "quantization": quantization, "quantization_config": quantization_config,
+        "attention_backend": attention_backend,
+        "lora_rank": int(lora_rank), "lora_alpha": int(lora_alpha),
+        "lora_target_modules": list(lora_target_modules),
+        "gradient_checkpointing": bool(gradient_checkpointing),
+    }
     class EpochSnapshotCallback(TrainerCallback):
         def __init__(self): self.checkpoints=[]
         def on_evaluate(self,args,state,control,metrics=None,**kwargs):
@@ -934,6 +1010,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             model.backbone.save_pretrained(epoch_dir,safe_serialization=True)
             tokenizer.save_pretrained(epoch_dir)
             torch.save({k:v.detach().cpu() for k,v in model.classifier.state_dict().items()},epoch_dir/"classifier.pt")
+            (epoch_dir/"checkpoint_manifest.json").write_text(json.dumps(checkpoint_metadata,indent=2)+"\n")
             (epoch_dir/"validation_metrics.json").write_text(json.dumps(metrics or {},indent=2)+"\n")
             self.checkpoints.append(str(epoch_dir))
             return control
@@ -1072,7 +1149,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     # accelerator wrapper, which can retain pre-restore weights after the
     # selected epoch adapter/head have been loaded above.
     from torch.utils.data import DataLoader
-    prediction_device = next(model.parameters()).device
+    prediction_device = next(model.classifier.parameters()).device
     amp_dtype = (torch.bfloat16 if use_bf16 else
                  torch.float16 if use_fp16 else None)
 
@@ -1100,6 +1177,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     inference_seconds = time.perf_counter() - pred_start
     backbone.save_pretrained(out,safe_serialization=True);tokenizer.save_pretrained(out)
     torch.save(model.classifier.state_dict(),out/"classifier.pt")
+    (out/"checkpoint_manifest.json").write_text(json.dumps(checkpoint_metadata,indent=2)+"\n")
     if not np.isfinite(logits).all(): raise ValueError("Qwen adapter produced non-finite scores")
     probs=softmax(logits/temperature,axis=1)
     trainable=sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1117,4 +1195,6 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "requested_batch_size":int(batch_size),"effective_batch_size":effective_batch_size,
         "lr_scheduler_type":scheduler,"warmup_ratio":float(warmup_ratio),
         "batch_size_probe":batch_probe,
+        "quantization":quantization,"quantization_config":quantization_config,
+        "attention_backend":attention_backend,
         "peak_gpu_memory_bytes":int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None}

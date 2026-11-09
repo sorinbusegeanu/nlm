@@ -59,7 +59,8 @@ def predict_catboost_stylometry(checkpoint, texts, classes, *, temperature=1.0):
 
 def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max_length=384, temperature=1.0,
                     base_checkpoint=None, revision=None, fix_mistral_regex=False,
-                    text_only_backbone=False, local_base_model=None, return_scores=False):
+                    text_only_backbone=False, local_base_model=None, return_scores=False,
+                    quantization=None, attention_backend=None):
     try:
         import torch
         from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
@@ -67,6 +68,18 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     except ImportError as exc:
         raise RuntimeError("Offline neural inference requires the project's [neural] dependencies") from exc
     checkpoint = Path(checkpoint)
+    checkpoint_metadata_path = checkpoint / "checkpoint_manifest.json"
+    checkpoint_metadata = (json.loads(checkpoint_metadata_path.read_text())
+                           if checkpoint_metadata_path.is_file() else {})
+    quantization = str(quantization or checkpoint_metadata.get("quantization") or "none").lower()
+    attention_backend = attention_backend or checkpoint_metadata.get("attention_backend")
+    if quantization not in {"none", "qlora4"}:
+        raise ValueError(f"unsupported checkpoint quantization: {quantization}")
+    if attention_backend not in {None, "sdpa", "flash_attention_2"}:
+        raise ValueError(f"unsupported attention backend: {attention_backend}")
+    if attention_backend == "flash_attention_2":
+        from .model_factory import _require_flash_attention_2_runtime
+        _require_flash_attention_2_runtime(torch)
     if model_name in {"embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b"} and (checkpoint / "readout.joblib").is_file():
         from .model_factory import extract_frozen_backbone_features
         bundle = joblib.load(checkpoint / "readout.joblib")
@@ -85,7 +98,13 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
             raise ValueError(f"{model_name} returned invalid probabilities")
         return aligned, list(classes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float16 if device.type == "cuda" else torch.float32
+    # EmbeddingGemma's activations can overflow fp16. Use bf16 where available
+    # and fp32 on GPUs such as T4 that do not support bf16.
+    if device.type == "cuda":
+        model_dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported() else
+                       torch.float32 if model_name == "embeddinggemma2" else torch.float16)
+    else:
+        model_dtype = torch.float32
     trust_remote_code = model_name == "phi35_mini"
     tokenizer_kwargs = {"local_files_only": True, "trust_remote_code": True}
     if fix_mistral_regex:
@@ -94,9 +113,9 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     if model_name == "ultrabert380":
         network = AutoModelForSequenceClassification.from_pretrained(checkpoint, local_files_only=True, trust_remote_code=True)
-    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "llama32_3b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}:
+    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "llama32_3b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}:
         backbone_path = checkpoint / "merged_backbone"
-        if backbone_path.exists():
+        if backbone_path.exists() and quantization != "qlora4":
             network = AutoModel.from_pretrained(backbone_path, local_files_only=True, torch_dtype=model_dtype,
                                                 trust_remote_code=trust_remote_code)
         else:
@@ -105,20 +124,44 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
             if local_base_model:
                 base_checkpoint = str(local_base_model)
                 revision = None
+            load_kwargs = {"attn_implementation": attention_backend} if attention_backend else {}
+            if quantization == "qlora4":
+                if device.type != "cuda":
+                    raise RuntimeError("QLoRA checkpoint inference requires a CUDA GPU")
+                if not torch.cuda.is_bf16_supported():
+                    raise RuntimeError("QLoRA checkpoint inference requires BF16-capable CUDA hardware")
+                from transformers import BitsAndBytesConfig
+                load_kwargs.update({
+                    "quantization_config": BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                    ),
+                    "device_map": {"": torch.cuda.current_device()},
+                })
             if text_only_backbone:
+                if quantization == "qlora4":
+                    raise ValueError("qlora4 inference does not support text-only composite loading")
                 from .model_factory import load_text_only_backbone
                 import transformers
                 network = load_text_only_backbone(transformers, base_checkpoint, revision,
                                                   torch_dtype=model_dtype, local_files_only=True)
             else:
                 network = AutoModel.from_pretrained(base_checkpoint, revision=revision, local_files_only=True,
-                                                    torch_dtype=model_dtype, trust_remote_code=trust_remote_code)
+                                                    torch_dtype=model_dtype, trust_remote_code=trust_remote_code,
+                                                    **load_kwargs)
             network = PeftModel.from_pretrained(network, checkpoint, local_files_only=True)
         state = torch.load(checkpoint / "classifier.pt", map_location="cpu", weights_only=True)
         classifier = torch.nn.Linear(int(state["weight"].shape[1]), len(classes))
         classifier.load_state_dict(state)
+        if quantization == "qlora4":
+            classifier.to(device)
         class Readout(torch.nn.Module):
-            def __init__(self): super().__init__(); self.backbone=network; self.classifier=classifier
+            def __init__(self):
+                super().__init__(); self.backbone=network; self.classifier=classifier
+                if quantization == "qlora4":
+                    self.hf_device_map = getattr(network, "hf_device_map", {"": device.index or 0})
             def forward(self, input_ids, attention_mask):
                 hidden=self.backbone(input_ids=input_ids,attention_mask=attention_mask).last_hidden_state
                 mask=attention_mask.unsqueeze(-1).to(hidden.dtype)
@@ -126,18 +169,41 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                 return self.classifier(pooled.float())
         network = Readout()
     else: raise ValueError(f"unsupported neural model: {model_name}")
-    network.to(device).eval(); batches=[]; score_batches=[]
+    if quantization == "qlora4":
+        network.eval()
+    else:
+        network.to(device).eval()
+    batches=[]; score_batches=[]
+    batch_size = max(1, int(batch_size))
+    next_batch_size = batch_size
     with torch.inference_mode():
-        for start in range(0, len(texts), batch_size):
-            text_batch = list(texts[start:start+batch_size])
+        start = 0
+        while start < len(texts):
+            current_size = min(next_batch_size, len(texts) - start)
+            text_batch = list(texts[start:start + current_size])
             if model_name == "embeddinggemma2":
                 text_batch = ["task: classification | query: " + str(text) for text in text_batch]
-            enc=tokenizer(text_batch,truncation=True,max_length=max_length,padding=True,return_tensors="pt")
-            if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "llama32_3b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
-            enc={k:v.to(device) for k,v in enc.items()}; logits=network(**enc)
-            if hasattr(logits,"logits"): logits=logits.logits
-            raw_logits = logits.float()
-            score_batches.append(raw_logits.cpu().numpy())
+            try:
+                enc=tokenizer(text_batch,truncation=True,max_length=max_length,padding=True,return_tensors="pt")
+                if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "llama32_3b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
+                enc={k:v.to(device) for k,v in enc.items()}; logits=network(**enc)
+                if hasattr(logits,"logits"): logits=logits.logits
+                raw_logits = logits.float()
+                score_batches.append(raw_logits.cpu().numpy())
+                start += current_size
+            except RuntimeError as exc:
+                is_cuda_oom = device.type == "cuda" and (
+                    isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ())) or
+                    "out of memory" in str(exc).lower())
+                if not is_cuda_oom or current_size <= 1:
+                    raise
+                if "enc" in locals():
+                    del enc
+                if "logits" in locals():
+                    del logits
+                torch.cuda.empty_cache()
+                next_batch_size = max(1, current_size // 2)
+                continue
             batches.append(torch.softmax(raw_logits/float(temperature),dim=-1).cpu().numpy())
     matrix=np.concatenate(batches,axis=0) if batches else np.empty((0,len(classes)))
     if matrix.shape != (len(texts),len(classes)) or not np.isfinite(matrix).all(): raise ValueError("neural model returned invalid probabilities")
@@ -182,7 +248,9 @@ def export_submission(model, checkpoint, test_path, output_path):
             max_length=manifest.get("config",{}).get("max_length",384),temperature=manifest.get("calibration_temperature",1.0),
             base_checkpoint=manifest.get("config",{}).get("checkpoint"),revision=manifest.get("model_revision"),
             fix_mistral_regex=manifest.get("config",{}).get("fix_mistral_regex",False),
-            text_only_backbone=manifest.get("config",{}).get("text_only_backbone",False))
+            text_only_backbone=manifest.get("config",{}).get("text_only_backbone",False),
+            quantization=manifest.get("config",{}).get("quantization",manifest.get("quantization")),
+            attention_backend=manifest.get("config",{}).get("attention_backend",manifest.get("attention_backend")))
     output = pd.DataFrame({"id": frame.id, "model": np.asarray(classes)[probabilities.argmax(1)]})
     if output.id.astype(str).tolist() != frame.id.astype(str).tolist(): raise RuntimeError("output row order does not match input")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,6 +327,8 @@ def predict_candidate(model_spec, texts, classes, bundle_root):
             base_checkpoint=config.get("checkpoint"), revision=model_spec.get("model_revision"),
             fix_mistral_regex=config.get("fix_mistral_regex", False),
             text_only_backbone=config.get("text_only_backbone", False),
+            quantization=config.get("quantization", model_spec.get("quantization")),
+            attention_backend=config.get("attention_backend", model_spec.get("attention_backend")),
             local_base_model=(bundle_root / model_spec["base_model"] if model_spec.get("base_model") else None))
     if returned_classes != classes:
         indexes = {label: index for index, label in enumerate(returned_classes)}

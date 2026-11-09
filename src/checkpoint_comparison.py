@@ -195,7 +195,9 @@ def _generate_predictions(manifest, manifest_path, validation_rows, classes, art
             temperature=temperature, base_checkpoint=config.get("checkpoint"),
             revision=manifest.get("model_revision") or config.get("revision"),
             fix_mistral_regex=bool(config.get("fix_mistral_regex", False)),
-            text_only_backbone=bool(config.get("text_only_backbone", False)))
+            text_only_backbone=bool(config.get("text_only_backbone", False)),
+            quantization=config.get("quantization", manifest.get("quantization")),
+            attention_backend=config.get("attention_backend", manifest.get("attention_backend")))
     returned_classes = list(map(str, returned_classes))
     if set(returned_classes) != set(classes):
         raise ValueError(f"{manifest['experiment_id']} prediction classes differ from frozen V0")
