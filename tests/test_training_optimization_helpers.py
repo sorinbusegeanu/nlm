@@ -326,6 +326,76 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertFalse(pipeline._continuation_source_matches(
             legacy, "train", "valid", train, valid.assign(text="changed"), "legacy-source-hash"))
 
+    def test_continuation_paths_forward_inference_and_calibration_settings(self):
+        train = pd.DataFrame({"id": ["t1", "t2"], "prompt_id": ["pt1", "pt2"],
+            "text": ["train a", "train b"], "model": ["a", "b"]})
+        valid = pd.DataFrame({"id": ["v1", "v2"], "prompt_id": ["pv1", "pv2"],
+            "text": ["valid a", "valid b"], "model": ["a", "b"]})
+        scores = np.asarray([[2., 0.], [0., 2.]])
+        probabilities = np.asarray([[.9, .1], [.1, .9]])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); artifacts = root / "artifacts"; predictions = artifacts / "predictions"
+            predictions.mkdir(parents=True)
+            data = root / "data"; data.mkdir()
+            profile = data / "dataset_profile_v1.json"
+            profile.write_text(json.dumps({"dataset_sha256": "train-hash"}))
+            calls = {}
+            def fake_result(**extra):
+                return {"scores": scores, "probabilities": probabilities,
+                    "fit_seconds": .1, "inference_seconds": 0.,
+                    "calibration_temperature": 1., "calibration_enabled": False,
+                    "calibration_sample_size": None, "validation_metrics_by_epoch": [],
+                    "validation_predictions_by_epoch": [], "best_epoch": 1,
+                    "best_validation_accuracy": 1., "best_validation_balanced_accuracy": 1.,
+                    "checkpoint_selection_metric": "validation_balanced_accuracy",
+                    "checkpoint_scoring_method": "test", "early_stopping": None,
+                    "best_checkpoint_path": str(root / "selected"),
+                    "baseline_validation_metrics": {"accuracy": 1.},
+                    "requested_batch_size": 1, "effective_batch_size": 1,
+                    "requested_inference_batch_size": 7, "effective_inference_batch_size": 7,
+                    "runtime_breakdown": {"effective_inference_batch_size": 7}, **extra}
+            qwen_checkpoint = artifacts / "runs" / "qwen-source" / "checkpoint"
+            qwen_checkpoint.mkdir(parents=True)
+            qwen_source = {"experiment_id": "qwen-source", "model": "qwen06", "dataset": "v1",
+                "checkpoint_path": str(qwen_checkpoint), "best_checkpoint_path": str(qwen_checkpoint),
+                "checkpoint_id": "Qwen/Qwen3-0.6B", "model_revision": "rev",
+                "classes": ["a", "b"], "config": {"batch_size": 1, "epochs": 1,
+                    "quantization": "none", "calibration_enabled": False, "inference_batch_size": 7},
+                "created_at_utc": "2026-01-01"}
+            (predictions / "qwen06_v1_qwen-source_manifest.json").write_text(json.dumps(qwen_source))
+            encoder_checkpoint = artifacts / "runs" / "encoder-source" / "checkpoint"
+            encoder_checkpoint.mkdir(parents=True)
+            encoder_source = {"experiment_id": "encoder-source", "model": "ultrabert380", "dataset": "v1",
+                "checkpoint_path": str(encoder_checkpoint), "best_checkpoint_path": str(encoder_checkpoint),
+                "checkpoint_id": "ultrabert", "model_revision": "rev", "classes": ["a", "b"],
+                "config": {"batch_size": 2, "inference_batch_size": 6,
+                    "calibration_enabled": False, "epochs": 1}, "created_at_utc": "2026-01-01"}
+            (predictions / "encoder-source_manifest.json").write_text(json.dumps(encoder_source))
+
+            def fake_qwen(*args, **kwargs):
+                calls["qwen"] = kwargs
+                return fake_result()
+            def fake_encoder(*args, **kwargs):
+                calls["encoder"] = kwargs
+                return fake_result()
+            with patch.object(pipeline, "_training_partitions", return_value=(train, valid)), \
+                    patch.object(pipeline, "_profile_path", return_value=profile), \
+                    patch.object(pipeline, "_continuation_source_matches", return_value=True), \
+                    patch.object(pipeline, "_dataset_max_length", return_value=16), \
+                    patch("src.model_factory.train_qwen_lora_fold", side_effect=fake_qwen), \
+                    patch("src.model_factory.train_encoder_fold", side_effect=fake_encoder), \
+                    patch.object(pipeline, "Registry"):
+                pipeline.continue_qwen("v1", data_dir=str(data), artifact_dir=str(artifacts),
+                    registry_path=str(root / "registry.sqlite"), from_experiment="qwen-source",
+                    model="qwen06", epochs=1)
+                pipeline.continue_encoder("v1", data_dir=str(data), artifact_dir=str(artifacts),
+                    registry_path=str(root / "registry.sqlite"), from_experiment="encoder-source",
+                    epochs=1)
+        self.assertEqual(calls["qwen"]["inference_batch_size"], 7)
+        self.assertFalse(calls["qwen"]["calibration_enabled"])
+        self.assertEqual(calls["encoder"]["inference_batch_size"], 6)
+        self.assertFalse(calls["encoder"]["calibration_enabled"])
+
     def test_standard_training_passes_full_rows_and_balanced_selection(self):
         train_rows = pd.DataFrame({"id": ["t1", "t2", "t3", "t4"],
             "prompt_id": ["pt1", "pt2", "pt3", "pt4"],
