@@ -137,6 +137,40 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertNotIn("save_epoch_checkpoints",
                          inspect.signature(model_factory.train_catboost_stylometry).parameters)
 
+    def test_catboost_disabled_temperature_skips_calibration_prediction(self):
+        import sys
+        class FakeCatBoost:
+            calls = []
+            def __init__(self, **kwargs): self.kwargs = kwargs
+            def fit(self, x, y, **kwargs):
+                self.classes_ = np.asarray(["a", "b"])
+                self.tree_count_ = 2
+                self.fit_kwargs = kwargs
+                FakeCatBoost.calls.append(("fit", kwargs))
+            def get_best_iteration(self): return 1
+            def get_evals_result(self): return {"validation": {"BalancedAccuracy": [0.5, 0.6]}}
+            def predict(self, x, prediction_type=None):
+                FakeCatBoost.calls.append(("predict", len(x)))
+                return np.tile(np.asarray([[1.0, -1.0]]), (len(x), 1))
+            def save_model(self, path): Path(path).write_bytes(b"fake-model")
+        fake_module = SimpleNamespace(CatBoostClassifier=FakeCatBoost)
+        FakeCatBoost.calls = []
+        with tempfile.TemporaryDirectory() as temp, patch.dict(sys.modules, {"catboost": fake_module}):
+            result = model_factory.train_catboost_stylometry(
+                ["train a", "train b"], ["a", "b"], ["valid a", "valid b"], ["a", "b"],
+                output_dir=Path(temp), iterations=2, validation_labels=["a", "b"],
+                calibration_enabled=False,
+                feature_matrices=(np.zeros((2, 1)), np.zeros((2, 1)), ["f"]))
+        self.assertEqual([entry for entry in FakeCatBoost.calls if entry[0] == "predict"],
+                         [("predict", 2)])
+        self.assertEqual(result["calibration_temperature"], 1.0)
+        self.assertFalse(result["calibration_enabled"])
+        self.assertIsNone(result.get("calibration_sample_size"))
+        self.assertTrue(np.allclose(result["probabilities"], result["probabilities"][0]))
+        fit_kwargs = next(entry[1] for entry in FakeCatBoost.calls if entry[0] == "fit")
+        self.assertIsInstance(result["model"].kwargs["eval_metric"], model_factory._BalancedAccuracyMetric)
+        self.assertEqual(fit_kwargs["early_stopping_rounds"], 100)
+
     def test_post_training_runtime_has_stable_stage_keys(self):
         runtime = pipeline._post_training_runtime({"inference_seconds": 1.25,
             "runtime_breakdown": {"temperature_fit_seconds": 0.04}})
