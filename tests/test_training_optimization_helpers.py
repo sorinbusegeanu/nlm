@@ -171,6 +171,35 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertIsInstance(result["model"].kwargs["eval_metric"], model_factory._BalancedAccuracyMetric)
         self.assertEqual(fit_kwargs["early_stopping_rounds"], 100)
 
+    def test_standard_catboost_pipeline_uses_balanced_early_stopping_and_valid_kwargs(self):
+        class Matrix:
+            def __init__(self, value): self.value = np.asarray(value)
+            def toarray(self): return self.value
+        class Transform:
+            stylometry_feature_names = ["f"]
+        train = pd.DataFrame({"id": ["t1", "t2"], "prompt_id": ["p1", "p2"],
+                              "text": ["train a", "train b"], "model": ["a", "b"]})
+        valid = pd.DataFrame({"id": ["v1", "v2"], "prompt_id": ["q1", "q2"],
+                              "text": ["valid a", "valid b"], "model": ["a", "b"]})
+        calls = {}
+        def fake_train(*args, **kwargs):
+            calls.update(kwargs)
+            return {"scores": np.asarray([[1., 0.], [0., 1.]]),
+                    "probabilities": np.asarray([[.8, .2], [.2, .8]]),
+                    "checkpoint": "fake", "fit_seconds": 0.1}
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(pipeline, "load_or_fit", return_value=(Matrix([[1], [0]]),
+                    Matrix([[1], [0]]), Transform(), "cache")), \
+                patch.object(pipeline, "train_catboost_stylometry", side_effect=fake_train):
+            pipeline._train_fold("catboost_stylometry", train, valid, ["a", "b"],
+                {"feature_recipe": {"baseline": [], "groups": []}, "iterations": 3,
+                 "early_stopping_rounds": 7, "calibration_enabled": False},
+                Path(temp), 2026, "validation", Path(temp) / "features")
+        self.assertNotIn("save_epoch_checkpoints", calls)
+        self.assertEqual(calls["checkpoint_selection_metric"], "balanced_accuracy")
+        self.assertEqual(calls["early_stopping_rounds"], 7)
+        self.assertFalse(calls["calibration_enabled"])
+
     def test_post_training_runtime_has_stable_stage_keys(self):
         runtime = pipeline._post_training_runtime({"inference_seconds": 1.25,
             "runtime_breakdown": {"temperature_fit_seconds": 0.04}})
