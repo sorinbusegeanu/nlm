@@ -7,6 +7,7 @@ import math
 import os
 import inspect
 import shutil
+import hashlib
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -28,16 +29,58 @@ def _aligned(values, fitted_classes, classes):
     return result
 
 
-def _fit_temperature(train_logits, train_labels, classes):
-    """Fit scalar temperature using training rows only; validation logits are never used."""
-    logits = np.asarray(train_logits, dtype=float)
+def _calibration_indices(labels, *, max_samples=5000, seed=2026, full_dataset=False):
+    """Deterministic class-stratified training-only calibration sample."""
+    labels = np.asarray(labels, dtype=object)
+    if full_dataset or max_samples is None or len(labels) <= int(max_samples):
+        return np.arange(len(labels), dtype=int)
+    quota = max(1, int(max_samples))
+    rng = np.random.default_rng(int(seed))
+    selected = []
+    groups = {label: np.flatnonzero(labels == label) for label in sorted(set(labels.tolist()))}
+    if quota < len(groups):
+        raise ValueError(f"calibration_max_samples={quota} cannot represent all {len(groups)} classes")
+    # Allocate proportional quotas by largest remainder, with at least one per class.
+    raw = {label: quota * len(indices) / len(labels) for label, indices in groups.items()}
+    counts = {label: min(len(indices), max(1, int(np.floor(raw[label]))))
+              for label, indices in groups.items()}
+    while sum(counts.values()) > quota:
+        choices = [label for label in counts if counts[label] > 1]
+        if not choices: break
+        counts[max(choices, key=lambda label: (counts[label] - raw[label], counts[label]))] -= 1
+    while sum(counts.values()) < quota:
+        choices = [label for label in counts if counts[label] < len(groups[label])]
+        if not choices: break
+        counts[max(choices, key=lambda label: (raw[label] - counts[label], len(groups[label]) - counts[label]))] += 1
+    for label, indices in groups.items():
+        selected.extend(rng.choice(indices, size=counts[label], replace=False).tolist())
+    return np.asarray(sorted(selected), dtype=int)
+
+
+def _fit_temperature(train_logits, train_labels, classes, *, max_samples=5000,
+                     seed=2026, full_dataset=False, return_metrics=False):
+    """Fit temperature using a deterministic stratified sample of training rows only."""
+    all_logits = np.asarray(train_logits, dtype=float)
+    indexes = _calibration_indices(train_labels, max_samples=max_samples, seed=seed,
+                                   full_dataset=full_dataset)
+    logits = all_logits[indexes]
+    sample_labels = np.asarray(train_labels, dtype=object)[indexes].tolist()
     indexes = {label: i for i, label in enumerate(classes)}
-    targets = np.asarray([indexes[label] for label in train_labels], dtype=int)
+    targets = np.asarray([indexes[label] for label in sample_labels], dtype=int)
     def loss(log_temperature):
         scaled = logits / np.exp(log_temperature)
         return float(np.mean(logsumexp(scaled, axis=1) - scaled[np.arange(len(targets)), targets]))
     result = minimize_scalar(loss, bounds=(-3.0, 3.0), method="bounded")
-    return float(np.exp(result.x))
+    temperature = float(np.exp(result.x))
+    if not return_metrics:
+        return temperature
+    raw_loss = loss(0.0)
+    calibrated_loss = loss(float(result.x))
+    return temperature, {"calibration_sample_size": int(len(sample_labels)),
+                         "calibration_full_dataset": bool(full_dataset),
+                         "calibration_seed": int(seed),
+                         "calibration_raw_loss": float(raw_loss),
+                         "calibration_calibrated_loss": float(calibrated_loss)}
 
 
 def _validation_losses(y_true, raw_scores, calibrated_probabilities, classes):
@@ -120,7 +163,9 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
                               thread_count=8, seed=2026, temperature_calibration=True,
                               validation_labels=None, early_stopping_rounds=100,
                               feature_recipe=None, feature_matrices=None, init_model=None,
-                              checkpoint_metadata=None, checkpoint_selection_metric="accuracy"):
+                              checkpoint_metadata=None, checkpoint_selection_metric="accuracy",
+                              calibration_max_samples=5000, calibration_seed=2026,
+                              calibration_full_dataset=False):
     """Fit CatBoost on deterministic row-local style statistics; no validation fitting."""
     try:
         from catboost import CatBoostClassifier
@@ -152,7 +197,10 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         fit_kwargs.update({"eval_set": (x_validation, list(validation_labels)),
                            "use_best_model": True,
                            "early_stopping_rounds": int(early_stopping_rounds)})
+    startup_seconds = time.perf_counter() - start
+    training_started = time.perf_counter()
     model.fit(x_train, list(y_train), **fit_kwargs)
+    training_seconds = time.perf_counter() - training_started
     iteration_metrics = []
     selected_iteration = (int(model.get_best_iteration()) if validation_labels is not None
                           else int(model.tree_count_) if model.tree_count_ else None)
@@ -168,18 +216,32 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         iteration_metrics = [{"iteration": index + 1,
                               f"validation_{checkpoint_selection_metric}": float(value)}
                              for index, value in enumerate(metric_values)]
-    train_raw = np.asarray(model.predict(x_train, prediction_type="RawFormulaVal"))
     pred_start = time.perf_counter()
     validation_raw = np.asarray(model.predict(x_validation, prediction_type="RawFormulaVal"))
     inference_seconds = time.perf_counter() - pred_start
     model_classes = list(model.classes_)
-    if train_raw.ndim == 1:
-        train_raw = np.column_stack([-train_raw, train_raw])
     if validation_raw.ndim == 1:
         validation_raw = np.column_stack([-validation_raw, validation_raw])
-    train_raw = _aligned(train_raw, model_classes, classes)
     raw = _aligned(validation_raw, model_classes, classes)
-    temperature = _fit_temperature(train_raw, list(y_train), classes) if temperature_calibration else 1.0
+    calibration_metrics = {}
+    if temperature_calibration:
+        calibration_started = time.perf_counter()
+        calibration_indices = _calibration_indices(y_train, max_samples=calibration_max_samples,
+            seed=calibration_seed, full_dataset=calibration_full_dataset)
+        calibration_labels = np.asarray(y_train, dtype=object)[calibration_indices].tolist()
+        train_raw = np.asarray(model.predict(x_train[calibration_indices], prediction_type="RawFormulaVal"))
+        if train_raw.ndim == 1:
+            train_raw = np.column_stack([-train_raw, train_raw])
+        train_raw = _aligned(train_raw, model_classes, classes)
+        temperature, calibration_metrics = _fit_temperature(train_raw, calibration_labels, classes,
+            max_samples=None, seed=calibration_seed, full_dataset=True, return_metrics=True)
+        # The supplied logits already correspond to the deterministic training subset.
+        calibration_metrics["calibration_sample_size"] = int(len(calibration_indices))
+        calibration_metrics["calibration_full_dataset"] = bool(len(calibration_indices) == len(y_train))
+        calibration_metrics["calibration_seed"] = int(calibration_seed)
+        calibration_metrics["calibration_fit_seconds"] = time.perf_counter() - calibration_started
+    else:
+        temperature = 1.0
     probabilities = softmax(raw / temperature, axis=1)
     validation_losses = (_validation_losses(validation_labels, raw, probabilities, classes)
                          if validation_labels is not None else {})
@@ -194,12 +256,16 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
     best_iteration = selected_iteration if validation_labels is not None else None
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_started = time.perf_counter()
     model.save_model(str(output_dir / "model.cbm"))
+    checkpoint_save_seconds = time.perf_counter() - checkpoint_started
     metadata = {
         "feature_version": STYLOMETRY_VERSION,
         "feature_names": feature_names,
         "feature_recipe": feature_recipe,
         "feature_count": int(x_train.shape[1]), "temperature": temperature,
+        **calibration_metrics,
+        **validation_losses,
         "selected_iteration": best_iteration,
         "selected_validation_accuracy": selected_validation_accuracy,
         "selected_validation_balanced_accuracy": selected_validation_balanced_accuracy,
@@ -217,7 +283,14 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
     (output_dir / "stylometry.json").write_text(json.dumps(metadata, indent=2) + "\n")
     return {"scores": raw, "probabilities": probabilities, "model": model,
         "fit_seconds": time.perf_counter() - start, "inference_seconds": inference_seconds,
+        "runtime_breakdown": {"startup_seconds": startup_seconds,
+            "training_including_validation_seconds": training_seconds,
+            "validation_seconds": None,
+            "final_validation_seconds": inference_seconds,
+            "checkpoint_save_seconds": checkpoint_save_seconds,
+            "calibration_seconds": float(calibration_metrics.get("calibration_fit_seconds", 0.0))},
         "classes": list(classes), "calibration_temperature": temperature,
+        **calibration_metrics,
         "calibration_method": "train-only scalar temperature" if temperature_calibration else "none",
         "selected_iteration": best_iteration, "selected_validation_accuracy": selected_validation_accuracy,
         "selected_validation_balanced_accuracy": selected_validation_balanced_accuracy,
@@ -278,6 +351,26 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
     prefix = (EMBEDDINGGEMMA2_TASK_PREFIX if use_processor and model_name == "embeddinggemma2"
               else "" if use_processor else str(task_prefix or ""))
     all_texts = [prefix + str(text) for text in texts]
+    cache_payload = json.dumps({"model": model_name, "checkpoint": str(checkpoint),
+        "revision": revision, "prefix": prefix, "processor": bool(use_processor),
+        "trust_remote_code": bool(trust_remote_code), "fix_mistral_regex": bool(fix_mistral_regex),
+        "texts_sha256": hashlib.sha256("\0".join(all_texts).encode("utf-8")).hexdigest(),
+        "rows": len(all_texts)}, sort_keys=True)
+    cache_key = hashlib.sha256(cache_payload.encode()).hexdigest()
+    cache_path = Path(os.environ.get("NLM_TOKEN_LENGTH_CACHE", "artifacts/cache/token_lengths")) / f"{cache_key}.json"
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            maximum = int(cached["maximum_tokens"])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            # Ignore malformed/stale cache files and recompute from the tokenizer.
+            cached, maximum = None, None
+        if (cached is not None and cached.get("cache_key") == cache_key
+                and int(cached.get("rows", -1)) == len(all_texts)):
+            if maximum > context_window:
+                raise ValueError(f"{model_name} dataset requires {maximum} tokens (including special tokens and task prefix), "
+                                 f"exceeding the model context window of {context_window}")
+            return maximum
     maximum = 0
     for start in range(0, len(all_texts), max(1, int(batch_size))):
         batch_texts = all_texts[start:start + max(1, int(batch_size))]
@@ -291,6 +384,9 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
     if maximum > context_window:
         raise ValueError(f"{model_name} dataset requires {maximum} tokens (including special tokens and task prefix), "
                          f"exceeding the model context window of {context_window}")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps({"cache_key": cache_key, "maximum_tokens": maximum,
+        "rows": len(all_texts), "context_window": context_window}, indent=2) + "\n", encoding="utf-8")
     return maximum
 
 
@@ -326,10 +422,55 @@ def _load_frozen_backbone(model_name, checkpoint, revision, *, fix_mistral_regex
     return model, text_model, processor
 
 
+def _read_embedding_cache(cache_path, metadata_path, cache_key, row_ids):
+    """Load cached features only when their exact ordered row alignment matches."""
+    cache_path, metadata_path = Path(cache_path), Path(metadata_path)
+    if not cache_path.is_file() or not metadata_path.is_file():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("cache_key") != cache_key or metadata.get("row_ids") != list(row_ids):
+            return None
+        with np.load(cache_path) as archive:
+            features = archive["features"]
+        if features.shape[0] != len(row_ids) or not np.isfinite(features).all():
+            return None
+        return features
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def _restore_qwen_selected_state(backbone, classifier, adapter_state, classifier_state, *, setter=None):
+    """Restore the selected LoRA adapter and its matching classifier readout."""
+    if setter is None:
+        from peft.utils.save_and_load import set_peft_model_state_dict
+        setter = set_peft_model_state_dict
+    setter(backbone, adapter_state, adapter_name="default")
+    classifier.load_state_dict(classifier_state)
+
+
 def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *, max_length=384,
-                                     batch_size=8, model_dir=None, fix_mistral_regex=False):
+                                     batch_size=8, model_dir=None, fix_mistral_regex=False,
+                                     row_ids=None, cache_dir="artifacts/cache/frozen_embeddings"):
     """Extract deterministic, text-only mean-pooled features without gradient updates."""
     import torch
+    texts = [str(text) for text in texts]
+    aligned_ids = ([str(value) for value in row_ids] if row_ids is not None else
+                   [f"{index}:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
+                    for index, text in enumerate(texts)])
+    if len(aligned_ids) != len(texts) or len(set(aligned_ids)) != len(aligned_ids):
+        raise ValueError("frozen embedding row IDs must be unique and aligned to texts")
+    cache_config = {"model": model_name, "checkpoint": str(checkpoint), "revision": revision,
+        "tokenizer_config": {"processor": True, "fix_mistral_regex": bool(fix_mistral_regex)},
+        "max_length": int(max_length), "pooling": "attention-mask mean",
+        "texts_sha256": hashlib.sha256("\0".join(texts).encode("utf-8")).hexdigest(),
+        "row_ids_sha256": hashlib.sha256("\0".join(aligned_ids).encode("utf-8")).hexdigest()}
+    cache_key = hashlib.sha256(json.dumps(cache_config, sort_keys=True).encode()).hexdigest()
+    cache_path = Path(cache_dir) / f"{cache_key}.npz"
+    metadata_path = Path(cache_dir) / f"{cache_key}.json"
+    cached_features = _read_embedding_cache(cache_path, metadata_path, cache_key, aligned_ids)
+    if cached_features is not None:
+        return cached_features, 0.0
     model, text_model, processor = _load_frozen_backbone(
         model_name, model_dir or checkpoint, revision,
         fix_mistral_regex=fix_mistral_regex)
@@ -364,22 +505,34 @@ def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *,
         torch.cuda.empty_cache()
     if not np.isfinite(features).all():
         raise ValueError(f"{model_name} produced non-finite text features")
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, features=features)
+    metadata_path.write_text(json.dumps({"cache_key": cache_key, "config": cache_config,
+        "row_ids": aligned_ids, "rows": len(texts), "shape": list(features.shape)},
+        indent=2) + "\n", encoding="utf-8")
     return features, elapsed
 
 
 def train_frozen_backbone_fold(model_name, train_text, y_train, validation_text, classes, *,
                                checkpoint, revision, output_dir, max_length=384, batch_size=8,
                                c=.5, calibration_cv=3, seed=2026, fix_mistral_regex=False,
-                               validation_labels=None):
+                               validation_labels=None, train_row_ids=None, validation_row_ids=None,
+                               embedding_cache_dir="artifacts/cache/frozen_embeddings"):
     """Fit a train-only LinearSVC readout over frozen model-specific text features."""
     if model_name not in FROZEN_BACKBONE_MODELS:
         raise ValueError(f"unsupported frozen backbone: {model_name}")
     start = time.perf_counter()
     same_rows = list(train_text) == list(validation_text)
     all_text = list(train_text) if same_rows else list(train_text) + list(validation_text)
+    all_ids = (list(train_row_ids) if train_row_ids is not None else
+               [f"train:{i}:{hashlib.sha256(str(text).encode()).hexdigest()}" for i, text in enumerate(train_text)])
+    if not same_rows:
+        all_ids += (list(validation_row_ids) if validation_row_ids is not None else
+                    [f"validation:{i}:{hashlib.sha256(str(text).encode()).hexdigest()}" for i, text in enumerate(validation_text)])
     all_features, extraction_seconds = extract_frozen_backbone_features(
         model_name, checkpoint, revision, all_text, max_length=max_length,
-        batch_size=batch_size, fix_mistral_regex=fix_mistral_regex)
+        batch_size=batch_size, fix_mistral_regex=fix_mistral_regex, row_ids=all_ids,
+        cache_dir=embedding_cache_dir)
     train_features = all_features[:len(train_text)]
     validation_features = all_features if same_rows else all_features[len(train_text):]
     inference_started = time.perf_counter()
@@ -576,7 +729,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        warmup_ratio=0.0, warmup_epochs=None, early_stopping_patience=2,
                        auto_batch_size=False, max_batch_size=1024,
                        batch_probe_safety_fraction=0.95,
-                       checkpoint_selection_metric="accuracy"):
+                       checkpoint_selection_metric="accuracy", calibration_max_samples=5000,
+                       calibration_seed=2026, calibration_full_dataset=False):
     """Fine-tune or continue an encoder after recording its validation baseline."""
     _force_huggingface_offline()
     local_files_only = True
@@ -635,10 +789,17 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     from torch.utils.data import SequentialSampler
 
     class OrderedValidationTrainer(tr.Trainer):
+        validation_seconds = 0.0
         def _get_eval_sampler(self, eval_dataset):
             # Keep each epoch's saved validation outputs aligned to input rows.
             # Training still uses its configured length-grouped sampler.
             return SequentialSampler(eval_dataset)
+        def evaluate(self, *args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return super().evaluate(*args, **kwargs)
+            finally:
+                self.validation_seconds += time.perf_counter() - started
 
     live_callback = _live_training_progress_callback(TrainerCallback, out)
     epoch_prediction_callback = _epoch_prediction_capture_callback(
@@ -653,6 +814,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     best_state = {"metric": -1.0, "accuracy": None, "balanced_accuracy": None, "epoch": None}
 
     class BestCheckpointCallback(TrainerCallback):
+        save_seconds = 0.0
         def on_evaluate(self, args, state, control, metrics=None, **kwargs):
             metric_value = (metrics or {}).get(f"eval_{checkpoint_selection_metric}")
             if select_best_checkpoint and metric_value is not None and float(metric_value) > best_state["metric"]:
@@ -663,11 +825,13 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 if best_dir.exists():
                     shutil.rmtree(best_dir)
                 best_dir.mkdir(parents=True, exist_ok=True)
+                save_started = time.perf_counter()
                 model.save_pretrained(best_dir, safe_serialization=True)
                 tokenizer.save_pretrained(best_dir)
                 (best_dir / "selection.json").write_text(json.dumps({
                     "metric": f"validation_{checkpoint_selection_metric}", "epoch": best_state["epoch"],
                     "value": best_state["metric"]}, indent=2) + "\n")
+                self.save_seconds += time.perf_counter() - save_started
             return control
 
     encoder_steps_per_epoch = max(1, math.ceil(len(train) / (effective_batch_size * gradient_accumulation_steps)))
@@ -701,11 +865,12 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
 
     callbacks = [live_callback, epoch_prediction_callback]
     early_stopping_callback = None
+    best_checkpoint_callback = BestCheckpointCallback()
     if validation_labels is not None:
         early_stopping_callback = _accuracy_early_stopping_callback(
             TrainerCallback, early_stopping_patience, metric=checkpoint_selection_metric)
         callbacks.append(early_stopping_callback)
-        callbacks.append(BestCheckpointCallback)
+        callbacks.append(best_checkpoint_callback)
     trainer = trainer_type(model=model, args=args, train_dataset=train, data_collator=data_collator,
         eval_dataset=val if validation_labels is not None else None,
         compute_metrics=compute_metrics if validation_labels is not None else None,
@@ -737,7 +902,9 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 chunks.append(output.logits.float().cpu().numpy())
         return np.concatenate(chunks, axis=0) if chunks else np.empty((0, len(classes)))
 
+    baseline_validation_started = time.perf_counter()
     baseline_logits = predict_in_input_order(validation_text)
+    baseline_validation_seconds = time.perf_counter() - baseline_validation_started
     baseline_predictions = np.asarray(classes)[baseline_logits.argmax(axis=1)]
     from sklearn.metrics import accuracy_score, balanced_accuracy_score, log_loss
     baseline_metrics = {
@@ -748,7 +915,10 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     }
     (out / "baseline_validation.json").write_text(json.dumps(baseline_metrics, indent=2) + "\n")
     live_callback.set_baseline(baseline_metrics)
+    startup_seconds = max(0.0, time.perf_counter() - start - baseline_validation_seconds)
+    training_started = time.perf_counter()
     trainer.train()
+    training_seconds = time.perf_counter() - training_started
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     (Path(output_dir)/"training_log.json").write_text(json.dumps(trainer.state.log_history, indent=2)+"\n")
     if select_best_checkpoint:
@@ -763,13 +933,24 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "selected_validation_accuracy": best_state["accuracy"],
             "selected_validation_balanced_accuracy": best_state["balanced_accuracy"],
             "best_checkpoint": str(best_dir)}, indent=2) + "\n")
-    train_logits = predict_in_input_order(train_text)
-    train_labels = list(y_train)
-    temperature = _fit_temperature(train_logits, train_labels, classes)
+    calibration_started = time.perf_counter()
+    calibration_indices = _calibration_indices(y_train, max_samples=calibration_max_samples,
+        seed=calibration_seed, full_dataset=calibration_full_dataset)
+    train_labels = np.asarray(y_train, dtype=object)[calibration_indices].tolist()
+    calibration_text = [train_text[index] for index in calibration_indices]
+    train_logits = predict_in_input_order(calibration_text)
+    temperature, calibration_metrics = _fit_temperature(train_logits, train_labels, classes,
+        max_samples=None, seed=calibration_seed, full_dataset=True, return_metrics=True)
+    calibration_metrics["calibration_sample_size"] = int(len(calibration_indices))
+    calibration_metrics["calibration_full_dataset"] = bool(len(calibration_indices) == len(y_train))
+    calibration_metrics["calibration_seed"] = int(calibration_seed)
+    calibration_metrics["calibration_fit_seconds"] = time.perf_counter() - calibration_started
     pred_start = time.perf_counter()
     logits = predict_in_input_order(validation_text)
     inference_seconds = time.perf_counter() - pred_start
+    checkpoint_started = time.perf_counter()
     model.save_pretrained(output_dir, safe_serialization=True); tokenizer.save_pretrained(output_dir)
+    checkpoint_save_seconds = time.perf_counter() - checkpoint_started
     if not np.isfinite(logits).all(): raise ValueError("encoder produced non-finite scores")
     probs = softmax(logits / temperature, axis=1)
     epoch_history = [dict(entry) for entry in trainer.state.log_history if "eval_accuracy" in entry]
@@ -797,6 +978,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "batch_size_probe": batch_probe,
             "fit_seconds": time.perf_counter() - start, "inference_seconds": inference_seconds,
             "classes": list(classes), "calibration_temperature": temperature, "calibration_method": "train-only scalar temperature",
+            **calibration_metrics,
             "baseline_validation_metrics": baseline_metrics,
             "validation_metrics_by_epoch": epoch_history,
             "validation_predictions_by_epoch": epoch_prediction_callback.predictions,
@@ -807,6 +989,15 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "best_validation_accuracy": best_state["accuracy"] if best_state["epoch"] is not None else None,
             "best_validation_balanced_accuracy": best_state["balanced_accuracy"] if best_state["epoch"] is not None else None,
             "checkpoint_scoring_method": "sequential_restored_model_forward",
+            "runtime_breakdown": {"startup_seconds": startup_seconds,
+                "baseline_validation_seconds": baseline_validation_seconds,
+                "training_including_validation_seconds": training_seconds,
+                "validation_seconds": float(getattr(trainer, "validation_seconds", 0.0)),
+                "final_validation_seconds": float(inference_seconds),
+                "checkpoint_save_seconds": checkpoint_save_seconds + float(best_checkpoint_callback.save_seconds),
+                "calibration_seconds": float(calibration_metrics.get("calibration_fit_seconds", 0.0)),
+                "training_excluding_validation_seconds": max(0.0, training_seconds -
+                    float(getattr(trainer, "validation_seconds", 0.0)))},
             "early_stopping": (_early_stopping_summary(early_stopping_callback, early_stopping_patience, epochs,
                                                         metric=checkpoint_selection_metric)
                                if early_stopping_callback is not None else None),
@@ -866,11 +1057,11 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
     probe_order = (sorted(range(len(dataset)), key=lambda idx: dataset_lengths[idx], reverse=True)
                    if dataset_lengths is not None else list(range(len(dataset))))
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    saved_trainable = [parameter.detach().cpu().clone() for parameter in trainable]
+    saved_trainable = [parameter.detach().clone() for parameter in trainable]
     # Trainer initializes AdamW moments lazily on its first update. Simulate a
     # full-precision AdamW update during probing so the selected batch includes
     # that persistent memory. This is conservative for lower-memory optimizers.
-    optimizer_probe = "adamw_torch"
+    optimizer_probe = str(optimizer_name)
 
     def attempt(size):
         torch.cuda.empty_cache()
@@ -894,8 +1085,10 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
             if loss is None:
                 raise RuntimeError("batch size probe needs labeled training examples")
             loss.backward()
-            probe_optimizer = torch.optim.AdamW(trainable, lr=1e-4,
-                                                weight_decay=float(weight_decay))
+            optimizer_type = getattr(torch.optim, str(optimizer_name).split("_")[-1].upper(), None)
+            if optimizer_type is None:
+                optimizer_type = torch.optim.AdamW
+            probe_optimizer = optimizer_type(trainable, lr=1e-4, weight_decay=float(weight_decay))
             probe_optimizer.step()
             torch.cuda.synchronize(device)
             peak = int(torch.cuda.max_memory_allocated(device))
@@ -917,7 +1110,7 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
                 del probe_optimizer
             with torch.no_grad():
                 for parameter, saved in zip(trainable, saved_trainable):
-                    parameter.copy_(saved.to(device=parameter.device, dtype=parameter.dtype))
+                    parameter.copy_(saved)
             del batch
             torch.cuda.empty_cache()
 
@@ -927,6 +1120,37 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
         if not getattr(model, "_qlora_quantized", False):
             model.to(device)
         model.train()
+        config = getattr(model, "config", None)
+        identity = (getattr(model, "_batch_probe_model_id", None) or
+                    getattr(config, "_name_or_path", None) or model.__class__.__qualname__)
+        cache_payload = {"model": identity, "model_class": model.__class__.__qualname__,
+            "gpu": torch.cuda.get_device_name(device), "device": str(device),
+            "precision": "bf16" if use_bf16 else "fp16" if use_fp16 else "fp32",
+            "sequence_length": max(dataset_lengths) if dataset_lengths else None,
+            "optimizer": str(optimizer_name), "gradient_checkpointing": bool(
+                getattr(getattr(model, "backbone", model), "is_gradient_checkpointing", False)),
+            "safety_fraction": float(safety_fraction),
+            "max_batch_size": maximum}
+        cache_key = hashlib.sha256(json.dumps(cache_payload, sort_keys=True).encode()).hexdigest()
+        cache_path = Path(os.environ.get("NLM_BATCH_SIZE_CACHE", "artifacts/cache/batch_sizes")) / f"{cache_key}.json"
+        cached_size = None
+        if cache_path.is_file():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                candidate_size = int(cached.get("selected_batch_size", 0))
+                if cached.get("cache_key") == cache_key and 0 < candidate_size <= maximum:
+                    cached_size = candidate_size
+            except (OSError, ValueError, json.JSONDecodeError):
+                cached_size = None
+        if cached_size is not None and attempt(cached_size):
+            report.update({"status": "cached_validated", "selected_batch_size": cached_size,
+                           "cache_key": cache_key, "cache_validation_passes": 1,
+                           "configured_optimizer": str(optimizer_name),
+                           "probe_optimizer": optimizer_probe,
+                           "optimizer_state_included": True})
+            return cached_size, report
+        if cached_size is not None:
+            cache_path.unlink(missing_ok=True)
         successful = 0
         failed = None
         candidate = 1
@@ -950,11 +1174,15 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
                 else:
                     high = mid - 1
         report.update({"status": "selected", "selected_batch_size": successful,
+                       "cache_key": cache_key,
                        "configured_optimizer": str(optimizer_name),
                        "probe_optimizer": optimizer_probe,
                        "optimizer_state_included": True,
                        "peak_probe_allocated_bytes": max(
                            (x.get("peak_allocated_bytes", 0) for x in report["attempts"]), default=0)})
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({"cache_key": cache_key,
+            "selected_batch_size": successful, "config": cache_payload}, indent=2) + "\n")
         return successful, report
     finally:
         model.zero_grad(set_to_none=True)
@@ -1012,7 +1240,9 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          warmup_epochs=None, optimizer="adamw_torch", weight_decay=0.0,
                          early_stopping_patience=2, trust_remote_code=False,
                          quantization="none", attention_backend=None,
-                         checkpoint_selection_metric="accuracy"):
+                         checkpoint_selection_metric="accuracy", save_epoch_checkpoints=False,
+                         calibration_max_samples=5000, calibration_seed=2026,
+                         calibration_full_dataset=False):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
     _force_huggingface_offline()
     torch, tr = _require_neural()
@@ -1042,6 +1272,10 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         raise ValueError("quantization must be 'none' or 'qlora4'")
     if attention_backend not in {None, "sdpa", "flash_attention_2"}:
         raise ValueError("attention_backend must be 'sdpa', 'flash_attention_2', or None")
+    checkpointing_limit = (int(max_batch_size or batch_size) if auto_batch_size else int(batch_size))
+    checkpointing_disabled_for_batch = bool(gradient_checkpointing and checkpointing_limit > 8)
+    if checkpointing_disabled_for_batch:
+        gradient_checkpointing = False
     load_kwargs = {"attn_implementation": attention_backend} if attention_backend else {}
     quantization_config = None
     if attention_backend == "flash_attention_2":
@@ -1128,6 +1362,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             if self.ys is not None: item["labels"]=torch.tensor(label_map[self.ys[i]],dtype=torch.long)
             return item
     model=Head()
+    model._batch_probe_model_id = f"{checkpoint}@{revision}"
     if resume_checkpoint:
         classifier_path = Path(resume_checkpoint)/"classifier.pt"
         if not classifier_path.is_file(): raise FileNotFoundError(f"continuation checkpoint has no classifier head: {classifier_path}")
@@ -1144,6 +1379,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     out=Path(output_dir)
     checkpoint_metadata = {
         "checkpoint": checkpoint, "revision": revision,
+        "max_length": int(max_length), "task_prefix": str(task_prefix),
+        "classes": list(classes), "pooling": "attention-mask mean",
         "quantization": quantization, "quantization_config": quantization_config,
         "attention_backend": attention_backend,
         "lora_rank": int(lora_rank), "lora_alpha": int(lora_alpha),
@@ -1151,20 +1388,37 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "gradient_checkpointing": bool(gradient_checkpointing),
     }
     class EpochSnapshotCallback(TrainerCallback):
-        def __init__(self): self.checkpoints=[]; self.validation_predictions=[]
+        def __init__(self):
+            self.checkpoints=[]; self.validation_predictions=[]; self.best_state=None
+            self.save_seconds=0.0; self.snapshot_seconds=0.0
         def on_evaluate(self,args,state,control,metrics=None,**kwargs):
             epoch=int(round(state.epoch or len(self.checkpoints)+1))
             logits=captured_validation_prediction.pop("logits",None)
             if logits is not None:
                 self.validation_predictions.append({"epoch":epoch,"scores":logits})
-            epoch_dir=out/f"epoch-{epoch:02d}"
-            epoch_dir.mkdir(parents=True,exist_ok=True)
-            model.backbone.save_pretrained(epoch_dir,safe_serialization=True)
-            tokenizer.save_pretrained(epoch_dir)
-            torch.save({k:v.detach().cpu() for k,v in model.classifier.state_dict().items()},epoch_dir/"classifier.pt")
-            (epoch_dir/"checkpoint_manifest.json").write_text(json.dumps(checkpoint_metadata,indent=2)+"\n")
-            (epoch_dir/"validation_metrics.json").write_text(json.dumps(metrics or {},indent=2)+"\n")
-            self.checkpoints.append(str(epoch_dir))
+            snapshot_started = time.perf_counter()
+            from peft import get_peft_model_state_dict
+            captured_state = {"adapter": {k:v.detach().cpu().clone() for k,v in
+                get_peft_model_state_dict(backbone).items()},
+                "classifier": {k:v.detach().cpu().clone() for k,v in model.classifier.state_dict().items()},
+                "metrics": dict(metrics or {}), "epoch": epoch}
+            metric_value = (metrics or {}).get(f"eval_{checkpoint_selection_metric}")
+            if metric_value is not None and (self.best_state is None or
+                    float(metric_value) > float(self.best_state["metrics"].get(
+                        f"eval_{checkpoint_selection_metric}", -float("inf")))):
+                self.best_state = captured_state
+            self.snapshot_seconds += time.perf_counter() - snapshot_started
+            if save_epoch_checkpoints:
+                save_started = time.perf_counter()
+                epoch_dir=out/f"epoch-{epoch:02d}"
+                epoch_dir.mkdir(parents=True,exist_ok=True)
+                model.backbone.save_pretrained(epoch_dir,safe_serialization=True)
+                tokenizer.save_pretrained(epoch_dir)
+                torch.save(captured_state["classifier"],epoch_dir/"classifier.pt")
+                (epoch_dir/"checkpoint_manifest.json").write_text(json.dumps(checkpoint_metadata,indent=2)+"\n")
+                (epoch_dir/"validation_metrics.json").write_text(json.dumps(metrics or {},indent=2)+"\n")
+                self.checkpoints.append(str(epoch_dir))
+                self.save_seconds += time.perf_counter() - save_started
             return control
     snapshot_callback=EpochSnapshotCallback()
     progress_callback=_live_training_progress_callback(TrainerCallback, out)
@@ -1197,23 +1451,13 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             max_batch_size=max_batch_size or batch_size,
             safety_fraction=batch_probe_safety_fraction, use_bf16=use_bf16, use_fp16=use_fp16,
             optimizer_name=optimizer, weight_decay=weight_decay)
-    checkpointing_disabled_for_batch = False
     checkpointing_probe_batch_size = int(effective_batch_size)
-    if gradient_checkpointing and effective_batch_size > 8:
+    if checkpointing_disabled_for_batch:
         disable_checkpointing = getattr(backbone, "gradient_checkpointing_disable", None)
-        if disable_checkpointing is None:
-            raise RuntimeError("batch size exceeded 8 but the model cannot disable gradient checkpointing")
-        disable_checkpointing()
-        gradient_checkpointing = False
-        checkpointing_disabled_for_batch = True
-        # The memory probe must reflect the mode that will actually train.
-        if auto_batch_size:
-            effective_batch_size, batch_probe = _probe_max_batch_size(
-                model, train_dataset, requested_batch_size=batch_size,
-                max_batch_size=max_batch_size or batch_size,
-                safety_fraction=batch_probe_safety_fraction, use_bf16=use_bf16, use_fp16=use_fp16,
-                optimizer_name=optimizer, weight_decay=weight_decay)
-        batch_probe["gradient_checkpointing_reprobed_without_checkpointing"] = True
+        if disable_checkpointing is None and quantization != "qlora4":
+            raise RuntimeError("batch size threshold requires the model to disable gradient checkpointing")
+        if disable_checkpointing is not None:
+            disable_checkpointing()
     out.mkdir(parents=True,exist_ok=True)
     batch_probe.update({"requested_batch_size":int(batch_size),
                         "effective_batch_size":effective_batch_size,
@@ -1240,8 +1484,15 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         remove_unused_columns=False,dataloader_num_workers=0,
         **_length_grouping_args(tr))
     class OrderedValidationTrainer(tr.Trainer):
+        validation_seconds = 0.0
         def _get_eval_sampler(self, eval_dataset):
             return SequentialSampler(eval_dataset)
+        def evaluate(self, *args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return super().evaluate(*args, **kwargs)
+            finally:
+                self.validation_seconds += time.perf_counter() - started
 
     trainer_type=OrderedValidationTrainer
     if scheduler == "epoch_decay":
@@ -1261,7 +1512,10 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         compute_metrics=compute_metrics if eval_each_epoch else None,
         callbacks=([snapshot_callback,progress_callback,early_stopping_callback]
                    if eval_each_epoch else [progress_callback]))
+    startup_seconds = time.perf_counter() - start
+    training_started = time.perf_counter()
     trainer.train()
+    training_seconds = time.perf_counter() - training_started
     out.mkdir(parents=True,exist_ok=True)
     (out/"training_log.json").write_text(json.dumps(trainer.state.log_history, indent=2)+"\n")
     eval_history = [entry for entry in trainer.state.log_history if "eval_balanced_accuracy" in entry]
@@ -1289,19 +1543,11 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         best_epoch = int(round(float(selected["epoch"])))
         best_validation_accuracy = float(selected["eval_accuracy"])
         best_validation_balanced_accuracy = float(selected["eval_balanced_accuracy"])
-        selected_dir = Path(snapshot_callback.checkpoints[best_epoch - 1])
-        adapter_path = selected_dir / "adapter_model.safetensors"
-        if adapter_path.is_file():
-            from safetensors.torch import load_file
-            adapter_state = load_file(str(adapter_path), device="cpu")
-        else:
-            adapter_path = selected_dir / "adapter_model.bin"
-            if not adapter_path.is_file():
-                raise FileNotFoundError(f"epoch {best_epoch} has no saved LoRA adapter: {selected_dir}")
-            adapter_state = torch.load(adapter_path, map_location="cpu", weights_only=True)
-        from peft.utils.save_and_load import set_peft_model_state_dict
-        set_peft_model_state_dict(backbone, adapter_state, adapter_name="default")
-        model.classifier.load_state_dict(torch.load(selected_dir / "classifier.pt", map_location="cpu", weights_only=True))
+        selected_state = snapshot_callback.best_state
+        if selected_state is None or selected_state["epoch"] != best_epoch:
+            raise RuntimeError("selected Qwen epoch has no captured adapter and classifier state")
+        _restore_qwen_selected_state(backbone, model.classifier,
+            selected_state["adapter"], selected_state["classifier"])
     selection = {"metric": f"validation_{checkpoint_selection_metric}" if eval_each_epoch else None,
                  "best_epoch": best_epoch,
                  "best_validation_accuracy": best_validation_accuracy,
@@ -1333,14 +1579,26 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                 chunks.append(output.logits.float().cpu().numpy())
         return np.concatenate(chunks, axis=0) if chunks else np.empty((0, len(classes)))
 
-    train_logits = predict_restored_model(train_text)
-    temperature = _fit_temperature(train_logits, list(y_train), classes)
+    calibration_started = time.perf_counter()
+    calibration_indices = _calibration_indices(y_train, max_samples=calibration_max_samples,
+        seed=calibration_seed, full_dataset=calibration_full_dataset)
+    calibration_labels = np.asarray(y_train, dtype=object)[calibration_indices].tolist()
+    calibration_text = [train_text[index] for index in calibration_indices]
+    train_logits = predict_restored_model(calibration_text)
+    temperature, calibration_metrics = _fit_temperature(train_logits, calibration_labels, classes,
+        max_samples=None, seed=calibration_seed, full_dataset=True, return_metrics=True)
+    calibration_metrics["calibration_sample_size"] = int(len(calibration_indices))
+    calibration_metrics["calibration_full_dataset"] = bool(len(calibration_indices) == len(y_train))
+    calibration_metrics["calibration_seed"] = int(calibration_seed)
+    calibration_metrics["calibration_fit_seconds"] = time.perf_counter() - calibration_started
     pred_start = time.perf_counter()
     logits = predict_restored_model(validation_text)
     inference_seconds = time.perf_counter() - pred_start
+    checkpoint_started = time.perf_counter()
     backbone.save_pretrained(out,safe_serialization=True);tokenizer.save_pretrained(out)
     torch.save(model.classifier.state_dict(),out/"classifier.pt")
     (out/"checkpoint_manifest.json").write_text(json.dumps(checkpoint_metadata,indent=2)+"\n")
+    checkpoint_save_seconds = time.perf_counter() - checkpoint_started
     if not np.isfinite(logits).all(): raise ValueError("Qwen adapter produced non-finite scores")
     probs=softmax(logits/temperature,axis=1)
     validation_loss_raw = (selected.get("eval_loss") if eval_each_epoch else None)
@@ -1365,6 +1623,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "fit_seconds":time.perf_counter()-start,"inference_seconds":inference_seconds,
         "classes":list(classes),"trainable_parameters":trainable,"calibration_temperature":temperature,
         "calibration_method":"train-only scalar temperature",
+        **calibration_metrics,
         "validation_metrics_by_epoch":validation_metrics_by_epoch,
         "validation_loss_raw": (float(validation_loss_raw)
                                 if validation_loss_raw is not None else None),
@@ -1378,6 +1637,15 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "best_validation_balanced_accuracy":best_validation_balanced_accuracy,
         "checkpoint_selection_metric":f"validation_{checkpoint_selection_metric}" if eval_each_epoch else None,
         "checkpoint_scoring_method":"restored_model_direct_forward",
+        "runtime_breakdown":{"startup_seconds":startup_seconds,
+            "training_including_validation_seconds":training_seconds,
+            "validation_seconds":float(getattr(trainer,"validation_seconds",0.0)),
+            "final_validation_seconds":float(inference_seconds),
+            "checkpoint_save_seconds":checkpoint_save_seconds+snapshot_callback.save_seconds,
+            "checkpoint_snapshot_seconds":snapshot_callback.snapshot_seconds,
+            "calibration_seconds":float(calibration_metrics.get("calibration_fit_seconds",0.0)),
+            "training_excluding_validation_seconds":max(0.0,training_seconds-
+                float(getattr(trainer,"validation_seconds",0.0)))},
         "requested_batch_size":int(batch_size),"effective_batch_size":effective_batch_size,
         "lr_scheduler_type":scheduler,"warmup_ratio":float(warmup_ratio),
         "batch_size_probe":batch_probe,

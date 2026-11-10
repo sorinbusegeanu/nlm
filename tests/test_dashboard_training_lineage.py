@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dashboard.training_lineage import training_lineage
+from dashboard.training_lineage import training_lineage, trainer_completion
 
 
 class TrainingLineageTests(unittest.TestCase):
@@ -45,6 +45,26 @@ class TrainingLineageTests(unittest.TestCase):
             current = {"experiment_id": "third", "dataset": "v0",
                        "continued_from_experiment": "second"}
             self.assertEqual(training_lineage(current, tmp), "V1-all → V0 → V0")
+
+    def test_trainer_completion_distinguishes_postprocessing_from_next_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            progress = Path(tmp, "training_progress.json")
+            progress.write_text("{}")
+            log = Path(tmp, "training_log.json")
+            log.write_text(json.dumps([
+                {"eval_accuracy": 0.5, "epoch": 6.0},
+                {"train_runtime": 26986.8, "epoch": 6.0},
+            ]))
+            self.assertEqual(trainer_completion(progress), {"finished": True, "epoch": 6})
+
+    def test_active_training_log_without_runtime_is_not_marked_finished(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            progress = Path(tmp, "training_progress.json")
+            progress.write_text("{}")
+            Path(tmp, "training_log.json").write_text(json.dumps([
+                {"eval_accuracy": 0.5, "epoch": 6.0},
+            ]))
+            self.assertEqual(trainer_completion(progress), {"finished": False, "epoch": None})
 
 
 if __name__ == "__main__":

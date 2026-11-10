@@ -15,7 +15,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.registry import Registry
-from dashboard.training_lineage import training_lineage
+from dashboard.training_lineage import training_lineage, trainer_completion
 
 st.set_page_config(page_title="Name That LLM experiments", layout="wide")
 st.title("Name That LLM — experiment results")
@@ -164,6 +164,12 @@ def live_training_banner():
         return
     config = live["config"]
     title = config.get("experiment_name") or live["model"]
+    trainer_state = trainer_completion(live.get("progress_path"))
+    if trainer_state["finished"]:
+        epoch = trainer_state.get("epoch")
+        epoch_text = f" after epoch {epoch}" if epoch is not None else ""
+        st.info(f"Training finished{epoch_text}; post-training pipeline work is still running for {title} · {model_display(live['model'])} · PID {live['pid']}.")
+        return
     epoch_limit = int(config.get("epochs", 0) or 0)
     completed_epochs = 0
     progress_path = live.get("progress_path")
@@ -261,6 +267,11 @@ def render_current_training():
         st.caption("No model is currently training.")
         return
     config = live_training["config"]
+    trainer_state = trainer_completion(live_training.get("progress_path"))
+    if trainer_state["finished"]:
+        epoch = trainer_state.get("epoch")
+        epoch_text = f" at epoch {epoch}" if epoch is not None else ""
+        st.caption(f"Trainer has finished{epoch_text}; the pipeline process is completing post-training work.")
     st.markdown(f"**Model:** {model_display(live_training['model'])}")
     st.markdown(f"**Epochs:** {config.get('epochs', '—')}")
     st.markdown("**Training parameters**")

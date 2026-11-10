@@ -8,6 +8,13 @@ artifacts/
 artifacts/checkpoints/
 artifacts/runs/
 artifacts/final_runs/
+# Generated experiment splits and model/checkpoint caches outside artifacts/.
+/analysis-output/**/split_data/
+**/checkpoints/
+**/checkpoint/
+**/model_cache/
+**/models/
+**/cache/
 experiments/*.sqlite
 experiments/*.sqlite-*
 

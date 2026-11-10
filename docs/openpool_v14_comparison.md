@@ -1,8 +1,8 @@
-# Open Pool V14 comparison (download folder `open_pool_v12`)
+# Open Pool V14 comparison (download folder `Open Pool V14`)
 
 ## Release identity and method
 
-The requested Kaggle dataset is currently **V14**, distributed as Kaggle dataset version **16**; Kaggle metadata dates that version to **2026-11-09**. The local folder name `open_pool_v12` is retained as requested, but the downloaded release is not V12. Kaggle’s listing describes V14 as 223,840 passages and documents 11,501 additions plus removal of 284 rows in the V14 update. The download was made 2026-11-10. Source and per-file sizes/SHA-256 hashes are recorded in [`data/raw/open_pool_v12/README.md`](../data/raw/open_pool_v12/README.md). [Kaggle dataset page](https://www.kaggle.com/datasets/crtproduction/name-that-llm-open-pool) · [Kaggle dataset metadata](https://www.kaggle.com/api/v1/datasets/view/crtproduction/name-that-llm-open-pool)
+The requested Kaggle dataset is currently **V14**, distributed as Kaggle dataset version **16**; Kaggle metadata dates that version to **2026-11-09**. The local folder name `Open Pool V14` is the renamed local folder, matching the verified release. Kaggle’s listing describes V14 as 223,840 passages and documents 11,501 additions plus removal of 284 rows in the V14 update. The download was made 2026-11-10. Source and per-file sizes/SHA-256 hashes are recorded in [README.md](<../data/raw/Open Pool V14/README.md>). [Kaggle dataset page](https://www.kaggle.com/datasets/crtproduction/name-that-llm-open-pool) · [Kaggle dataset metadata](https://www.kaggle.com/api/v1/datasets/view/crtproduction/name-that-llm-open-pool)
 
 Comparison uses the main V14, V11 and B2M parquet files, with separate accounting for the Gemini 3.7 sidecars. A response key is Unicode NFKC-normalized, case-folded, and whitespace-collapsed. Punctuation and wording are otherwise unchanged. These are exact normalized-text matches, not semantic or near-duplicate matches. The main files each contain one row per normalized response, with no empty response or within-file normalized duplicate; no conflicting labels were found within any main file.
 

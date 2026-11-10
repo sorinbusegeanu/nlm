@@ -48,3 +48,26 @@ def training_lineage(manifest: dict, manifest_dir: str | Path, _visited=None) ->
     if target:
         parts.append(_display_dataset(target))
     return " → ".join(parts) if parts else None
+
+
+def trainer_completion(progress_path: str | Path | None) -> dict:
+    """Detect that Trainer has stopped even if the enclosing pipeline PID remains alive."""
+    if progress_path is None:
+        return {"finished": False, "epoch": None}
+    training_log = Path(progress_path).with_name("training_log.json")
+    try:
+        history = json.loads(training_log.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {"finished": False, "epoch": None}
+    if not isinstance(history, list):
+        return {"finished": False, "epoch": None}
+    summary = next((entry for entry in reversed(history)
+                    if isinstance(entry, dict) and entry.get("train_runtime") is not None), None)
+    if summary is None:
+        return {"finished": False, "epoch": None}
+    epoch = summary.get("epoch")
+    try:
+        epoch = int(round(float(epoch))) if epoch is not None else None
+    except (TypeError, ValueError):
+        epoch = None
+    return {"finished": True, "epoch": epoch}
