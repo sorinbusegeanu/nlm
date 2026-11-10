@@ -383,7 +383,7 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                     patch.object(pipeline, "_continuation_source_matches", return_value=True), \
                     patch.object(pipeline, "_dataset_max_length", return_value=16), \
                     patch("src.model_factory.train_qwen_lora_fold", side_effect=fake_qwen), \
-                    patch("src.model_factory.train_encoder_fold", side_effect=fake_encoder), \
+                    patch.object(pipeline, "train_encoder_fold", side_effect=fake_encoder), \
                     patch.object(pipeline, "Registry"):
                 pipeline.continue_qwen("v1", data_dir=str(data), artifact_dir=str(artifacts),
                     registry_path=str(root / "registry.sqlite"), from_experiment="qwen-source",
