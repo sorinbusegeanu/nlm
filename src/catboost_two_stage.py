@@ -346,7 +346,9 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
     manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
     (stage_artifact_dir / f"{experiment_id}_metrics.json").write_text(
         json.dumps(manifest, indent=2, allow_nan=False) + "\n")
-    manifest["runtime_breakdown"]["total_post_training_seconds"] = time.perf_counter() - post_training_started
+    manifest["runtime_breakdown"]["total_post_training_seconds"] = (
+        float(manifest["runtime_breakdown"].get("model_post_training_seconds", 0.0)) +
+        time.perf_counter() - post_training_started)
     manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
     (stage_artifact_dir / f"{experiment_id}_metrics.json").write_text(
         json.dumps(manifest, indent=2, allow_nan=False) + "\n")

@@ -422,7 +422,8 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
             "calibration_rows_per_second": (calibration_metrics.get("calibration_sample_size", 0) /
                 calibration_inference_seconds if calibration_inference_seconds else None),
             "effective_inference_batch_size": None,
-            "checkpoint_serialization_seconds": float(checkpoint_save_seconds)},
+            "checkpoint_serialization_seconds": float(checkpoint_save_seconds),
+            "model_post_training_seconds": float(time.perf_counter() - post_training_started)},
         "classes": list(classes), "calibration_temperature": temperature,
         **calibration_metrics,
         "calibration_enabled": calibration_enabled,
@@ -1107,6 +1108,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     training_started = time.perf_counter()
     trainer.train()
     training_seconds = time.perf_counter() - training_started
+    post_training_started = time.perf_counter()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     (Path(output_dir)/"training_log.json").write_text(json.dumps(trainer.state.log_history, indent=2)+"\n")
     best_checkpoint_restoration_seconds = 0.0
@@ -1225,7 +1227,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 "checkpoint_serialization_seconds": float(checkpoint_save_seconds + best_checkpoint_callback.save_seconds),
                 "best_checkpoint_state_snapshot_seconds": float(best_state["snapshot_seconds"]),
                 "training_excluding_validation_seconds": max(0.0, training_seconds -
-                    float(getattr(trainer, "validation_seconds", 0.0)))},
+                    float(getattr(trainer, "validation_seconds", 0.0))),
+                "model_post_training_seconds": float(time.perf_counter() - post_training_started)},
             "early_stopping": (_early_stopping_summary(early_stopping_callback, early_stopping_patience, epochs,
                                                         metric=checkpoint_selection_metric)
                                if early_stopping_callback is not None else None),
@@ -1774,6 +1777,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     training_started = time.perf_counter()
     trainer.train()
     training_seconds = time.perf_counter() - training_started
+    post_training_started = time.perf_counter()
     out.mkdir(parents=True,exist_ok=True)
     (out/"training_log.json").write_text(json.dumps(trainer.state.log_history, indent=2)+"\n")
     eval_history = [entry for entry in trainer.state.log_history if "eval_balanced_accuracy" in entry]
@@ -1925,7 +1929,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             "checkpoint_serialization_seconds":float(checkpoint_save_seconds+snapshot_callback.save_seconds),
             "checkpoint_snapshot_seconds":snapshot_callback.snapshot_seconds,
             "training_excluding_validation_seconds":max(0.0,training_seconds-
-                float(getattr(trainer,"validation_seconds",0.0)))},
+                float(getattr(trainer,"validation_seconds",0.0))),
+            "model_post_training_seconds":float(time.perf_counter()-post_training_started)},
         "requested_batch_size":int(batch_size),"effective_batch_size":effective_batch_size,
         "requested_inference_batch_size":requested_inference_batch_size,
         "lr_scheduler_type":scheduler,"warmup_ratio":float(warmup_ratio),

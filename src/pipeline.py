@@ -531,6 +531,7 @@ def _post_training_runtime(result):
     runtime.setdefault("manifest_prediction_export_seconds", 0.0)
     runtime.setdefault("downstream_refresh_seconds", 0.0)
     runtime.setdefault("checkpoint_snapshot_seconds", runtime.get("best_checkpoint_state_snapshot_seconds", 0.0))
+    runtime.setdefault("best_checkpoint_state_snapshot_seconds", runtime.get("checkpoint_snapshot_seconds", 0.0))
     runtime.setdefault("effective_inference_batch_size", result.get("effective_inference_batch_size"))
     runtime.setdefault("calibration_rows_per_second", result.get("calibration_rows_per_second"))
     runtime.setdefault("final_validation_rows_per_second", result.get("final_validation_rows_per_second"))
@@ -538,6 +539,7 @@ def _post_training_runtime(result):
     runtime.setdefault("prediction_export_seconds", 0.0)
     runtime.setdefault("manifest_export_seconds", 0.0)
     runtime.setdefault("total_post_training_seconds", 0.0)
+    runtime.setdefault("model_post_training_seconds", 0.0)
     return runtime
 
 
@@ -961,7 +963,9 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         manifest["checkpoint_catalog_update"] = {"status": "skipped", "reason": "disabled"}
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
         (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    runtime_breakdown["total_post_training_seconds"] = time.perf_counter() - post_training_started
+    runtime_breakdown["total_post_training_seconds"] = (
+        float(runtime_breakdown.get("model_post_training_seconds", 0.0)) +
+        time.perf_counter() - post_training_started)
     manifest["runtime_breakdown"] = runtime_breakdown
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
     (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2, default=str) + "\n")
@@ -1204,7 +1208,9 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         manifest["checkpoint_catalog_update"] = {"status":"skipped", "reason":"disabled"}
         manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
         (pred_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2)+"\n")
-    runtime_breakdown["total_post_training_seconds"]=time.perf_counter()-post_training_started
+    runtime_breakdown["total_post_training_seconds"]=(
+        float(runtime_breakdown.get("model_post_training_seconds",0.0))+
+        time.perf_counter()-post_training_started)
     manifest["runtime_breakdown"]=runtime_breakdown
     manifest_path.write_text(json.dumps(manifest,indent=2,default=str)+"\n")
     (pred_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2,default=str)+"\n")
@@ -1419,7 +1425,9 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         manifest["checkpoint_catalog_update"] = {"status":"skipped", "reason":"disabled"}
         manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
         (manifests_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2)+"\n")
-    runtime_breakdown["total_post_training_seconds"] = time.perf_counter() - post_training_started
+    runtime_breakdown["total_post_training_seconds"] = (
+        float(runtime_breakdown.get("model_post_training_seconds", 0.0)) +
+        time.perf_counter() - post_training_started)
     manifest["runtime_breakdown"] = runtime_breakdown
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
     (manifests_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2, default=str) + "\n")
