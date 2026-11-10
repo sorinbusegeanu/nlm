@@ -99,6 +99,106 @@ def make_splits(train: pd.DataFrame, seed: int = 2026, validation_fraction: floa
     return assignments
 
 
+def build_full_v0_external_scope(external: pd.DataFrame, v0: pd.DataFrame, *,
+                                 expected_classes: int = 18,
+                                 expected_v0_rows: int = 2699) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Use every external row for training and all official V0 rows for validation."""
+    external = external.copy().reset_index(drop=True)
+    v0 = v0.copy().reset_index(drop=True)
+    for label, frame in (("external", external), ("V0", v0)):
+        errors = validate_data(frame, expected_classes=expected_classes)
+        if errors:
+            raise ValueError(f"Invalid {label} dataset:\n- " + "\n- ".join(errors))
+    if expected_v0_rows is not None and len(v0) != int(expected_v0_rows):
+        raise ValueError(f"full V0 scope requires {expected_v0_rows} official rows; found {len(v0)}")
+    if set(external.model.astype(str)) != set(v0.model.astype(str)):
+        raise ValueError("external training labels differ from the official V0 labels")
+
+    external_ids = set(external.id.astype(str))
+    v0_ids = set(v0.id.astype(str))
+    id_overlap = external_ids & v0_ids
+    external_text = external.text.astype(str).map(_normal_text)
+    v0_text = v0.text.astype(str).map(_normal_text)
+    response_overlap = set(external_text) & set(v0_text)
+    external_prompt_ids = set(external.prompt_id.astype(str))
+    v0_prompt_ids = set(v0.prompt_id.astype(str))
+    prompt_id_overlap = external_prompt_ids & v0_prompt_ids
+    external_prompt_text = (set(external.prompt_canon.fillna("").astype(str).map(_normal_text)) - {""}
+                            if "prompt_canon" in external else set())
+    v0_prompt_text = (set(v0.prompt_canon.fillna("").astype(str).map(_normal_text)) - {""}
+                      if "prompt_canon" in v0 else set())
+    prompt_text_overlap = external_prompt_text & v0_prompt_text
+    overlap_counts = {
+        "id": len(id_overlap), "normalized_response_text": len(response_overlap),
+        "prompt_id": len(prompt_id_overlap), "normalized_prompt_text": len(prompt_text_overlap),
+    }
+    if any(overlap_counts.values()):
+        raise ValueError("external data overlaps full V0; refusing leakage: " +
+                         json.dumps(overlap_counts, sort_keys=True))
+
+    external = external.sort_values("id", kind="stable").reset_index(drop=True)
+    external_scoped = external.drop(columns=["split"], errors="ignore").copy()
+    external_scoped["split"] = "train"
+    external_scoped["validation_role"] = "training"
+    v0 = v0.sort_values("id", kind="stable").reset_index(drop=True)
+    v0_scoped = v0.drop(columns=["split"], errors="ignore").copy()
+    v0_scoped["split"] = "validation"
+    v0_scoped["validation_role"] = "validation_and_checkpoint_selection"
+
+    rows = pd.concat([external_scoped, v0_scoped], ignore_index=True, sort=False)
+    if rows.id.astype(str).duplicated().any():
+        raise ValueError("scoped external and V0 row IDs are not unique")
+    train_rows = external_scoped
+    validation_rows = v0_scoped
+    assignments = pd.concat([
+        external_scoped[["id", "prompt_id", "model", "split", "validation_role"]],
+        v0_scoped[["id", "prompt_id", "model", "split", "validation_role"]],
+    ], ignore_index=True, sort=False).sort_values("id", kind="stable").reset_index(drop=True)
+    split_payload = assignments.to_csv(index=False, lineterminator="\n").encode("utf-8")
+
+    def ordered_hash(values):
+        return hashlib.sha256("\n".join(sorted(map(str, values))).encode("utf-8")).hexdigest()
+
+    def normalized_content_hash(frame):
+        pairs = sorted(f"{row.id}\t{_normal_text(row.text)}"
+                       for row in frame.sort_values("id", kind="stable").itertuples())
+        return hashlib.sha256("\n".join(pairs).encode("utf-8")).hexdigest()
+
+    def prompt_content_hash(frame):
+        values = (frame.prompt_canon.fillna("").astype(str).map(_normal_text).tolist()
+                  if "prompt_canon" in frame else frame.prompt_id.astype(str).tolist())
+        return ordered_hash(value for value in values if value)
+
+    v0_by_id = v0.assign(_id=v0.id.astype(str)).sort_values("_id", kind="stable")
+    normalized_v0_text = [f"{row.id}\t{_normal_text(row.text)}" for row in v0_by_id.itertuples()]
+    profile = {
+        "validation_scope": "full_v0",
+        "selection_validation_scope": "full_v0",
+        "validation_dataset_version": "v0", "validation_rows": int(len(v0)),
+        "validation_prompt_groups": int(v0.prompt_id.nunique()),
+        "validation_ids_sha256": ordered_hash(v0.id.astype(str)),
+        "validation_normalized_text_sha256": hashlib.sha256("\n".join(normalized_v0_text).encode("utf-8")).hexdigest(),
+        "validation_prompt_ids_sha256": ordered_hash(v0.prompt_id.astype(str).unique()),
+        "validation_prompt_content_sha256": prompt_content_hash(v0),
+        "training_dataset_rows": int(len(train_rows)),
+        "training_dataset_ids_sha256": ordered_hash(train_rows.id.astype(str)),
+        "training_dataset_prompt_groups": int(train_rows.prompt_id.nunique()),
+        "training_dataset_normalized_text_sha256": normalized_content_hash(train_rows),
+        "training_dataset_prompt_content_sha256": prompt_content_hash(train_rows),
+        "training_rows": int(len(train_rows)),
+        "training_ids_sha256": ordered_hash(train_rows.id.astype(str)),
+        "training_prompt_groups": int(train_rows.prompt_id.nunique()),
+        "training_prompt_ids_sha256": ordered_hash(train_rows.prompt_id.astype(str).unique()),
+        "split_sha256": hashlib.sha256(split_payload).hexdigest(),
+        "split_method": "all external rows for training; all official V0 rows for validation",
+        "isolation_overlap_counts": overlap_counts,
+        "training_validation_overlap_counts": overlap_counts,
+        "external_v0_overlap": overlap_counts,
+        "v0_original_split_sha256": None,
+    }
+    return rows.sort_values("id", kind="stable").reset_index(drop=True), assignments, profile
+
+
 def _dataset_artifact_names(dataset_version: str) -> tuple[str, str]:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", dataset_version):
         raise ValueError("dataset_version may contain only letters, digits, dots, underscores, and hyphens")

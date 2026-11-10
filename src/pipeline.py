@@ -19,12 +19,14 @@ import joblib
 from sklearn.metrics import balanced_accuracy_score
 
 from .data_factory import (assemble_openpool_mix, assemble_v1_5, build_v1_3_external_dataset,
+                           build_full_v0_external_scope,
                            curate_openpool, curate_v1_all_balanced_deduped,
-                           curate_v1_all_clean_compact, prepare)
+                           curate_v1_all_clean_compact, prepare, _normal_text)
 from .evaluation import (align_predictions, complementarity, evaluate, paired_group_bootstrap)
 from .ensemble_factory import ensemble_probabilities
-from .feature_factory import load_or_fit
-from .model_factory import (FROZEN_BACKBONE_MODELS, calculate_max_token_length, train_encoder_fold,
+from .feature_factory import load_or_fit, stylometry
+from .model_factory import (FROZEN_BACKBONE_MODELS, calculate_max_token_length,
+                            train_encoder_fold,
                             train_frozen_backbone_fold, train_qwen_lora_fold,
                             train_catboost_stylometry, train_svc)
 from .registry import Registry
@@ -341,7 +343,18 @@ def _is_training_only_profile(profile):
             and profile.get("validation_split_sha256"))
 
 
-def _effective_profile(data_dir, dataset, rows):
+def _effective_profile(data_dir, dataset, rows, validation_scope=None):
+    if validation_scope == "full_v0":
+        scoped_path = Path(data_dir) / f"dataset_profile_{dataset}_full_v0.json"
+        if not scoped_path.is_file():
+            raise FileNotFoundError(f"full_v0 validation profile was not prepared for {dataset}")
+        profile = json.loads(scoped_path.read_text(encoding="utf-8"))
+        expected_validation = int(rows.split.eq("validation").sum())
+        expected_training = int(rows.split.eq("train").sum())
+        if (expected_validation != int(profile.get("validation_rows", -1))
+                or expected_training != int(profile.get("training_rows", -1))):
+            raise ValueError(f"{dataset} full_v0 profile row counts do not match scoped rows")
+        return profile
     profile = json.loads(_profile_path(data_dir, dataset).read_text())
     if dataset == "v0":
         return profile
@@ -371,8 +384,60 @@ def _effective_profile(data_dir, dataset, rows):
     return profile
 
 
-def _load_dataset(dataset, data_dir):
+def _load_dataset(dataset, data_dir, *, validation_scope=None):
     data_dir = Path(data_dir)
+    if validation_scope not in (None, "frozen_v0_540", "full_v0"):
+        raise ValueError("validation_scope must be 'frozen_v0_540' or 'full_v0'")
+    if validation_scope == "full_v0":
+        source_profile_path = _profile_path(data_dir, dataset)
+        source_profile = json.loads(source_profile_path.read_text(encoding="utf-8"))
+        if not _is_training_only_profile(source_profile):
+            raise ValueError(
+                f"validation_scope=full_v0 requires an external-only training dataset; "
+                f"{dataset} is not marked training_only. Use its external-only source dataset "
+                "(for example v2_openpool instead of mixed v2).")
+        external = pd.read_parquet(data_dir / f"dataset_{dataset}.parquet")
+        v0_rows, _ = _load_dataset("v0", data_dir)
+        v0_profile = json.loads(_profile_path(data_dir, "v0").read_text(encoding="utf-8"))
+        expected_v0_rows = int(v0_profile.get("rows", -1))
+        rows, assignments, scope = build_full_v0_external_scope(
+            external, v0_rows,
+            expected_classes=len(v0_profile.get("classes", [])),
+            expected_v0_rows=expected_v0_rows)
+        scope.update({
+            "dataset_version": dataset,
+            "dataset_sha256": source_profile["dataset_sha256"],
+            "external_dataset_sha256": source_profile["dataset_sha256"],
+            "source_profile_path": str(source_profile_path),
+            "v0_dataset_sha256": v0_profile["dataset_sha256"],
+            "v0_source_split_sha256": v0_profile.get("split_sha256"),
+            "validation_split_sha256": scope["split_sha256"],
+            "validation_dataset_sha256": v0_profile["dataset_sha256"],
+            "validation_ids_sha256": scope["validation_ids_sha256"],
+            "validation_hashes": {
+                "ids_sha256": scope["validation_ids_sha256"],
+                "normalized_text_sha256": scope["validation_normalized_text_sha256"],
+                "prompt_ids_sha256": scope["validation_prompt_ids_sha256"],
+                "prompt_content_sha256": scope["validation_prompt_content_sha256"],
+                "scope_split_sha256": scope["split_sha256"],
+            },
+            "classes": v0_profile.get("classes", []),
+            "training_only": True,
+        })
+        profile_path = data_dir / f"dataset_profile_{dataset}_full_v0.json"
+        split_path = data_dir / f"splits_{dataset}_full_v0.parquet"
+        if profile_path.exists() or split_path.exists():
+            if not (profile_path.is_file() and split_path.is_file()):
+                raise FileExistsError(f"partial full_v0 scope artifacts exist for {dataset}")
+            old_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            old_assignments = pd.read_parquet(split_path)
+            if (old_profile != scope or
+                    not old_assignments.equals(assignments)):
+                raise FileExistsError(f"full_v0 scope artifacts already exist with different inputs for {dataset}")
+        else:
+            assignments.to_parquet(split_path, index=False)
+            profile_path.write_text(json.dumps(scope, indent=2) + "\n", encoding="utf-8")
+        return rows, data_dir
     if dataset != "v0" and _is_training_only_profile(json.loads(_profile_path(data_dir, dataset).read_text())):
         openpool = pd.read_parquet(data_dir / f"dataset_{dataset}.parquet")
         v0_rows, _ = _load_dataset("v0", data_dir)
@@ -483,7 +548,8 @@ def _model_cfg(model, config_path=None):
     return cfg
 
 
-def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache_dir, *, cache_fold=None):
+def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache_dir, *,
+                cache_fold=None, checkpoint_selection_metric="accuracy"):
     if model == "svc":
         result = train_svc(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
                            c=cfg.get("C", .5), calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
@@ -513,7 +579,8 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             early_stopping_rounds=cfg.get("early_stopping_rounds", 100),
             feature_recipe=feature_config.get("stylometry_recipe"),
             feature_matrices=(x_train.toarray(), x_valid.toarray(),
-                              feature_transform.stylometry_feature_names))
+                              feature_transform.stylometry_feature_names),
+            checkpoint_selection_metric=checkpoint_selection_metric)
         result["cache_key"] = cache_key
         result["checkpoint"] = str(checkpoint)
     elif model == "ultrabert380":
@@ -535,7 +602,9 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             auto_batch_size=cfg.get("auto_batch_size", False),
             max_batch_size=cfg.get("max_batch_size", 1024),
             batch_probe_safety_fraction=cfg.get("batch_probe_safety_fraction", 0.95),
-            select_best_checkpoint=cfg.get("checkpoint_selection") == "highest_validation_accuracy")
+            select_best_checkpoint=(checkpoint_selection_metric == "balanced_accuracy"
+                or cfg.get("checkpoint_selection") == "highest_validation_accuracy"),
+            checkpoint_selection_metric=checkpoint_selection_metric)
         result["checkpoint"] = str(checkpoint)
     elif model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen":
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
@@ -577,7 +646,8 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             weight_decay=cfg.get("weight_decay", 0.0),
             trust_remote_code=cfg.get("trust_remote_code", False),
             quantization=cfg.get("quantization", "none"),
-            attention_backend=cfg.get("attention_backend"))
+            attention_backend=cfg.get("attention_backend"),
+            checkpoint_selection_metric=checkpoint_selection_metric)
         result["checkpoint"] = str(checkpoint)
     else: raise ValueError(f"unknown model: {model}")
     return result
@@ -608,31 +678,50 @@ def build_features(dataset="v0", data_dir="data/processed", config_path="configs
     return report
 
 
-def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None, refresh_prediction=True):
-    """Fit one model on the fixed 80% train split and score its 20% validation split."""
+def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None, refresh_prediction=True, validation_scope=None):
+    """Train one model; optionally use an external-only split for selection and full V0 for final scoring."""
     if folds is not None:
         raise ValueError("fold selection was removed; this pipeline uses one fixed train/validation split")
     cfg = _model_cfg(model, config_path)
     if config_overrides:
         cfg.update(config_overrides)
         _validate_training_overrides(model, cfg)
+    external_only = False
+    if dataset != "v0":
+        source_profile_path = _profile_path(Path(data_dir), dataset)
+        if source_profile_path.is_file():
+            external_only = _is_training_only_profile(
+                json.loads(source_profile_path.read_text(encoding="utf-8")))
+    requested_scope = validation_scope or cfg.get("validation_scope")
+    if external_only and requested_scope not in (None, "full_v0"):
+        raise ValueError("external-only datasets must use validation_scope=full_v0")
+    scope = "full_v0" if external_only else (requested_scope or "frozen_v0_540")
+    if scope not in {"frozen_v0_540", "full_v0"}:
+        raise ValueError("validation_scope must be 'frozen_v0_540' or 'full_v0'")
+    if validation_scope is not None or cfg.get("validation_scope") is not None:
+        cfg["validation_scope"] = scope
+    if scope == "full_v0":
+        cfg["validation_scope"] = scope
     if model in {"svc", "catboost_stylometry"} and feature_config_path:
         cfg["features"] = _read_yaml(feature_config_path)
-    rows, data_dir = _load_dataset(dataset, data_dir)
+    rows, data_dir = _load_dataset(dataset, data_dir,
+        validation_scope="full_v0" if scope == "full_v0" else None)
     if model not in {"svc", "catboost_stylometry"}:
         cfg["max_length"] = _dataset_max_length(model, cfg, rows)
-    profile = _effective_profile(data_dir, dataset, rows)
+    profile = _effective_profile(data_dir, dataset, rows,
+                                 validation_scope="full_v0" if scope == "full_v0" else None)
     code_revision = _revision()
     config_snapshot = {k: v for k, v in cfg.items() if not k.startswith("_")}
     config_hash = _sha(config_snapshot)
     experiment_id = f"{model}_{dataset}_data{profile['dataset_sha256'][:8]}_split{profile['split_sha256'][:8]}_seed{seed}_cfg{config_hash[:8]}_code{code_revision[:7]}"
     run_artifact_dir = Path(artifact_dir) / "runs" / experiment_id
     pred_dir = Path(artifact_dir) / "predictions"
-    prediction_path = pred_dir / f"{experiment_id}_validation.parquet"
+    prediction_suffix = "full_v0" if scope == "full_v0" else "validation"
+    prediction_path = pred_dir / f"{experiment_id}_{prediction_suffix}.parquet"
     manifest_path = pred_dir / f"{experiment_id}_manifest.json"
     if manifest_path.exists() and prediction_path.exists():
         existing = json.loads(manifest_path.read_text())
-        if refresh_prediction and "prediction_factory_update" not in existing:
+        if scope != "full_v0" and refresh_prediction and "prediction_factory_update" not in existing:
             _refresh_ensemble_after_training(existing, manifest_path,
                 artifact_dir=artifact_dir, data_dir=data_dir)
         return existing
@@ -641,25 +730,54 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
     train = rows[rows.split.eq("train")].sort_values("id", kind="stable").reset_index(drop=True)
     valid = rows[rows.split.eq("validation")].sort_values("id", kind="stable").reset_index(drop=True)
     if set(train.prompt_id.astype(str)) & set(valid.prompt_id.astype(str)):
-        raise RuntimeError("prompt leakage between train and validation")
+        raise RuntimeError("prompt-group leakage between training and validation")
+    if scope == "full_v0":
+        for column, normalize in (("id", lambda values: values.astype(str)),
+                                  ("text", lambda values: values.astype(str).map(_normal_text)),
+                                  ("prompt_id", lambda values: values.astype(str))):
+            overlap = set(normalize(train[column])) & set(normalize(valid[column]))
+            if overlap:
+                raise RuntimeError(f"external training and full V0 validation overlap on {column}: {len(overlap)}")
+        if "prompt_canon" in train and "prompt_canon" in valid:
+            train_prompts = set(train.prompt_canon.fillna("").astype(str).map(_normal_text)) - {""}
+            validation_prompts = set(valid.prompt_canon.fillna("").astype(str).map(_normal_text)) - {""}
+            if train_prompts & validation_prompts:
+                raise RuntimeError(
+                    "external training and full V0 validation overlap on normalized prompt text: "
+                    f"{len(train_prompts & validation_prompts)}")
+    metric = "balanced_accuracy" if scope == "full_v0" else "accuracy"
     result = _train_fold(model, train, valid, classes, cfg, run_artifact_dir, seed, "validation", Path(artifact_dir)/"features",
-                         cache_fold=f"{dataset}-train-validation")
+                         cache_fold=f"{dataset}-train-validation",
+                         checkpoint_selection_metric=metric)
     scores, probabilities = result["scores"], result["probabilities"]
-    if not np.isfinite(scores).all() or not np.isfinite(probabilities).all(): raise RuntimeError("validation output is incomplete or non-finite")
-    if not np.allclose(probabilities.sum(axis=1), 1, atol=1e-5): raise RuntimeError("validation probability rows do not sum to one")
+    if (not np.isfinite(scores).all() or not np.isfinite(probabilities).all()
+            or not np.allclose(probabilities.sum(axis=1), 1, atol=1e-5)):
+        raise RuntimeError("V0 validation output is incomplete or non-finite")
     metrics = evaluate(valid.model.astype(str), scores, classes, probabilities)
     pred = valid[["id", "prompt_id", "model"]].rename(columns={"model": "y_true"}).copy()
     for i, label in enumerate(classes):
-        pred[f"score::{label}"] = scores[:, i]; pred[f"prob::{label}"] = probabilities[:, i]
+        pred[f"score::{label}"] = scores[:, i]
+        pred[f"prob::{label}"] = probabilities[:, i]
     pred_dir.mkdir(parents=True, exist_ok=True)
     pred.to_parquet(prediction_path, index=False)
     checkpoint = Path(result["checkpoint"])
     artifact_size = sum(f.stat().st_size for f in checkpoint.rglob("*") if f.is_file()) if checkpoint.is_dir() else checkpoint.stat().st_size
+    validation_ids = sorted(valid.id.astype(str))
     manifest = {"experiment_id": experiment_id, "experiment_name": config_snapshot.get("experiment_name"),
         "model": model, "dataset": dataset,
-        "split": "validation", "classes": classes, "train_rows": len(train), "validation_rows": len(valid),
+        "split": "validation", "validation_scope": scope,
+        "validation_dataset_version": "v0" if scope == "full_v0" else profile.get("validation_dataset_version", "v0"),
+        "checkpoint_selection_scope": "full_v0" if scope == "full_v0" else "frozen_v0_540",
+        "classes": classes, "train_rows": len(train), "validation_rows": len(valid),
         "train_id_sha256": hashlib.sha256("\n".join(train.id.astype(str)).encode()).hexdigest(),
-        "id_sha256": hashlib.sha256("\n".join(valid.id.astype(str)).encode()).hexdigest(),
+        "id_sha256": hashlib.sha256("\n".join(validation_ids).encode()).hexdigest(),
+        "validation_ids_sha256": hashlib.sha256("\n".join(validation_ids).encode()).hexdigest(),
+        "checkpoint_selection_rows": len(valid),
+        "checkpoint_selection_ids_sha256": hashlib.sha256("\n".join(validation_ids).encode()).hexdigest(),
+        "checkpoint_selection_prompt_groups": int(valid.prompt_id.nunique()),
+        "checkpoint_selection_prompt_ids_sha256": profile.get("validation_prompt_ids_sha256"),
+        "checkpoint_selection_normalized_text_sha256": profile.get("validation_normalized_text_sha256"),
+        "checkpoint_selection_prompt_content_sha256": profile.get("validation_prompt_content_sha256"),
         "dataset_sha256": profile["dataset_sha256"], "split_sha256": profile["split_sha256"],
         "code_revision": code_revision, "model_revision": cfg.get("revision"), "checkpoint_id": cfg.get("checkpoint"),
         "config": config_snapshot, "config_sha256": config_hash, "seed": seed,
@@ -667,7 +785,8 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         "quantization_config": result.get("quantization_config"),
         "attention_backend": result.get("attention_backend", cfg.get("attention_backend")),
         "fit_seconds": float(result["fit_seconds"]), "inference_seconds": result.get("inference_seconds"),
-        "inference_rows_per_second": len(valid) / result["inference_seconds"] if result.get("inference_seconds") else None,
+        "inference_rows_per_second": (len(valid) / result["inference_seconds"]
+            if result.get("inference_seconds") else None),
         "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"), "checkpoint_size_bytes": artifact_size,
         "calibration_method": result.get("calibration_method", "sigmoid train-only CV" if model == "svc" else "train-only scalar temperature"),
         "calibration_temperature": result.get("calibration_temperature"),
@@ -677,25 +796,45 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         "lr_scheduler_type": result.get("lr_scheduler_type", cfg.get("lr_scheduler_type", "epoch_decay")),
         "warmup_ratio": result.get("warmup_ratio", cfg.get("warmup_ratio", 0.0)),
         "validation_metrics_by_epoch": result.get("validation_metrics_by_epoch", []),
+        "validation_metrics_by_iteration": result.get("validation_metrics_by_iteration", []),
+        "validation_metrics": metrics,
+        "checkpoint_selection_metric": result.get("checkpoint_selection_metric") or
+            ("single_fit_no_epoch_selection" if model in {"svc"} or
+             (model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen")
+             else f"validation_{metric}"),
+        "selected_validation_balanced_accuracy": result.get("best_validation_balanced_accuracy",
+            result.get("selected_validation_balanced_accuracy", metrics.get("balanced_accuracy"))),
+        "early_stopping_scope": "full_v0" if scope == "full_v0" else "frozen_v0_540",
         "early_stopping": result.get("early_stopping"),
         "epoch_checkpoints": result.get("epoch_checkpoints", []),
         "selected_epoch": result.get("best_epoch"),
         "selected_iteration": result.get("selected_iteration"),
         "selected_validation_accuracy": result.get("best_validation_accuracy",
-            result.get("selected_validation_accuracy")),
+            result.get("selected_validation_accuracy", metrics.get("accuracy"))),
         "baseline_validation_metrics": result.get("baseline_validation_metrics"),
-        "checkpoint_selection_metric": result.get("checkpoint_selection_metric"),
         "checkpoint_scoring_method": result.get("checkpoint_scoring_method"),
         "feature_count": result.get("feature_count"),
         "feature_names": result.get("feature_names"),
         "feature_recipe": result.get("feature_recipe", cfg.get("feature_recipe")),
         "feature_cache_key": result.get("cache_key"), "checkpoint_path": str(checkpoint),
         "prediction_path": str(prediction_path), "prediction_sha256": hashlib.sha256(prediction_path.read_bytes()).hexdigest(),
+        "full_v0_validation": ({
+            "dataset_version": "v0", "rows": len(valid),
+            "prompt_groups": int(valid.prompt_id.nunique()),
+            "ids_sha256": profile.get("validation_ids_sha256"),
+            "normalized_text_sha256": profile.get("validation_normalized_text_sha256"),
+            "prompt_ids_sha256": profile.get("validation_prompt_ids_sha256"),
+            "prompt_content_sha256": profile.get("validation_prompt_content_sha256"),
+            "scope_split_sha256": profile.get("split_sha256"),
+            "used_for_epoch_metrics_early_stopping_and_checkpoint_choice": True,
+        } if scope == "full_v0" else None),
         "metrics": metrics, "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat()}
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     experiment_name = config_snapshot.get("experiment_name")
-    description = (f"{experiment_name}: " if experiment_name else "") + \
-        f"{model} trained on {len(train)} rows and validated on {len(valid)} prompt-grouped rows (80/20)."
+    description = (f"{experiment_name}: " if experiment_name else "") + (
+        f"{model} trained on all {len(train)} {dataset} rows; epoch validation and checkpoint selection used all "
+        f"{len(valid)} official V0 rows (balanced accuracy)." if scope == "full_v0" else
+        f"{model} trained on {len(train)} rows and validated on {len(valid)} prompt-grouped rows (80/20).")
     Registry(registry_path).add(manifest["experiment_id"], model, "validation", manifest["config"], metrics,
         dataset_hash=manifest["dataset_sha256"], code_revision=manifest["code_revision"], seed=seed,
         runtime_seconds=manifest["fit_seconds"], artifact_path=str(prediction_path), config_hash=manifest["config_sha256"],
@@ -703,9 +842,19 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         description=description)
     (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")
     _release_completed_training_model(result)
-    if refresh_prediction:
+    if refresh_prediction and scope != "full_v0":
         _refresh_ensemble_after_training(manifest, manifest_path,
             artifact_dir=artifact_dir, data_dir=data_dir)
+    elif scope == "full_v0":
+        # Existing prediction-factory roster artifacts use the historical
+        # frozen-540 scope. A full-V0 result must not silently enter that path.
+        manifest["prediction_factory_update"] = {
+            "status": "skipped", "reason": "full_v0 validation scope is not a 540-row roster candidate"}
+        manifest["checkpoint_catalog_update"] = {
+            "status": "skipped", "reason": "full_v0 validation scope requires catalog scope support"}
+        manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+        (pred_dir / f"{experiment_id}_metrics.json").write_text(
+            json.dumps(manifest, indent=2, default=str) + "\n")
     return manifest
 
 
@@ -1252,7 +1401,7 @@ def main(argv=None):
     mix=d.add_parser("assemble");mix.add_argument("--config",default="configs/data/mixed_v1_5.yaml")
     f=sub.add_parser("features").add_subparsers(dest="action",required=True);b=f.add_parser("build");b.add_argument("--dataset",default="v0");b.add_argument("--data-dir",default="data/processed");b.add_argument("--config",default="configs/features/default.yaml")
     m=sub.add_parser("models").add_subparsers(dest="action",required=True)
-    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v0");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--skip-prediction-refresh",action="store_true",help="save the model run without changing the active prediction roster or ensemble history");t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
+    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v0");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--validation-scope",choices=["frozen_v0_540","full_v0"],help="use the historical 540-row V0 split or all V0 rows for final evaluation with an external-only selection split");t.add_argument("--skip-prediction-refresh",action="store_true",help="save the model run without changing the active prediction roster or ensemble history");t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
     cq=m.add_parser("continue-qwen",help="continue the latest Qwen LoRA checkpoint and validate after every epoch")
     cq.add_argument("--dataset",default="v0");cq.add_argument("--epochs",type=int,default=4);cq.add_argument("--seed",type=int,default=2026)
     cq.add_argument("--model",choices=["qwen06","qwen17","qwen4","qwen8"],default="qwen06")
@@ -1386,7 +1535,7 @@ def main(argv=None):
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
         result=train_models(a.dataset,a.model,a.data_dir,a.artifact_dir,config_path=a.config,
             feature_config_path=a.features_config,seed=a.seed,config_overrides=overrides,
-            refresh_prediction=not a.skip_prediction_refresh)
+            refresh_prediction=not a.skip_prediction_refresh, validation_scope=a.validation_scope)
     elif a.command=="models" and a.action=="catboost-two-stage":
         from .catboost_two_stage import run_catboost_two_stage
         cfg = _model_cfg("catboost_stylometry", a.config)
