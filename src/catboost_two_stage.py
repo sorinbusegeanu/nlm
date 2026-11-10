@@ -227,6 +227,7 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         learning_rate=cfg["learning_rate"], l2_leaf_reg=cfg["l2_leaf_reg"],
         thread_count=cfg["thread_count"], seed=seed,
         temperature_calibration=cfg.get("temperature_calibration", True),
+        calibration_enabled=cfg.get("calibration_enabled", cfg.get("temperature_calibration", True)),
         calibration_max_samples=cfg.get("calibration_max_samples", 5000),
         calibration_seed=cfg.get("calibration_seed", seed),
         calibration_full_dataset=cfg.get("calibration_full_dataset", False),
@@ -257,6 +258,7 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
     stage_artifact_dir = checkpoint.parent
     prediction_path = stage_artifact_dir / f"{run_id}_validation.parquet"
     export_started = time.perf_counter()
+    post_training_started = export_started
     prediction_frame = _write_prediction_frame(prediction_path, valid, classes, scores, probabilities)
     dataset_hash = data_profile["dataset_sha256"]
     split_hash = data_profile.get("split_sha256", "")
@@ -317,6 +319,7 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         "iterations_added": int(iterations), "tree_count": int(result["tree_count"]),
         "feature_count": len(feature_names), "feature_names": feature_names,
         "feature_recipe": recipe, "calibration_method": result["calibration_method"],
+        "calibration_enabled": result.get("calibration_enabled", cfg.get("calibration_enabled", True)),
         "calibration_temperature": float(result["calibration_temperature"]),
         "calibration_sample_size": result.get("calibration_sample_size"),
         "calibration_full_dataset": result.get("calibration_full_dataset"),
@@ -337,6 +340,11 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         description=(f"{experiment} {experiment_name} stage {stage}: CatBoost trained on "
                      f"{dataset_name}, {len(train)} train rows; {len(valid)} frozen V0 validation rows."))
     manifest["runtime_breakdown"]["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
+    manifest["runtime_breakdown"]["manifest_export_seconds"] = manifest["runtime_breakdown"]["manifest_prediction_export_seconds"]
+    manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
+    (stage_artifact_dir / f"{experiment_id}_metrics.json").write_text(
+        json.dumps(manifest, indent=2, allow_nan=False) + "\n")
+    manifest["runtime_breakdown"]["total_post_training_seconds"] = time.perf_counter() - post_training_started
     manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
     (stage_artifact_dir / f"{experiment_id}_metrics.json").write_text(
         json.dumps(manifest, indent=2, allow_nan=False) + "\n")

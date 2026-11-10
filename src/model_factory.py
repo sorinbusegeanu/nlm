@@ -82,6 +82,18 @@ def _fit_temperature(train_logits, train_labels, classes, *, max_samples=5000,
                          "calibration_calibrated_loss": float(calibrated_loss)}
 
 
+def _temperature_if_enabled(train_logits, train_labels, classes, *, enabled=True,
+                            seed=2026):
+    """Fit scalar temperature when requested; otherwise return identity calibration."""
+    if not enabled:
+        return 1.0, {"calibration_enabled": False, "calibration_sample_size": None,
+                     "calibration_raw_loss": None, "calibration_calibrated_loss": None}
+    temperature, metrics = _fit_temperature(train_logits, train_labels, classes,
+        max_samples=None, seed=seed, full_dataset=True, return_metrics=True)
+    metrics["calibration_enabled"] = True
+    return temperature, metrics
+
+
 def _length_order(lengths):
     """Stable short-to-long order for dynamic-padding inference batches."""
     return np.argsort(np.asarray(lengths, dtype=np.int64), kind="stable")
@@ -110,9 +122,20 @@ def _selected_epoch_scores(epoch_predictions, selected_epoch, expected_shape):
     return None
 
 
+def _snapshot_state_dict_cpu(model):
+    """Copy a selected neural checkpoint to CPU once, without retaining GPU storage."""
+    return {key: value.detach().to(device="cpu", copy=True)
+            for key, value in model.state_dict().items()}
+
+
+def _restore_model_state(model, state):
+    """Restore a previously captured full model state exactly."""
+    model.load_state_dict(state)
+
+
 def _predict_cached_dataset(model, dataset, *, batch_size, data_collator, device,
-                            amp_dtype=None, num_workers=0):
-    """Infer over pre-tokenized rows in length order, restoring original alignment."""
+                            amp_dtype=None, num_workers=0, return_info=False):
+    """Infer length-grouped cached rows, retrying CUDA OOMs at smaller batches."""
     import torch
     from torch.utils.data import DataLoader, Subset
 
@@ -124,23 +147,45 @@ def _predict_cached_dataset(model, dataset, *, batch_size, data_collator, device
         raise ValueError("cached inference dataset must expose token lengths")
     order = _length_order(lengths)
     ordered = Subset(dataset, order.tolist())
-    loader = DataLoader(ordered, batch_size=max(1, int(batch_size)), shuffle=False,
-                        collate_fn=data_collator, num_workers=int(num_workers))
-    chunks = []
+    effective_batch_size = max(1, int(batch_size))
+    fallback_count = 0
+    started = time.perf_counter()
     model.eval()
-    with torch.inference_mode():
-        for batch in loader:
-            batch = {key: value.to(device) for key, value in batch.items()}
-            amp = (torch.autocast(device_type="cuda", dtype=amp_dtype)
-                   if getattr(device, "type", None) == "cuda" and amp_dtype is not None
-                   else nullcontext())
-            with amp:
-                output = model(**batch)
-            logits = output.logits if hasattr(output, "logits") else output
-            chunks.append(logits.float().cpu().numpy())
-    sorted_predictions = (np.concatenate(chunks, axis=0) if chunks
-                          else np.empty((0, 0), dtype=np.float32))
-    return _restore_prediction_order(sorted_predictions, order)
+    while True:
+        chunks = []
+        batch = output = logits = None
+        try:
+            loader = DataLoader(ordered, batch_size=effective_batch_size, shuffle=False,
+                                collate_fn=data_collator, num_workers=int(num_workers))
+            with torch.inference_mode():
+                for batch in loader:
+                    batch = {key: value.to(device) for key, value in batch.items()}
+                    amp = (torch.autocast(device_type="cuda", dtype=amp_dtype)
+                           if getattr(device, "type", None) == "cuda" and amp_dtype is not None
+                           else nullcontext())
+                    with amp:
+                        output = model(**batch)
+                    logits = output.logits if hasattr(output, "logits") else output
+                    chunks.append(logits.float().cpu().numpy())
+            sorted_predictions = (np.concatenate(chunks, axis=0) if chunks
+                                  else np.empty((0, 0), dtype=np.float32))
+            predictions = _restore_prediction_order(sorted_predictions, order)
+            elapsed = time.perf_counter() - started
+            info = {"effective_inference_batch_size": effective_batch_size,
+                    "inference_oom_fallbacks": fallback_count,
+                    "inference_rows_per_second": (len(predictions) / elapsed if elapsed else None),
+                    "inference_seconds": elapsed}
+            return (predictions, info) if return_info else predictions
+        except (RuntimeError, getattr(torch.cuda, "OutOfMemoryError", RuntimeError)) as exc:
+            is_oom = "out of memory" in str(exc).lower() or "cuda oom" in str(exc).lower()
+            if not is_oom or effective_batch_size <= 1:
+                raise
+            effective_batch_size = max(1, effective_batch_size // 2)
+            fallback_count += 1
+            del chunks
+            batch = output = logits = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def _validation_losses(y_true, raw_scores, calibrated_probabilities, classes):
@@ -230,6 +275,7 @@ class _BalancedAccuracyMetric:
 def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, output_dir,
                               iterations=800, depth=7, learning_rate=.05, l2_leaf_reg=5.0,
                               thread_count=8, seed=2026, temperature_calibration=True,
+                              calibration_enabled=None,
                               validation_labels=None, early_stopping_rounds=100,
                               feature_recipe=None, feature_matrices=None, init_model=None,
                               checkpoint_metadata=None, checkpoint_selection_metric="balanced_accuracy",
@@ -241,6 +287,8 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
     except ImportError as exc:
         raise RuntimeError("CatBoost model requires catboost; install the project's requirements.txt") from exc
     start = time.perf_counter()
+    calibration_enabled = (bool(temperature_calibration) if calibration_enabled is None
+                           else bool(calibration_enabled))
     if checkpoint_selection_metric not in {"accuracy", "balanced_accuracy"}:
         raise ValueError("checkpoint_selection_metric must be accuracy or balanced_accuracy")
     feature_recipe = {"baseline": list(DEFAULT_STYLOMETRY_RECIPE["baseline"]),
@@ -292,8 +340,10 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
     if validation_raw.ndim == 1:
         validation_raw = np.column_stack([-validation_raw, validation_raw])
     raw = _aligned(validation_raw, model_classes, classes)
-    calibration_metrics = {}
-    if temperature_calibration:
+    calibration_metrics = {"calibration_enabled": calibration_enabled}
+    calibration_inference_seconds = 0.0
+    temperature_fit_seconds = 0.0
+    if calibration_enabled:
         calibration_inference_started = time.perf_counter()
         calibration_indices = _calibration_indices(y_train, max_samples=calibration_max_samples,
             seed=calibration_seed, full_dataset=calibration_full_dataset)
@@ -304,14 +354,15 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         train_raw = _aligned(train_raw, model_classes, classes)
         calibration_inference_seconds = time.perf_counter() - calibration_inference_started
         temperature_fit_started = time.perf_counter()
-        temperature, calibration_metrics = _fit_temperature(train_raw, calibration_labels, classes,
-            max_samples=None, seed=calibration_seed, full_dataset=True, return_metrics=True)
+        temperature, calibration_metrics = _temperature_if_enabled(train_raw, calibration_labels, classes,
+            enabled=True, seed=calibration_seed)
         # The supplied logits already correspond to the deterministic training subset.
         calibration_metrics["calibration_sample_size"] = int(len(calibration_indices))
         calibration_metrics["calibration_full_dataset"] = bool(len(calibration_indices) == len(y_train))
         calibration_metrics["calibration_seed"] = int(calibration_seed)
         calibration_metrics["calibration_inference_seconds"] = calibration_inference_seconds
         calibration_metrics["temperature_fit_seconds"] = time.perf_counter() - temperature_fit_started
+        temperature_fit_seconds = calibration_metrics["temperature_fit_seconds"]
     else:
         temperature = 1.0
     probabilities = softmax(raw / temperature, axis=1)
@@ -360,11 +411,16 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
             "validation_seconds": None,
             "final_validation_seconds": inference_seconds,
             "checkpoint_save_seconds": checkpoint_save_seconds,
-            "calibration_inference_seconds": float(calibration_metrics.get("calibration_inference_seconds", 0.0)),
-            "temperature_fit_seconds": float(calibration_metrics.get("temperature_fit_seconds", 0.0))},
+            "calibration_inference_seconds": float(calibration_inference_seconds),
+            "temperature_fit_seconds": float(temperature_fit_seconds),
+            "calibration_rows_per_second": (calibration_metrics.get("calibration_sample_size", 0) /
+                calibration_inference_seconds if calibration_inference_seconds else None),
+            "effective_inference_batch_size": None,
+            "checkpoint_serialization_seconds": float(checkpoint_save_seconds)},
         "classes": list(classes), "calibration_temperature": temperature,
         **calibration_metrics,
-        "calibration_method": "train-only scalar temperature" if temperature_calibration else "none",
+        "calibration_enabled": calibration_enabled,
+        "calibration_method": "train-only scalar temperature" if calibration_enabled else "disabled",
         "selected_iteration": best_iteration, "selected_validation_accuracy": selected_validation_accuracy,
         "selected_validation_balanced_accuracy": selected_validation_balanced_accuracy,
         "validation_metrics_by_iteration": iteration_metrics,
@@ -840,7 +896,7 @@ def _epoch_decay_lambda(*, decay, steps_per_epoch, warmup_steps=0):
 
 
 def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpoint, revision, output_dir,
-                       epochs=3, batch_size=16, max_length=384, learning_rate=2e-5, seed=2026,
+                       epochs=3, batch_size=16, inference_batch_size=None, max_length=384, learning_rate=2e-5, seed=2026,
                        gradient_accumulation_steps=1, local_files_only=True, validation_labels=None,
                        resume_checkpoint=None, learning_rate_decay=None,
                        select_best_checkpoint=False,
@@ -850,7 +906,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        batch_probe_safety_fraction=0.95,
                        checkpoint_selection_metric="balanced_accuracy", calibration_max_samples=5000,
                        calibration_seed=2026, calibration_full_dataset=False,
-                       save_epoch_checkpoints=False):
+                       calibration_enabled=True, save_epoch_checkpoints=False):
     """Fine-tune or continue an encoder after recording its validation baseline."""
     _force_huggingface_offline()
     local_files_only = True
@@ -877,6 +933,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     train.collate_fn = data_collator
     val.collate_fn = data_collator
     requested_batch_size = int(batch_size)
+    requested_inference_batch_size = max(1, int(inference_batch_size or batch_size))
     effective_batch_size = requested_batch_size
     batch_probe = {"enabled": False, "selected_batch_size": effective_batch_size}
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -954,8 +1011,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 best_state["balanced_accuracy"] = (metrics or {}).get("eval_balanced_accuracy")
                 best_state["epoch"] = int(round(float(state.epoch or 0)))
                 snapshot_started = time.perf_counter()
-                best_state["model_state"] = {
-                    key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                best_state["model_state"] = _snapshot_state_dict_cpu(model)
                 best_state["snapshot_seconds"] += time.perf_counter() - snapshot_started
             if save_epoch_checkpoints:
                 epoch = int(round(float(state.epoch or 0)))
@@ -1020,12 +1076,16 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     prediction_dtype = (torch.bfloat16 if use_bf16 else
                        torch.float16 if use_fp16 else None)
 
+    inference_stats = []
     def predict_cached(dataset):
-        return _predict_cached_dataset(model, dataset, batch_size=effective_batch_size,
-            data_collator=data_collator, device=prediction_device, amp_dtype=prediction_dtype)
+        scores, stats = _predict_cached_dataset(model, dataset,
+            batch_size=requested_inference_batch_size, data_collator=data_collator,
+            device=prediction_device, amp_dtype=prediction_dtype, return_info=True)
+        inference_stats.append(stats)
+        return scores, stats
 
     baseline_validation_started = time.perf_counter()
-    baseline_logits = predict_cached(val)
+    baseline_logits, baseline_inference_stats = predict_cached(val)
     baseline_validation_seconds = time.perf_counter() - baseline_validation_started
     baseline_predictions = np.asarray(classes)[baseline_logits.argmax(axis=1)]
     from sklearn.metrics import accuracy_score, balanced_accuracy_score, log_loss
@@ -1048,27 +1108,37 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         if best_state["epoch"] is None:
             raise RuntimeError("best checkpoint selection requested but no epoch validation metric was recorded")
         restore_started = time.perf_counter()
-        model.load_state_dict(best_state["model_state"])
+        _restore_model_state(model, best_state["model_state"])
         best_checkpoint_restoration_seconds = time.perf_counter() - restore_started
         (out / "checkpoint_selection.json").write_text(json.dumps({
             "metric": f"validation_{checkpoint_selection_metric}", "selected_epoch": best_state["epoch"],
             "selected_validation_accuracy": best_state["accuracy"],
             "selected_validation_balanced_accuracy": best_state["balanced_accuracy"]}, indent=2) + "\n")
-    calibration_indices = _calibration_indices(y_train, max_samples=calibration_max_samples,
-        seed=calibration_seed, full_dataset=calibration_full_dataset)
-    from torch.utils.data import Subset
-    calibration_dataset = Subset(train, calibration_indices.tolist())
-    calibration_labels = np.asarray(y_train, dtype=object)[calibration_indices].tolist()
-    calibration_inference_started = time.perf_counter()
-    train_logits = predict_cached(calibration_dataset)
-    calibration_inference_seconds = time.perf_counter() - calibration_inference_started
-    temperature_fit_started = time.perf_counter()
-    temperature, calibration_metrics = _fit_temperature(train_logits, calibration_labels, classes,
-        max_samples=None, seed=calibration_seed, full_dataset=True, return_metrics=True)
-    temperature_fit_seconds = time.perf_counter() - temperature_fit_started
-    calibration_metrics["calibration_sample_size"] = int(len(calibration_indices))
-    calibration_metrics["calibration_full_dataset"] = bool(len(calibration_indices) == len(y_train))
-    calibration_metrics["calibration_seed"] = int(calibration_seed)
+    calibration_metrics = {"calibration_enabled": bool(calibration_enabled),
+                           "calibration_full_dataset": bool(calibration_full_dataset),
+                           "calibration_seed": int(calibration_seed)}
+    calibration_inference_seconds = 0.0
+    temperature_fit_seconds = 0.0
+    calibration_stats = None
+    temperature = 1.0
+    if calibration_enabled:
+        calibration_indices = _calibration_indices(y_train, max_samples=calibration_max_samples,
+            seed=calibration_seed, full_dataset=calibration_full_dataset)
+        from torch.utils.data import Subset
+        calibration_dataset = Subset(train, calibration_indices.tolist())
+        calibration_labels = np.asarray(y_train, dtype=object)[calibration_indices].tolist()
+        calibration_inference_started = time.perf_counter()
+        train_logits, calibration_stats = predict_cached(calibration_dataset)
+        calibration_inference_seconds = time.perf_counter() - calibration_inference_started
+        temperature_fit_started = time.perf_counter()
+        temperature, fitted_metrics = _temperature_if_enabled(train_logits, calibration_labels, classes,
+            enabled=True, seed=calibration_seed)
+        temperature_fit_seconds = time.perf_counter() - temperature_fit_started
+        calibration_metrics.update(fitted_metrics)
+        calibration_metrics.update({"calibration_enabled": True,
+            "calibration_sample_size": int(len(calibration_indices)),
+            "calibration_full_dataset": bool(len(calibration_indices) == len(y_train)),
+            "calibration_seed": int(calibration_seed)})
     calibration_metrics["calibration_inference_seconds"] = calibration_inference_seconds
     calibration_metrics["temperature_fit_seconds"] = temperature_fit_seconds
     selected_prediction_epoch = (best_state["epoch"] if select_best_checkpoint else
@@ -1079,8 +1149,9 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     pred_start = time.perf_counter()
     if final_validation_reused_epoch_predictions:
         logits = selected_prediction
+        final_inference_stats = None
     else:
-        logits = predict_cached(val)
+        logits, final_inference_stats = predict_cached(val)
     inference_seconds = (0.0 if final_validation_reused_epoch_predictions
                          else time.perf_counter() - pred_start)
     checkpoint_started = time.perf_counter()
@@ -1108,12 +1179,19 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         for entry in epoch_history:
             epoch = int(round(float(entry.get("epoch", 1))))
             entry["learning_rate_used"] = float(learning_rate) * float(learning_rate_decay) ** (epoch - 1)
+    effective_post_inference_batch_size = min(
+        (item["effective_inference_batch_size"] for item in inference_stats),
+        default=requested_inference_batch_size)
     return {"scores": logits, "probabilities": probs, "model": model, "tokenizer": tokenizer,
             "requested_batch_size": requested_batch_size,
             "effective_batch_size": effective_batch_size,
+            "requested_inference_batch_size": requested_inference_batch_size,
+            "effective_inference_batch_size": effective_post_inference_batch_size,
             "batch_size_probe": batch_probe,
             "fit_seconds": time.perf_counter() - start, "inference_seconds": inference_seconds,
-            "classes": list(classes), "calibration_temperature": temperature, "calibration_method": "train-only scalar temperature",
+            "classes": list(classes), "calibration_temperature": temperature,
+            "calibration_enabled": bool(calibration_enabled),
+            "calibration_method": "train-only scalar temperature" if calibration_enabled else "disabled",
             **calibration_metrics,
             "baseline_validation_metrics": baseline_metrics,
             "validation_metrics_by_epoch": epoch_history,
@@ -1132,8 +1210,12 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 "validation_seconds": float(getattr(trainer, "validation_seconds", 0.0)),
                 "best_checkpoint_restoration_seconds": float(best_checkpoint_restoration_seconds),
                 "calibration_inference_seconds": float(calibration_inference_seconds),
+                "calibration_rows_per_second": (calibration_stats or {}).get("inference_rows_per_second"),
                 "temperature_fit_seconds": float(temperature_fit_seconds),
                 "final_validation_inference_seconds": float(inference_seconds),
+                "final_validation_rows_per_second": (final_inference_stats or {}).get("inference_rows_per_second"),
+                "effective_inference_batch_size": effective_post_inference_batch_size,
+                "inference_oom_fallbacks": sum(x.get("inference_oom_fallbacks", 0) for x in inference_stats),
                 "checkpoint_serialization_seconds": float(checkpoint_save_seconds + best_checkpoint_callback.save_seconds),
                 "best_checkpoint_state_snapshot_seconds": float(best_state["snapshot_seconds"]),
                 "training_excluding_validation_seconds": max(0.0, training_seconds -
@@ -1385,6 +1467,7 @@ def _require_flash_attention_2_runtime(torch):
 
 def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, checkpoint="Qwen/Qwen3-0.6B",
                          revision, output_dir="artifacts/checkpoints/qwen", epochs=3, batch_size=4,
+                         inference_batch_size=None,
                          max_length=384, learning_rate=1e-4, seed=2026, gradient_accumulation_steps=1,
                          lora_rank=16, lora_alpha=32,
                          lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
@@ -1399,7 +1482,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          quantization="none", attention_backend=None,
                          checkpoint_selection_metric="balanced_accuracy", save_epoch_checkpoints=False,
                          calibration_max_samples=5000, calibration_seed=2026,
-                         calibration_full_dataset=False):
+                         calibration_full_dataset=False, calibration_enabled=True):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
     _force_huggingface_offline()
     torch, tr = _require_neural()
@@ -1610,6 +1693,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     use_bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     use_fp16=torch.cuda.is_available() and not use_bf16
     effective_batch_size=int(batch_size)
+    requested_inference_batch_size=max(1,int(inference_batch_size or batch_size))
     batch_probe={"enabled": False, "selected_batch_size": effective_batch_size}
     if auto_batch_size:
         effective_batch_size, batch_probe = _probe_max_batch_size(
@@ -1639,7 +1723,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     warmup_basis_epochs=min(int(epochs),int(warmup_epochs)) if warmup_epochs is not None else int(epochs)
     warmup_steps=math.ceil(float(warmup_ratio)*steps_per_epoch*warmup_basis_epochs)
     args=tr.TrainingArguments(output_dir=str(output_dir),num_train_epochs=epochs,
-        per_device_train_batch_size=effective_batch_size,per_device_eval_batch_size=effective_batch_size,
+        per_device_train_batch_size=effective_batch_size,per_device_eval_batch_size=requested_inference_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,learning_rate=learning_rate,
         lr_scheduler_type="constant" if scheduler == "epoch_decay" else scheduler,
         warmup_steps=warmup_steps, optim=optimizer, weight_decay=float(weight_decay),
@@ -1732,32 +1816,45 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     amp_dtype = (torch.bfloat16 if use_bf16 else
                  torch.float16 if use_fp16 else None)
 
+    inference_stats=[]
     def predict_cached(dataset):
-        return _predict_cached_dataset(model, dataset, batch_size=effective_batch_size,
-            data_collator=data_collator, device=prediction_device, amp_dtype=amp_dtype)
+        scores, stats = _predict_cached_dataset(model, dataset,
+            batch_size=requested_inference_batch_size, data_collator=data_collator,
+            device=prediction_device, amp_dtype=amp_dtype, return_info=True)
+        inference_stats.append(stats)
+        return scores, stats
 
-    calibration_indices = _calibration_indices(y_train, max_samples=calibration_max_samples,
-        seed=calibration_seed, full_dataset=calibration_full_dataset)
-    calibration_labels = np.asarray(y_train, dtype=object)[calibration_indices].tolist()
-    calibration_dataset = torch.utils.data.Subset(train_dataset, calibration_indices.tolist())
-    calibration_inference_started = time.perf_counter()
-    train_logits = predict_cached(calibration_dataset)
-    calibration_inference_seconds = time.perf_counter() - calibration_inference_started
-    temperature_fit_started = time.perf_counter()
-    temperature, calibration_metrics = _fit_temperature(train_logits, calibration_labels, classes,
-        max_samples=None, seed=calibration_seed, full_dataset=True, return_metrics=True)
-    temperature_fit_seconds = time.perf_counter() - temperature_fit_started
-    calibration_metrics["calibration_sample_size"] = int(len(calibration_indices))
-    calibration_metrics["calibration_full_dataset"] = bool(len(calibration_indices) == len(y_train))
-    calibration_metrics["calibration_seed"] = int(calibration_seed)
-    calibration_metrics["calibration_inference_seconds"] = calibration_inference_seconds
-    calibration_metrics["temperature_fit_seconds"] = temperature_fit_seconds
+    calibration_metrics={"calibration_enabled":bool(calibration_enabled),
+        "calibration_full_dataset":bool(calibration_full_dataset),"calibration_seed":int(calibration_seed)}
+    calibration_inference_seconds=0.0;temperature_fit_seconds=0.0
+    calibration_stats=None;temperature=1.0
+    if calibration_enabled:
+        calibration_indices = _calibration_indices(y_train, max_samples=calibration_max_samples,
+            seed=calibration_seed, full_dataset=calibration_full_dataset)
+        calibration_labels = np.asarray(y_train, dtype=object)[calibration_indices].tolist()
+        calibration_dataset = torch.utils.data.Subset(train_dataset, calibration_indices.tolist())
+        calibration_inference_started = time.perf_counter()
+        train_logits, calibration_stats = predict_cached(calibration_dataset)
+        calibration_inference_seconds = time.perf_counter() - calibration_inference_started
+        temperature_fit_started = time.perf_counter()
+        temperature, fitted_metrics = _temperature_if_enabled(train_logits, calibration_labels, classes,
+            enabled=True, seed=calibration_seed)
+        temperature_fit_seconds = time.perf_counter() - temperature_fit_started
+        calibration_metrics.update(fitted_metrics)
+        calibration_metrics.update({"calibration_enabled":True,
+            "calibration_sample_size":int(len(calibration_indices)),
+            "calibration_full_dataset":bool(len(calibration_indices)==len(y_train)),
+            "calibration_seed":int(calibration_seed)})
+    calibration_metrics["calibration_inference_seconds"]=calibration_inference_seconds
+    calibration_metrics["temperature_fit_seconds"]=temperature_fit_seconds
     selected_prediction = _selected_epoch_scores(snapshot_callback.validation_predictions,
         best_epoch, (len(validation_dataset_rows), len(classes)))
     final_validation_reused_epoch_predictions = selected_prediction is not None
     pred_start = time.perf_counter()
-    logits = (selected_prediction if final_validation_reused_epoch_predictions
-              else predict_cached(validation_dataset_rows))
+    if final_validation_reused_epoch_predictions:
+        logits=selected_prediction;final_inference_stats=None
+    else:
+        logits,final_inference_stats=predict_cached(validation_dataset_rows)
     inference_seconds = (0.0 if final_validation_reused_epoch_predictions
                          else time.perf_counter() - pred_start)
     checkpoint_started = time.perf_counter()
@@ -1785,10 +1882,14 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             if entry.get("eval_loss") is not None:
                 entry["validation_loss_raw"] = float(entry["eval_loss"])
     trainable=sum(p.numel() for p in model.parameters() if p.requires_grad)
+    effective_post_inference_batch_size = min(
+        (item["effective_inference_batch_size"] for item in inference_stats),
+        default=requested_inference_batch_size)
     return {"scores":logits,"probabilities":probs,"model":model,"tokenizer":tokenizer,
         "fit_seconds":time.perf_counter()-start,"inference_seconds":inference_seconds,
         "classes":list(classes),"trainable_parameters":trainable,"calibration_temperature":temperature,
-        "calibration_method":"train-only scalar temperature",
+        "calibration_enabled":bool(calibration_enabled),
+        "calibration_method":"train-only scalar temperature" if calibration_enabled else "disabled",
         **calibration_metrics,
         "validation_metrics_by_epoch":validation_metrics_by_epoch,
         "validation_loss_raw": (float(validation_loss_raw)
@@ -1809,13 +1910,18 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             "validation_seconds":float(getattr(trainer,"validation_seconds",0.0)),
             "best_checkpoint_restoration_seconds":float(best_checkpoint_restoration_seconds),
             "calibration_inference_seconds":float(calibration_inference_seconds),
+            "calibration_rows_per_second":(calibration_stats or {}).get("inference_rows_per_second"),
             "temperature_fit_seconds":float(temperature_fit_seconds),
             "final_validation_inference_seconds":float(inference_seconds),
+            "final_validation_rows_per_second":(final_inference_stats or {}).get("inference_rows_per_second"),
+            "effective_inference_batch_size":effective_post_inference_batch_size,
+            "inference_oom_fallbacks":sum(x.get("inference_oom_fallbacks",0) for x in inference_stats),
             "checkpoint_serialization_seconds":float(checkpoint_save_seconds+snapshot_callback.save_seconds),
             "checkpoint_snapshot_seconds":snapshot_callback.snapshot_seconds,
             "training_excluding_validation_seconds":max(0.0,training_seconds-
                 float(getattr(trainer,"validation_seconds",0.0)))},
         "requested_batch_size":int(batch_size),"effective_batch_size":effective_batch_size,
+        "requested_inference_batch_size":requested_inference_batch_size,
         "lr_scheduler_type":scheduler,"warmup_ratio":float(warmup_ratio),
         "batch_size_probe":batch_probe,
         "quantization":quantization,"quantization_config":quantization_config,

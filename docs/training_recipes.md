@@ -74,7 +74,7 @@ Example:
 
 ```bash
 /home/zodrak/cuda13.x/bin/python -m src.pipeline models train \
-  --model qwen06 --dataset v2 --accept-config-defaults
+  --model qwen06 --dataset v1 --accept-config-defaults
 ```
 
 To make a repeatable override, edit or copy the model YAML and pass it with

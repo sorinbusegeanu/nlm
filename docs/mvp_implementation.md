@@ -63,19 +63,6 @@ python -m src.pipeline data curate-openpool --config configs/data/openpool_v1_1.
 
 The data factory writes `dataset_v1.1.parquet`, `dataset_profile_v1.1.json`, and `openpool_v1.1_removals.csv` under `data/processed/`. The profile includes the per-class counts, baseline hash, added rows, removals, and frozen validation split hash.
 
-### Complete Open Pool V11 plus original V0 training data (V2)
-
-V2 uses the same hard quality filters as V1 but does not downsample to a fixed per-class quota. The source artifact `dataset_v2_openpool.parquet` retains every eligible English response from `ntl_open_pool.parquet`, preserving class imbalance and source frequencies. It removes rows with missing text/label/provenance or canonical prompt, invalid Gemini 3.7 source routing, exact normalized overlap with official training text, duplicate/conflicting normalized response text, or non-English/undetermined language. The unverified Gemini 3.7 sidecar remains excluded. Its audit (`openpool_v2_openpool_removals.csv`) contains hard-quality exclusions only; there is no quota-sampling removal.
-
-The final `dataset_v2.parquet` adds all 2,159 original V0 training rows to the 188,095 eligible Open Pool responses and preserves the same 540 V0 validation rows. Thus V2 contains 190,254 training rows and 540 validation rows. The V0 validation examples remain held out to prevent evaluation leakage. Build it with:
-
-```bash
-python -m src.pipeline data curate-openpool --config configs/data/openpool_v2.yaml
-python -m src.pipeline data assemble --config configs/data/mixed_v2.yaml
-```
-
-The mixed factory writes `dataset_v2.parquet`, `splits_v2.parquet`, and `dataset_profile_v2.json`. `training_data_version` distinguishes original V0 rows from V2 Open Pool rows; these are metadata, not model features. V1 and V1.5 artifacts remain unchanged.
-
 ### Consolidated V1.5 training dataset
 
 To train on both V0 training rows and V1 Open Pool rows in one explicit dataset, run:

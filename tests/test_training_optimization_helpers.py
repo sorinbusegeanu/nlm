@@ -1,5 +1,6 @@
 """Focused tests for deterministic training cache/calibration helpers (no model training)."""
 import json
+import inspect
 import os
 import tempfile
 import unittest
@@ -79,6 +80,62 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         predictions = model_factory._predict_cached_dataset(Model(), Dataset(), batch_size=2,
             data_collator=collate, device=torch.device("cpu"))
         np.testing.assert_array_equal(predictions[:, 0], [1, 2, 3])
+
+    @unittest.skipUnless(_torch_available(), "PyTorch inference OOM fallback check")
+    def test_length_grouped_inference_retries_smaller_batches_and_restores_order(self):
+        import torch
+        class Dataset(torch.utils.data.Dataset):
+            lengths = [3, 1, 2]
+            def __len__(self): return 3
+            def __getitem__(self, index):
+                return {"input_ids": torch.full((self.lengths[index],), index + 1),
+                        "attention_mask": torch.ones(self.lengths[index], dtype=torch.long)}
+        class Model(torch.nn.Module):
+            def forward(self, input_ids, attention_mask):
+                if input_ids.shape[0] > 1:
+                    raise RuntimeError("CUDA out of memory in fake model")
+                value = input_ids[:, 0].float()
+                return SimpleNamespace(logits=torch.stack((value, -value), dim=1))
+        def collate(rows):
+            width = max(len(row["input_ids"]) for row in rows)
+            ids = torch.zeros((len(rows), width), dtype=torch.long)
+            mask = torch.zeros_like(ids)
+            for index, row in enumerate(rows):
+                ids[index, :len(row["input_ids"])] = row["input_ids"]
+                mask[index, :len(row["attention_mask"])] = row["attention_mask"]
+            return {"input_ids": ids, "attention_mask": mask}
+        predictions, info = model_factory._predict_cached_dataset(Model(), Dataset(), batch_size=4,
+            data_collator=collate, device=torch.device("cpu"), return_info=True)
+        np.testing.assert_array_equal(predictions[:, 0], [1, 2, 3])
+        self.assertEqual(info["effective_inference_batch_size"], 1)
+        self.assertEqual(info["inference_oom_fallbacks"], 2)
+        self.assertGreater(info["inference_rows_per_second"], 0)
+
+    def test_temperature_calibration_can_be_disabled_without_fitting(self):
+        with patch.object(model_factory, "_fit_temperature") as fit:
+            temperature, record = model_factory._temperature_if_enabled(
+                np.ones((3, 2)), ["a", "b", "a"], ["a", "b"], enabled=False)
+        fit.assert_not_called()
+        self.assertEqual(temperature, 1.0)
+        self.assertFalse(record["calibration_enabled"])
+        self.assertIsNone(record["calibration_sample_size"])
+
+    @unittest.skipUnless(_torch_available(), "PyTorch selected checkpoint restore check")
+    def test_ultrabert_cpu_snapshot_restores_exact_weights(self):
+        import torch
+        model = torch.nn.Linear(3, 2)
+        snapshot = model_factory._snapshot_state_dict_cpu(model)
+        self.assertTrue(all(value.device.type == "cpu" for value in snapshot.values()))
+        expected = {key: value.clone() for key, value in snapshot.items()}
+        with torch.no_grad():
+            for parameter in model.parameters(): parameter.add_(5)
+        model_factory._restore_model_state(model, snapshot)
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value.cpu(), expected[key])
+
+    def test_catboost_call_signature_has_no_unsupported_epoch_checkpoint_argument(self):
+        self.assertNotIn("save_epoch_checkpoints",
+                         inspect.signature(model_factory.train_catboost_stylometry).parameters)
 
     def test_post_training_runtime_has_stable_stage_keys(self):
         runtime = pipeline._post_training_runtime({"inference_seconds": 1.25,
