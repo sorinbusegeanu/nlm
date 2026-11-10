@@ -852,6 +852,7 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
     checkpoint = Path(result["checkpoint"])
     artifact_size = sum(f.stat().st_size for f in checkpoint.rglob("*") if f.is_file()) if checkpoint.is_dir() else checkpoint.stat().st_size
     validation_ids = sorted(valid.id.astype(str))
+    manifest_export_started = time.perf_counter()
     manifest = {"experiment_id": experiment_id, "experiment_name": config_snapshot.get("experiment_name"),
         "model": model, "dataset": dataset,
         "split": "validation", "training_dataset": dataset, "validation_dataset": validation_dataset,
@@ -937,7 +938,7 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         split_hash=manifest["split_sha256"], model_revision=manifest["model_revision"],
         description=description)
     runtime_breakdown["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
-    runtime_breakdown["manifest_export_seconds"] = runtime_breakdown["manifest_prediction_export_seconds"] - runtime_breakdown.get("prediction_export_seconds", 0.0)
+    runtime_breakdown["manifest_export_seconds"] = time.perf_counter() - manifest_export_started
     manifest["runtime_breakdown"] = runtime_breakdown
     (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -1137,6 +1138,7 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
     epoch_prediction_records = _save_epoch_validation_predictions(
         result, valid, classes, pred_dir, experiment_id)
     runtime_breakdown["prediction_export_seconds"]=time.perf_counter()-prediction_export_started
+    manifest_export_started=time.perf_counter()
     manifest={"experiment_id":experiment_id,"model":model,"dataset":dataset,"training_dataset":dataset,
         "validation_dataset":validation_dataset,"split":"validation",
         "continued_from_experiment":source["experiment_id"],"continued_from_checkpoint":str(source_checkpoint),
@@ -1181,7 +1183,7 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         code_revision=code_revision,seed=seed,runtime_seconds=result["fit_seconds"],artifact_path=str(prediction_path),
         config_hash=config_hash,description=f"Continued Qwen LoRA from {source['experiment_id']} for {epochs} epochs; validation metrics recorded each epoch.")
     runtime_breakdown["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
-    runtime_breakdown["manifest_export_seconds"] = runtime_breakdown["manifest_prediction_export_seconds"] - runtime_breakdown.get("prediction_export_seconds",0.0)
+    runtime_breakdown["manifest_export_seconds"] = time.perf_counter() - manifest_export_started
     manifest["runtime_breakdown"] = runtime_breakdown
     manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
     (pred_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2)+"\n")
@@ -1342,6 +1344,7 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         result, valid, classes, manifests_dir, experiment_id)
     runtime_breakdown["prediction_export_seconds"] = time.perf_counter() - prediction_export_started
     checkpoint = run_dir / "checkpoints" / f"{model}_continued"
+    manifest_export_started = time.perf_counter()
     manifest = {
         "experiment_id": experiment_id, "model": model, "dataset": dataset,
         "training_dataset": dataset, "validation_dataset": validation_dataset, "split": "validation",
@@ -1395,7 +1398,7 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         config_hash=config_hash,
         description=f"Continued {model} from {from_experiment} for {epochs} epochs after baseline validation.")
     runtime_breakdown["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
-    runtime_breakdown["manifest_export_seconds"] = runtime_breakdown["manifest_prediction_export_seconds"] - runtime_breakdown.get("prediction_export_seconds", 0.0)
+    runtime_breakdown["manifest_export_seconds"] = time.perf_counter() - manifest_export_started
     manifest["runtime_breakdown"] = runtime_breakdown
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     (manifests_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")

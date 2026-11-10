@@ -286,6 +286,7 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
     experiment_id = _stage_id(report_dir.name, experiment, stage)
     manifest_path = stage_artifact_dir / f"{experiment_id}_manifest.json"
     checkpoint_size = sum(path.stat().st_size for path in checkpoint.rglob("*") if path.is_file())
+    manifest_export_started = time.perf_counter()
     manifest = {
         "experiment_id": experiment_id, "experiment_name": experiment_name,
         "model": "catboost_stylometry", "dataset": dataset_name,
@@ -340,7 +341,7 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         description=(f"{experiment} {experiment_name} stage {stage}: CatBoost trained on "
                      f"{dataset_name}, {len(train)} train rows; {len(valid)} frozen V0 validation rows."))
     manifest["runtime_breakdown"]["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
-    manifest["runtime_breakdown"]["manifest_export_seconds"] = manifest["runtime_breakdown"]["manifest_prediction_export_seconds"]
+    manifest["runtime_breakdown"]["manifest_export_seconds"] = time.perf_counter() - manifest_export_started
     manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
     (stage_artifact_dir / f"{experiment_id}_metrics.json").write_text(
         json.dumps(manifest, indent=2, allow_nan=False) + "\n")

@@ -133,6 +133,12 @@ def _restore_model_state(model, state):
     model.load_state_dict(state)
 
 
+def _is_oom_error(exc):
+    message = str(exc).lower()
+    return any(marker in message for marker in (
+        "out of memory", "cuda oom", "cublas_status_alloc_failed", "mps backend out of memory"))
+
+
 def _predict_cached_dataset(model, dataset, *, batch_size, data_collator, device,
                             amp_dtype=None, num_workers=0, return_info=False):
     """Infer length-grouped cached rows, retrying CUDA OOMs at smaller batches."""
@@ -177,8 +183,7 @@ def _predict_cached_dataset(model, dataset, *, batch_size, data_collator, device
                     "inference_seconds": elapsed}
             return (predictions, info) if return_info else predictions
         except (RuntimeError, getattr(torch.cuda, "OutOfMemoryError", RuntimeError)) as exc:
-            is_oom = "out of memory" in str(exc).lower() or "cuda oom" in str(exc).lower()
-            if not is_oom or effective_batch_size <= 1:
+            if not _is_oom_error(exc) or effective_batch_size <= 1:
                 raise
             effective_batch_size = max(1, effective_batch_size // 2)
             fallback_count += 1
