@@ -276,6 +276,7 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
               "parent_checkpoint_sha256": parent_sha256,
               "calibration_method": result["calibration_method"],
               "calibration_temperature": result["calibration_temperature"],
+              "calibration_enabled": result.get("calibration_enabled", cfg.get("calibration_enabled", True)),
               "calibration_max_samples": int(cfg.get("calibration_max_samples", 5000)),
               "calibration_full_dataset": bool(cfg.get("calibration_full_dataset", False)),
               "calibration_seed": int(cfg.get("calibration_seed", seed)),
