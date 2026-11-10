@@ -33,13 +33,17 @@ MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert380": "configs/mode
     "phi35_mini": "configs/models/phi35_mini.yaml",
     "qwen06": "configs/models/qwen06.yaml", "qwen17": "configs/models/qwen17.yaml", "qwen4": "configs/models/qwen4.yaml",
     "qwen8": "configs/models/qwen8.yaml",
+    "minicpm5_2b": "configs/models/minicpm5_2b.yaml",
+    "hunyuan_1_8b": "configs/models/hunyuan_1_8b.yaml",
     "llama32_3b": "configs/models/llama32_3b.yaml", "smollm3_3b": "configs/models/smollm3_3b.yaml",
+    "llama31_8b": "configs/models/llama31_8b_qlora.yaml",
     "granite4_h_micro": "configs/models/granite4_h_micro.yaml",
     "granite4_350m": "configs/models/granite4_350m.yaml",
     "embeddinggemma2": "configs/models/embeddinggemma2.yaml",
     "gemma4_e2b": "configs/models/gemma4_e2b.yaml",
     "gemma4_e4b": "configs/models/gemma4_e4b.yaml",
     "ministral3_3b": "configs/models/ministral3_3b.yaml",
+    "ministral3_8b": "configs/models/ministral3_8b_qlora.yaml",
     "catboost_stylometry": "configs/models/catboost_stylometry.yaml"}
 DEFAULT_MVP_MODELS = ["svc", "catboost_stylometry", "ultrabert380", "qwen06"]
 ENSEMBLE_MODEL_CHOICES = [*MODEL_CONFIGS, "qwen06_best_epoch03"]
@@ -62,12 +66,13 @@ def _ensemble_member_labels(members):
     display_names = {"svc": "SVC", "ultrabert380": "UltraBERT-380M", "qwen06": "Qwen3-0.6B",
         "qwen06_best_epoch03": "Qwen3-0.6B best checkpoint (epoch 3)",
         "phi35_mini": "Phi-3.5 Mini",
-        "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B", "qwen8": "Qwen3-8B QLoRA", "llama32_3b": "Llama-3.2-3B",
+        "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B", "qwen8": "Qwen3-8B QLoRA", "llama32_3b": "Llama-3.2-3B", "llama31_8b": "Llama-3.1-8B QLoRA",
+        "minicpm5_2b": "MiniCPM5-2B-Base", "hunyuan_1_8b": "Hunyuan-1.8B-Pretrain",
         "smollm3_3b": "SmolLM3-3B",
         "granite4_h_micro": "Granite 4.0 H Micro Base",
         "granite4_350m": "Granite 4.0 350M Base",
         "embeddinggemma2": "EmbeddingGemma 2", "gemma4_e2b": "Gemma 4 E2B", "gemma4_e4b": "Gemma 4 E4B",
-        "ministral3_3b": "Ministral 3 3B", "catboost_stylometry": "CatBoost + Stylometry"}
+        "ministral3_3b": "Ministral 3 3B", "ministral3_8b": "Ministral 3 8B QLoRA", "catboost_stylometry": "CatBoost + Stylometry"}
     model_ids = sorted(display_names, key=len, reverse=True)
     labels = []
     for name in members:
@@ -541,7 +546,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
             fix_mistral_regex=cfg.get("fix_mistral_regex", False))
         result["checkpoint"] = str(checkpoint)
-    elif model in ({"qwen06", "qwen17", "qwen4", "qwen8", "llama32_3b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "phi35_mini"}
+    elif model in ({"qwen06", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "phi35_mini"}
                    | FROZEN_BACKBONE_MODELS):
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_qwen_lora_fold(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
@@ -1353,6 +1358,18 @@ def main(argv=None):
     zf.add_argument("--registry", default="experiments/registry.sqlite")
     zf.add_argument("--output-dir", default="artifacts/analysis/zod01_18label_cascade")
     zf.add_argument("--report", default="docs/zod01_18label_cascade.md")
+    z4 = analysis.add_parser("zod04", help="extract frozen UltraBERT layer features and compare logistic readouts")
+    z4.add_argument("--artifact-dir", default="artifacts")
+    z4.add_argument("--data-dir", default="data/processed")
+    z4.add_argument("--output-dir", default="artifacts/analysis/zod_04")
+    z4.add_argument("--report", default="docs/zod_04.md")
+    z4.add_argument("--experiment-id", default=None,
+        help="UltraBERT checkpoint experiment; defaults to the existing V1-all -> V0 best checkpoint")
+    z4.add_argument("--batch-size", type=int, default=8)
+    z4.add_argument("--n-splits", type=int, default=5)
+    z4.add_argument("--seed", type=int, default=2026)
+    z4.add_argument("--refresh-features", action="store_true",
+        help="re-extract hidden states even if a compatible feature cache exists")
     a=parser.parse_args(argv)
     if a.command=="restart": result=restart_mvp(models=a.models,seed=a.seed,bootstrap_replicates=a.bootstrap_replicates)
     elif a.command=="data" and a.action=="prepare": result=prepare_data(a.config)
@@ -1422,6 +1439,12 @@ def main(argv=None):
         result=run_fixed_zod01_cascade(data_dir=a.data_dir,inventory_path=a.inventory,
             predictions_dir=a.predictions_dir,registry_path=a.registry,
             output_dir=a.output_dir,report_path=a.report)
+    elif a.command=="analysis" and a.action=="zod04":
+        from .zod_04 import run_zod04
+        result=run_zod04(data_dir=a.data_dir,artifact_dir=a.artifact_dir,
+            output_dir=a.output_dir,report_path=a.report,experiment_id=a.experiment_id,
+            batch_size=a.batch_size,n_splits=a.n_splits,seed=a.seed,
+            refresh_features=a.refresh_features)
     elif a.command=="models" and a.action=="continue-qwen":
         cfg = _model_cfg(a.model, a.config); cfg["epochs"] = a.epochs
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)

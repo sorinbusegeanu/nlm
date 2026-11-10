@@ -1,0 +1,17 @@
+{
+  "version": "trust-v006",
+  "generated_at_utc": "2026-11-10T10:25:49+00:00",
+  "source_catalog": "docs/checkpoint_label_catalog.csv",
+  "source_catalog_sha256": "c79b669fa893ca042d23fe842b23af950c54f84abf7a0229b2adaba2d0f32813",
+  "rows": 1764,
+  "checkpoints": 98,
+  "eligible_rules": 1697,
+  "minimum_support": 10,
+  "smoothing": "Beta(1,1): (true_positive + 1) / (prediction_count + 2)",
+  "ordering": [
+    "precision descending",
+    "recall descending",
+    "checkpoint sequence ascending",
+    "label ascending"
+  ]
+}

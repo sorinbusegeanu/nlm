@@ -113,7 +113,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     if model_name == "ultrabert380":
         network = AutoModelForSequenceClassification.from_pretrained(checkpoint, local_files_only=True, trust_remote_code=True)
-    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "llama32_3b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}:
+    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}:
         backbone_path = checkpoint / "merged_backbone"
         if backbone_path.exists() and quantization != "qlora4":
             network = AutoModel.from_pretrained(backbone_path, local_files_only=True, torch_dtype=model_dtype,
@@ -141,12 +141,11 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                     "device_map": {"": torch.cuda.current_device()},
                 })
             if text_only_backbone:
-                if quantization == "qlora4":
-                    raise ValueError("qlora4 inference does not support text-only composite loading")
                 from .model_factory import load_text_only_backbone
                 import transformers
                 network = load_text_only_backbone(transformers, base_checkpoint, revision,
-                                                  torch_dtype=model_dtype, local_files_only=True)
+                                                  torch_dtype=model_dtype, local_files_only=True,
+                                                  trust_remote_code=trust_remote_code, **load_kwargs)
             else:
                 network = AutoModel.from_pretrained(base_checkpoint, revision=revision, local_files_only=True,
                                                     torch_dtype=model_dtype, trust_remote_code=trust_remote_code,
@@ -185,7 +184,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                 text_batch = ["task: classification | query: " + str(text) for text in text_batch]
             try:
                 enc=tokenizer(text_batch,truncation=True,max_length=max_length,padding=True,return_tensors="pt")
-                if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "llama32_3b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
+                if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
                 enc={k:v.to(device) for k,v in enc.items()}; logits=network(**enc)
                 if hasattr(logits,"logits"): logits=logits.logits
                 raw_logits = logits.float()
@@ -633,7 +632,7 @@ def package_offline_model(manifest_path, output_zip):
             packaged_checkpoint = "model.joblib"
         else:
             shutil.copytree(checkpoint, root / "model")
-            if model_name in {"embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b"}:
+            if model_name in {"embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "llama31_8b", "ministral3_8b"}:
                 config = source.get("config", {})
                 repo_id, revision = config.get("checkpoint"), source.get("model_revision")
                 if not repo_id or not revision:

@@ -4,7 +4,7 @@ checkpoint_selection_version: 2
 checkpoint: Qwen/Qwen3-1.7B-Base
 revision: ea980cb0a6c2ae4b936e82123acc929f1cec04c1
 epochs: 20
-early_stopping_patience: 3
+early_stopping_patience: 2
 batch_size: 2
 auto_batch_size: true
 max_batch_size: 1024

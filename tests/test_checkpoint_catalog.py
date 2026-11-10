@@ -17,12 +17,45 @@ from src.checkpoint_catalog import (
     _sequence_id,
     append_manifest,
     load_catalog,
+    refresh_trust_list,
     seed_from_specialist_snapshot,
     sort_catalog_for_dashboard,
 )
 
 
 class CheckpointCatalogTests(unittest.TestCase):
+    def test_versioned_trust_list_has_complete_order_and_bumps_on_source_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            catalog_path = root / "catalog.csv"
+            trust_path = root / "trust.csv"
+            metadata_path = root / "trust.json"
+            rows = []
+            for number, precision in ((1, .5), (2, .9)):
+                row = {column: "" for column in CATALOG_COLUMNS}
+                row.update({"sequence_id": f"N{number:04d}", "experiment_id": f"exp-{number}",
+                    "target_label": "label", "precision": precision, "recall": precision,
+                    "prediction_count": 10, "true_positive": int(precision * 10),
+                    "false_positive": 10 - int(precision * 10), "false_negative": 0,
+                    "evaluation_eligible": True, "validation_training_overlap": 0,
+                    "checkpoint_available": True})
+                rows.append(row)
+            pd.DataFrame(rows, columns=CATALOG_COLUMNS).to_csv(catalog_path, index=False)
+            first = refresh_trust_list(catalog_path=catalog_path, trust_list_path=trust_path,
+                                       metadata_path=metadata_path)
+            self.assertEqual(first["version"], "trust-v001")
+            listed = pd.read_csv(trust_path)
+            self.assertEqual(listed.SeqID.tolist(), [1, 2])
+            self.assertEqual(listed.experiment_id.tolist(), ["exp-2", "exp-1"])
+            self.assertFalse(listed.SeqID.isna().any())
+            self.assertEqual(refresh_trust_list(catalog_path=catalog_path, trust_list_path=trust_path,
+                metadata_path=metadata_path)["status"], "unchanged")
+            listed.loc[0, "precision"] = .4
+            listed.to_csv(catalog_path, index=False)
+            second = refresh_trust_list(catalog_path=catalog_path, trust_list_path=trust_path,
+                                        metadata_path=metadata_path)
+            self.assertEqual(second["version"], "trust-v002")
+
     def test_sequence_ids_are_stable_and_monotonic(self):
         frame = pd.DataFrame({"sequence_id": ["N0001", "N0072", "N10000"]})
         self.assertEqual(_next_sequence(frame), 10001)
@@ -46,7 +79,7 @@ class CheckpointCatalogTests(unittest.TestCase):
         function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                         and node.name == "render_prediction_factory")
         source = ast.get_source_segment(app_path.read_text(), function)
-        self.assertIn("checkpoint_label_catalog.csv", source)
+        self.assertIn("checkpoint_label_trust_list.csv", source)
         for removed in ("read_ensemble_registry", "active_model_roster.json", "prediction_v0_", "strategy_metrics"):
             self.assertNotIn(removed, source)
 

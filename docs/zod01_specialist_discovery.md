@@ -2,7 +2,7 @@
 
 ## Scope and validation
 
-Evaluated 89 distinct checkpoint runs (85 requested non-UltraBERT runs plus UltraBERT A–D) on the frozen V0 validation set: 540 rows, 30 prompt groups and 18 labels. Existing aligned probability caches were reused. Nonmatching cached validations were regenerated on frozen V0 from their saved checkpoints. No training was run.
+Evaluated 86 distinct checkpoint runs (82 requested non-UltraBERT runs plus UltraBERT A–D) on the frozen V0 validation set: 540 rows, 30 prompt groups and 18 labels. Existing aligned probability caches were reused. Nonmatching cached validations were regenerated on frozen V0 from their saved checkpoints. No training was run.
 
 All checkpoints have previously been compared or selected using validation data, and this specialist ranking selects rules on those same 540 labels. Treat precision and cascade scores as development diagnostics, not independent generalization estimates. Alternate splits of the V0 source that trained on frozen V0 validation rows remain inventoried but are excluded from ranked rules and cascade evaluation.
 
@@ -18,9 +18,6 @@ The checkpoint key is used in the global ranking; the exact experiment ID and ch
 | B | UltraBERT-380M | v1_all | 52.2% | 2 | yes | 0 | cached | `ultrabert380_v1_all_data3c4b61a6_split0b0fd08e_seed2026_cfgebf0c70f_code1b9bfc2` |
 | C | UltraBERT-380M | v1.5 | 53.1% | 5 | yes | 0 | cached | `ultrabert380_v15_from00dfd18d_data40a22ce8_split147ce64e_seed2026_cfge678dbc9_code667e2d0` |
 | D | UltraBERT-380M | v0 | 55.2% | 2 | yes | 0 | cached | `ultrabert380_v0_fromeab1ab35_data40a22ce8_split147ce64e_seed2026_cfg34506fe0_codedb9ddff` |
-| N0001 | CatBoost + Stylometry | catboost_a5_s2027 | 71.7% | — | yes | 342 | reused_generated_v0_cache | `catboost_stylometry_catboost_a5_s2027_data40a22ce8_split783f3a95_seed2027_cfgfa54eec9_code667e2d0` |
-| N0002 | CatBoost + Stylometry | catboost_a5_s2028 | 54.4% | — | yes | 432 | reused_generated_v0_cache | `catboost_stylometry_catboost_a5_s2028_data40a22ce8_split3fbb4529_seed2028_cfgfa54eec9_code667e2d0` |
-| N0003 | CatBoost + Stylometry | catboost_a5_s2029 | 59.6% | — | yes | 468 | reused_generated_v0_cache | `catboost_stylometry_catboost_a5_s2029_data40a22ce8_splitd83f8692_seed2029_cfgfa54eec9_code667e2d0` |
 | N0004 | CatBoost + Stylometry | catboost_v1_a5_s2027 | 30.6% | — | yes | 0 | reused_generated_v0_cache | `catboost_stylometry_catboost_v1_a5_s2027_datada64f007_split94737c59_seed2027_cfg263b702b_code667e2d0` |
 | N0005 | CatBoost + Stylometry | catboost_v1_a5_s2027 | 25.2% | — | yes | 0 | reused_generated_v0_cache | `catboost_stylometry_catboost_v1_a5_s2027_datada64f007_split94737c59_seed2027_cfgfa54eec9_code667e2d0` |
 | N0006 | CatBoost + Stylometry | catboost_v1_a5_s2028 | 31.7% | — | yes | 0 | reused_generated_v0_cache | `catboost_stylometry_catboost_v1_a5_s2028_datada64f007_split94737c59_seed2028_cfg263b702b_code667e2d0` |
@@ -103,11 +100,6 @@ The checkpoint key is used in the global ranking; the exact experiment ID and ch
 | N0083 | SVC | v1.1 | 38.7% | — | yes | 0 | cached | `svc_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfg50e77a40_code1b9bfc2` |
 | N0084 | SVC | v1.1 | 38.3% | — | yes | 0 | cached | `svc_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfg66dc1893_code3076bd5` |
 | N0085 | SVC | v1.1 | 38.3% | — | yes | 0 | cached | `svc_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfg702a030b_code1b9bfc2` |
-
-Excluded from precision ranking and cascade because their fit partitions overlap frozen validation:
-- `catboost_stylometry_catboost_a5_s2027_data40a22ce8_split783f3a95_seed2027_cfgfa54eec9_code667e2d0`: 342 frozen V0 validation rows in its training partition.
-- `catboost_stylometry_catboost_a5_s2028_data40a22ce8_split3fbb4529_seed2028_cfgfa54eec9_code667e2d0`: 432 frozen V0 validation rows in its training partition.
-- `catboost_stylometry_catboost_a5_s2029_data40a22ce8_splitd83f8692_seed2029_cfgfa54eec9_code667e2d0`: 468 frozen V0 validation rows in its training partition.
 
 ## Precision coverage
 

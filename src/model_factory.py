@@ -819,10 +819,12 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
         torch.cuda.empty_cache()
 
 
-def load_text_only_backbone(transformers_module, checkpoint, revision, *, torch_dtype, local_files_only=True):
-    """Load a multimodal checkpoint on CPU and retain its text tower only."""
+def load_text_only_backbone(transformers_module, checkpoint, revision, *, torch_dtype,
+                            local_files_only=True, trust_remote_code=False, **model_kwargs):
+    """Load a multimodal checkpoint and retain its text tower only."""
     composite = transformers_module.AutoModel.from_pretrained(
-        checkpoint, revision=revision, torch_dtype=torch_dtype, local_files_only=local_files_only)
+        checkpoint, revision=revision, torch_dtype=torch_dtype, local_files_only=local_files_only,
+        trust_remote_code=trust_remote_code, **model_kwargs)
     text_backbone = getattr(composite, "language_model", None)
     if text_backbone is None:
         raise ValueError(f"{checkpoint} has no language_model text backbone")
@@ -894,8 +896,6 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         raise ValueError("quantization must be 'none' or 'qlora4'")
     if attention_backend not in {None, "sdpa", "flash_attention_2"}:
         raise ValueError("attention_backend must be 'sdpa', 'flash_attention_2', or None")
-    if quantization == "qlora4" and text_only_backbone:
-        raise ValueError("qlora4 currently supports direct backbone loading, not text-only composite loading")
     load_kwargs = {"attn_implementation": attention_backend} if attention_backend else {}
     quantization_config = None
     if attention_backend == "flash_attention_2":
@@ -921,7 +921,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         })
     if text_only_backbone:
         backbone = load_text_only_backbone(tr, checkpoint, revision, torch_dtype=model_dtype,
-                                           local_files_only=local_files_only)
+                                           local_files_only=local_files_only,
+                                           trust_remote_code=trust_remote_code, **load_kwargs)
     else:
         backbone = tr.AutoModel.from_pretrained(checkpoint, revision=revision, torch_dtype=model_dtype,
                                                  local_files_only=local_files_only,

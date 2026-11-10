@@ -26,8 +26,12 @@ LOCAL_TIMEZONE = ZoneInfo("Europe/Zurich")
 SNAPSHOT_INVENTORY = Path("artifacts/analysis/zod01_specialist_discovery/checkpoint_inventory.csv")
 SNAPSHOT_RULES = Path("artifacts/analysis/zod01_specialist_discovery/ranked_checkpoint_label_rules.csv")
 DEFAULT_CATALOG = Path("docs/checkpoint_label_catalog.csv")
+DEFAULT_TRUST_LIST = Path("docs/checkpoint_label_trust_list.csv")
+DEFAULT_TRUST_METADATA = Path("docs/checkpoint_label_trust_list.json")
 DEFAULT_ARTIFACT_ROOT = Path("artifacts")
 NEW_RUNS_START_UTC = "2026-11-08T00:00:00+00:00"
+TRUST_LIST_ORDERING = ["precision descending", "recall descending",
+                       "checkpoint sequence ascending", "label ascending"]
 
 
 def _resolve(value, root: Path) -> Path:
@@ -107,6 +111,91 @@ def load_catalog(path=DEFAULT_CATALOG) -> pd.DataFrame:
     if frame.duplicated(["experiment_id", "target_label"]).any():
         raise ValueError(f"duplicate checkpoint-label rows in {path}")
     return frame
+
+
+def refresh_trust_list(*, catalog_path=DEFAULT_CATALOG, trust_list_path=None,
+                       metadata_path=None, minimum_support=10) -> dict:
+    """Write a versioned, complete checkpoint-label ranking from the catalog.
+
+    Every catalog row receives a stable numeric SeqID. Rules meeting the
+    frozen validation eligibility and support requirements sort first; other
+    rows remain in the reference list after them and are marked ineligible.
+    """
+    import hashlib
+
+    catalog_path = Path(catalog_path)
+    if trust_list_path is None:
+        trust_list_path = (DEFAULT_TRUST_LIST if catalog_path.resolve() == DEFAULT_CATALOG.resolve()
+                           else catalog_path.with_name(f"{catalog_path.stem}_trust_list.csv"))
+    if metadata_path is None:
+        metadata_path = (DEFAULT_TRUST_METADATA if catalog_path.resolve() == DEFAULT_CATALOG.resolve()
+                         else Path(trust_list_path).with_suffix(".json"))
+    trust_list_path, metadata_path = Path(trust_list_path), Path(metadata_path)
+
+    source = load_catalog(catalog_path)
+    if source.empty:
+        raise ValueError(f"cannot create a trust list from an empty checkpoint catalog: {catalog_path}")
+    source_hash = hashlib.sha256(catalog_path.read_bytes()).hexdigest()
+    prior = {}
+    if metadata_path.is_file():
+        try:
+            prior = json.loads(metadata_path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            prior = {}
+    if (prior.get("source_catalog_sha256") == source_hash and trust_list_path.is_file()
+            and int(prior.get("rows", -1)) == len(source)
+            and prior.get("ordering") == TRUST_LIST_ORDERING
+            and int(prior.get("minimum_support", -1)) == int(minimum_support)):
+        return {"status": "unchanged", "version": prior.get("version"),
+                "generated_at_utc": prior.get("generated_at_utc"), "rows": len(source),
+                "trust_list_path": str(trust_list_path)}
+
+    numeric = ["precision", "recall", "prediction_count", "true_positive", "false_positive",
+               "false_negative", "validation_training_overlap"]
+    for column in numeric:
+        source[column] = pd.to_numeric(source[column], errors="coerce")
+    source["smoothed_precision"] = (source.true_positive.fillna(0) + 1.0) / (source.prediction_count.fillna(0) + 2.0)
+    evaluation_ok = source.evaluation_eligible.astype(str).str.lower().isin({"true", "1"})
+    no_overlap = source.validation_training_overlap.fillna(0).eq(0)
+    support_ok = source.prediction_count.fillna(0).ge(int(minimum_support))
+    source["rule_eligible"] = evaluation_ok & no_overlap & support_ok
+    source["SeqID_checkpoint_order"] = source.sequence_id.astype(str).str.extract(r"N(\d+)", expand=False).astype(float)
+
+    source = source.sort_values(
+        ["precision", "recall", "SeqID_checkpoint_order", "target_label"],
+        ascending=[False, False, True, True],
+        na_position="last", kind="stable").reset_index(drop=True)
+    source.insert(0, "SeqID", range(1, len(source) + 1))
+    source = source.drop(columns="SeqID_checkpoint_order")
+
+    old_number = 0
+    old_version = str(prior.get("version", ""))
+    match = re.fullmatch(r"trust-v(\d+)", old_version)
+    if match:
+        old_number = int(match.group(1))
+    version = f"trust-v{old_number + 1:03d}"
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    source.insert(1, "trust_list_version", version)
+    source.insert(2, "trust_list_generated_at_utc", generated_at)
+    trust_list_path.parent.mkdir(parents=True, exist_ok=True)
+    source.to_csv(trust_list_path, index=False)
+    metadata = {
+        "version": version,
+        "generated_at_utc": generated_at,
+        "source_catalog": str(catalog_path),
+        "source_catalog_sha256": source_hash,
+        "rows": int(len(source)),
+        "checkpoints": int(source.experiment_id.nunique()),
+        "eligible_rules": int(source.rule_eligible.sum()),
+        "minimum_support": int(minimum_support),
+        "smoothing": "Beta(1,1): (true_positive + 1) / (prediction_count + 2)",
+        "ordering": TRUST_LIST_ORDERING,
+    }
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    return {"status": "generated", "version": version, "generated_at_utc": generated_at,
+            "rows": len(source), "eligible_rules": int(source.rule_eligible.sum()),
+            "trust_list_path": str(trust_list_path), "metadata_path": str(metadata_path)}
 
 
 def sort_catalog_for_dashboard(frame: pd.DataFrame) -> pd.DataFrame:
@@ -337,7 +426,8 @@ def append_manifest(*, manifest: dict, manifest_path, catalog_path=DEFAULT_CATAL
 
 
 def refresh_catalog(*, artifact_root=DEFAULT_ARTIFACT_ROOT, data_dir="data/processed",
-                    catalog_path=DEFAULT_CATALOG, since_utc=NEW_RUNS_START_UTC) -> dict:
+                    catalog_path=DEFAULT_CATALOG, since_utc=NEW_RUNS_START_UTC,
+                    trust_list_path=None, trust_metadata_path=None) -> dict:
     """Seed the historical snapshot, then append eligible newer V1-all checkpoints."""
     catalog_path = Path(catalog_path)
     current = load_catalog(catalog_path)
@@ -366,8 +456,11 @@ def refresh_catalog(*, artifact_root=DEFAULT_ARTIFACT_ROOT, data_dir="data/proce
         if result.get("status") == "added":
             additions.append({"experiment_id": manifest.get("experiment_id"), **result})
     final = load_catalog(catalog_path)
+    trust_update = refresh_trust_list(catalog_path=catalog_path,
+        trust_list_path=trust_list_path, metadata_path=trust_metadata_path)
     return {"status": "refreshed", "checkpoint_count": int(final.experiment_id.nunique()),
-            "label_rows": len(final), "added": additions, "catalog_path": str(catalog_path)}
+            "label_rows": len(final), "added": additions, "catalog_path": str(catalog_path),
+            "trust_list": trust_update}
 
 
 def main(argv=None):
@@ -376,9 +469,12 @@ def main(argv=None):
     parser.add_argument("--data-dir", default="data/processed")
     parser.add_argument("--catalog", default=str(DEFAULT_CATALOG))
     parser.add_argument("--since-utc", default=NEW_RUNS_START_UTC)
+    parser.add_argument("--trust-list", default=None)
+    parser.add_argument("--trust-metadata", default=None)
     args = parser.parse_args(argv)
     print(json.dumps(refresh_catalog(artifact_root=args.artifact_root, data_dir=args.data_dir,
-        catalog_path=args.catalog, since_utc=args.since_utc), indent=2))
+        catalog_path=args.catalog, since_utc=args.since_utc,
+        trust_list_path=args.trust_list, trust_metadata_path=args.trust_metadata), indent=2))
 
 
 if __name__ == "__main__":

@@ -15,11 +15,20 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.registry import Registry
-from src.checkpoint_catalog import sort_catalog_for_dashboard
 from dashboard.training_lineage import training_lineage
 
 st.set_page_config(page_title="Name That LLM experiments", layout="wide")
 st.title("Name That LLM — experiment results")
+EXPERIMENT_REPORTS = {"zod_04": Path(__file__).resolve().parents[1] / "docs/zod_04.md"}
+requested_report = st.query_params.get("experiment_report")
+if requested_report:
+    report_path = EXPERIMENT_REPORTS.get(str(requested_report))
+    if report_path is not None and report_path.is_file():
+        st.markdown("[← Back to dashboard](./)")
+        st.markdown(report_path.read_text())
+        st.stop()
+    st.caption(f"No report is registered for experiment {requested_report}.")
+
 registry_path = Path("experiments/registry.sqlite")
 records = Registry(registry_path).rows() if registry_path.exists() else []
 records = sorted(records, key=lambda row: int(row.get("sequence_number") or 0), reverse=True)
@@ -50,28 +59,9 @@ def model_display(name):
             "ultrabert380": "UltraBERT-380M", "phi35_mini": "Phi-3.5 Mini",
             "embeddinggemma2": "EmbeddingGemma 2",
             "granite4_350m": "Granite 4.0 350M Base",
+            "minicpm5_2b": "MiniCPM5-2B-Base",
+            "hunyuan_1_8b": "Hunyuan-1.8B-Pretrain",
             "catboost_stylometry": "CatBoost + Stylometry"}.get(name, name)
-
-def blend_label(name):
-    if not name: return ""
-    train_weighted = name.startswith("train_weighted:")
-    if train_weighted: name = name.removeprefix("train_weighted:")
-    labels = {"svc": "SVC", "ultrabert380": "UltraBERT-380M", "qwen06": "qwen3-0.6B",
-              "qwen06_best_epoch03": "qwen3-0.6B",
-              "qwen17": "qwen3-1.7B", "qwen4": "qwen3-4.0B", "llama32_3b": "Llama-3.2-3B",
-              "smollm3_3b": "SmolLM3-3B",
-              "granite4_h_micro": "Granite 4.0 H Micro Base",
-              "granite4_350m": "Granite 4.0 350M Base",
-              "catboost_stylometry": "CatBoost + Stylometry",
-              "embeddinggemma2": "EmbeddingGemma 2", "gemma4_e2b": "Gemma 4 E2B", "gemma4_e4b": "Gemma 4 E4B",
-              "ministral3_3b": "Ministral 3 3B", "phi35_mini": "Phi-3.5 Mini"}
-    model_ids = sorted(labels, key=len, reverse=True)
-    members = []
-    for part in name.split("+"):
-        model_id = next((item for item in model_ids if part == item or part.startswith(item + "_")), None)
-        members.append(labels.get(model_id, part.split("_", 1)[0]))
-    kind = "Train-fitted weighted blend" if train_weighted else "Equal-weight blend"
-    return f"{kind}: {' + '.join(members)}"
 
 def manifest_for(row):
     path = row.get("artifact_path")
@@ -334,16 +324,22 @@ def render_current_training():
 
 def render_prediction_factory():
     st.subheader("Checkpoint accuracy by model label")
-    catalog_path = Path(__file__).resolve().parents[1] / "docs" / "checkpoint_label_catalog.csv"
+    root = Path(__file__).resolve().parents[1]
+    trust_list_path = root / "docs" / "checkpoint_label_trust_list.csv"
+    trust_metadata_path = root / "docs" / "checkpoint_label_trust_list.json"
     try:
-        if not catalog_path.is_file():
-            st.info("The checkpoint label catalog has not been created yet.")
+        if not trust_list_path.is_file():
+            st.info("The versioned checkpoint-label trust list has not been generated yet.")
             return
-        catalog = pd.read_csv(catalog_path)
+        catalog = pd.read_csv(trust_list_path)
         if catalog.empty:
-            st.info("No checkpoint label results are recorded yet.")
+            st.info("The checkpoint-label trust list is empty.")
             return
-        catalog = sort_catalog_for_dashboard(catalog)
+        metadata = json.loads(trust_metadata_path.read_text()) if trust_metadata_path.is_file() else {}
+        if "SeqID" not in catalog or catalog["SeqID"].isna().any():
+            raise ValueError("versioned trust list must assign a SeqID to every checkpoint-label row")
+        catalog["SeqID"] = pd.to_numeric(catalog["SeqID"], errors="raise").astype(int)
+        catalog = catalog.sort_values("SeqID", kind="stable").reset_index(drop=True)
         catalog["prediction_count"] = pd.to_numeric(catalog["prediction_count"], errors="coerce")
         catalog["validation_training_overlap"] = pd.to_numeric(
             catalog["validation_training_overlap"], errors="coerce").fillna(0)
@@ -356,25 +352,30 @@ def render_prediction_factory():
             axis=1)
         catalog["checkpoint_status"] = catalog["checkpoint_available"].map(
             lambda value: "Available" if str(value).lower() in {"true", "1"} else "Missing")
+        catalog["rule_eligible_display"] = catalog["rule_eligible"].map(
+            lambda value: "Yes" if str(value).lower() in {"true", "1"} else "No")
         catalog = catalog.rename(columns={
             "sequence_id": "ID", "target_label": "Model label",
             "checkpoint_model_display": "Checkpoint model", "checkpoint": "Checkpoint",
             "dataset_lineage": "Training dataset", "checkpoint_date": "Date (MM.DD)",
             "precision": "Label accuracy (precision)", "recall": "Recall",
             "prediction_count": "Predicted rows", "validation_note": "Validation note",
-            "checkpoint_status": "Checkpoint status",
+            "checkpoint_status": "Checkpoint status", "rule_eligible_display": "Rule eligible",
         })
-        columns = ["ID", "Model label", "Checkpoint model", "Checkpoint", "Training dataset",
+        columns = ["SeqID", "ID", "Model label", "Checkpoint model", "Checkpoint", "Training dataset",
                    "Date (MM.DD)", "Label accuracy (precision)", "Recall", "Predicted rows",
-                   "Checkpoint status", "Validation note"]
+                   "Rule eligible", "Checkpoint status", "Validation note"]
         table = catalog[columns].style.format({
+            "SeqID": "{:.0f}",
             "Label accuracy (precision)": "{:.1%}", "Recall": "{:.1%}",
             "Predicted rows": "{:.0f}",
         }, na_rep="—")
-        st.caption("Metrics use the frozen V0 validation set. Each ID identifies one checkpoint; its rows show results for each target model label.")
+        generated = metadata.get("generated_at_utc", "unknown generation time")
+        version = metadata.get("version", catalog.trust_list_version.iloc[0])
+        st.caption(f"Trust-list reference: {version}, generated {generated}. SeqID is the row's order in this complete ranked list; ID identifies the checkpoint. ZOD03 skips rows that fail support eligibility or its repeated-label rule. Metrics use frozen V0 validation.")
         st.dataframe(table, use_container_width=True, hide_index=True)
     except (OSError, ValueError, TypeError, KeyError) as exc:
-        st.error(f"Could not read checkpoint label catalog: {exc}")
+        st.error(f"Could not read checkpoint-label trust list: {exc}")
 
 columns = st.columns(4)
 columns[0].metric("Experiments", len(records))
@@ -382,7 +383,7 @@ columns[1].metric("Models", int(frame.Model.nunique()))
 columns[2].metric("Best validation accuracy", f"{validation['acc_raw'].max():.4f}" if not validation.empty else "—")
 columns[3].metric("Validation rows", int(profile_validation_rows) if profile_validation_rows is not None else "—")
 
-tabs = st.tabs(["Overview", "Prediction factory", "Current training", "Models", "Errors", "Ablations", "Compute", "Data"])
+tabs = st.tabs(["Overview", "Experiments", "Prediction factory", "Current training", "Models", "Errors", "Compute", "Data"])
 with tabs[0]:
     st.subheader("Experiment comparison")
     st.dataframe(frame, use_container_width=True, hide_index=True)
@@ -391,12 +392,28 @@ with tabs[0]:
     st.download_button("Download experiment table (CSV)", frame.to_csv(index=False), "experiments.csv", "text/csv")
     st.download_button("Download experiment table (JSON)", frame.to_json(orient="records", indent=2), "experiments.json", "application/json")
 with tabs[1]:
-    render_prediction_factory()
+    experiments = pd.DataFrame([{
+        "ID": 1,
+        "Name": "zod_04",
+        "Description": (
+            "Existing V1-all → V0 best UltraBERT checkpoint; extracts and caches all 24 "
+            "attention-mask-pooled layer representations with aligned V0 IDs and labels, "
+            "ranks layers using five-fold prompt-grouped CV, and fits 28 final classifiers: "
+            "24 individual layers and four multi-layer combinations."
+        ),
+        "Report": "?experiment_report=zod_04",
+    }])
+    st.dataframe(experiments, use_container_width=True, hide_index=True,
+        column_config={"Report": st.column_config.LinkColumn(
+            "Report", display_text="docs/zod_04.md")})
 
 with tabs[2]:
-    render_current_training()
+    render_prediction_factory()
 
 with tabs[3]:
+    render_current_training()
+
+with tabs[4]:
     st.subheader("Model summary")
     best_runs = {}
     for row in records:
@@ -458,7 +475,7 @@ with tabs[3]:
     else:
         st.info("No validation model results are recorded yet.")
 
-with tabs[4]:
+with tabs[5]:
     options = [r for r in records if metrics(r).get("confusion_matrix")]
     if not options: st.info("No confusion matrices are recorded yet.")
     else:
@@ -476,30 +493,6 @@ with tabs[4]:
             st.subheader("Model disagreement and unique corrections")
             rows = [{"Pair": pair, **values} for pair, values in ensemble.get("complementarity_all", {}).items()]
             if rows: st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-with tabs[5]:
-    st.subheader("Ablations and model additions")
-    ablations = validation[~validation.Model.str.contains("ensemble", case=False)]
-    ensemble_files = sorted(Path("artifacts/predictions").glob("ensemble_v0_*_metrics.json"))
-    if ablations.empty: st.info("Train multiple feature/model configurations to compare ablations.")
-    else:
-        baseline = st.selectbox("Reference experiment", ablations.Experiment.tolist())
-        baseline_score = float(ablations.loc[ablations.Experiment.eq(baseline), "acc_raw"].iloc[0])
-        ablations = ablations.copy(); ablations["Delta vs reference"] = ablations["acc_raw"] - baseline_score
-        st.caption(f"Validation · Reference: {baseline} · balanced accuracy {baseline_score:.4f}")
-        st.dataframe(ablations, use_container_width=True, hide_index=True)
-        st.plotly_chart(px.bar(ablations, x="Experiment", y="Delta vs reference", color="Model"), use_container_width=True)
-    if ensemble_files:
-        ensemble_file = ensemble_files[-1]
-        data = json.loads(ensemble_file.read_text())
-        blend_rows = []
-        for name, value in data.get("ensembles", {}).items():
-            ci=value.get("paired_bootstrap_vs_best_single", {})
-            metrics_without_members = {k: v for k, v in value["metrics"].items() if k != "members"}
-            blend_rows.append({"Blend": blend_label(name), "Weights": value.get("weights"), **metrics_without_members,
-                "95% delta lower": ci.get("lower"), "95% delta upper": ci.get("upper"),
-                "marginal contribution": value.get("marginal_contribution")})
-        if blend_rows: st.dataframe(pd.DataFrame(blend_rows), use_container_width=True, hide_index=True)
 
 with tabs[6]:
     st.subheader("Training and inference cost")

@@ -1,0 +1,25 @@
+model: llama31_8b
+checkpoint_selection: highest_validation_accuracy
+checkpoint_selection_version: 2
+checkpoint: meta-llama/Llama-3.1-8B
+revision: d04e592bb4f6aa9cfee91e2e20afa771667e1d4b
+epochs: 20
+early_stopping_patience: 2
+quantization: qlora4
+attention_backend: sdpa
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+batch_size: 1
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+auto_batch_size: true
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
+max_length: 384
+learning_rate: 5.0e-5
+optimizer: paged_adamw_8bit
+weight_decay: 0.0
+lr_scheduler_type: linear
+warmup_ratio: 0.02
+local_files_only: true

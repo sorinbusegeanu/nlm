@@ -376,7 +376,7 @@ def _training_reliability_predictions(candidates, *, data_dir="data/processed", 
                                        config.get("effective_batch_size") or
                                        config.get("batch_size") or 8)
                 inference_batch = max(1, min(int(config.get("inference_batch_size", configured_batch)), 4 if model_name in {
-                    "qwen4", "llama32_3b", "smollm3_3b", "granite4_h_micro",
+                    "qwen4", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro",
                     "granite4_350m", "gemma4_e2b", "gemma4_e4b", "ministral3_3b"} else 8))
                 probabilities, returned_classes = _predict_neural(
                     model_name, checkpoint, training.text.astype(str).tolist(), classes,

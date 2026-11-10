@@ -4,7 +4,7 @@ checkpoint_selection_version: 2
 checkpoint: Qwen/Qwen3-8B
 revision: b968826d9c46dd6066d109eabc6255188de91218
 epochs: 20
-early_stopping_patience: 3
+early_stopping_patience: 2
 quantization: qlora4
 attention_backend: sdpa
 lora_rank: 16

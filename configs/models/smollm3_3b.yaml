@@ -4,7 +4,7 @@ checkpoint_selection_version: 2
 checkpoint: HuggingFaceTB/SmolLM3-3B-Base
 revision: d78a42f79198603e614095753484a04c10c2b940
 epochs: 20
-early_stopping_patience: 3
+early_stopping_patience: 2
 batch_size: 1
 auto_batch_size: true
 max_batch_size: 1024
