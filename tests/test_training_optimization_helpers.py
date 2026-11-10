@@ -144,6 +144,22 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertEqual(runtime["final_validation_inference_seconds"], 1.25)
         self.assertEqual(runtime["best_checkpoint_restoration_seconds"], 0.0)
         self.assertEqual(runtime["manifest_prediction_export_seconds"], 0.0)
+        self.assertEqual(runtime["total_post_training_seconds"], 0.0)
+        self.assertEqual(runtime["inference_oom_fallbacks"], 0)
+
+    def test_lora_qlora_and_continuation_paths_expose_inference_controls(self):
+        parameters = inspect.signature(model_factory.train_qwen_lora_fold).parameters
+        self.assertIn("inference_batch_size", parameters)
+        self.assertIn("calibration_enabled", parameters)
+        self.assertIn("quantization", parameters)
+        qwen_cfg = pipeline._model_cfg("qwen06")
+        self.assertEqual(qwen_cfg["inference_batch_size"], 8)
+        self.assertTrue(qwen_cfg["calibration_enabled"])
+        catboost_cfg = pipeline._model_cfg("catboost_stylometry")
+        self.assertTrue(catboost_cfg["calibration_enabled"])
+        encoder_parameters = inspect.signature(model_factory.train_encoder_fold).parameters
+        self.assertIn("inference_batch_size", encoder_parameters)
+        self.assertIn("calibration_enabled", encoder_parameters)
 
     def test_epoch_predictions_are_reused_only_for_matching_selected_checkpoint(self):
         epoch_predictions = [{"epoch": 1, "scores": np.ones((2, 3))},
