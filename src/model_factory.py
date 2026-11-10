@@ -40,7 +40,20 @@ def _fit_temperature(train_logits, train_labels, classes):
     return float(np.exp(result.x))
 
 
-def train_svc(train_text, y_train, validation_text, classes, *, c=.5, calibration_cv=3, seed=2026, feature_config=None, cache_dir=None, fold_token=""):
+def _validation_losses(y_true, raw_scores, calibrated_probabilities, classes):
+    """Return comparable raw and calibrated multiclass validation log losses."""
+    from sklearn.metrics import log_loss
+
+    raw_probabilities = softmax(np.asarray(raw_scores, dtype=float), axis=1)
+    calibrated_probabilities = np.asarray(calibrated_probabilities, dtype=float)
+    return {
+        "validation_loss_raw": float(log_loss(y_true, raw_probabilities, labels=list(classes))),
+        "validation_loss_calibrated": float(log_loss(
+            y_true, calibrated_probabilities, labels=list(classes))),
+    }
+
+
+def train_svc(train_text, y_train, validation_text, classes, *, c=.5, calibration_cv=3, seed=2026, feature_config=None, cache_dir=None, fold_token="", validation_labels=None):
     """Fit TF-IDF on train only, then save raw margins and train-only calibration."""
     start = time.perf_counter()
     if cache_dir:
@@ -61,11 +74,45 @@ def train_svc(train_text, y_train, validation_text, classes, *, c=.5, calibratio
     pred_start = time.perf_counter()
     raw = _aligned(np.asarray(base.decision_function(x_val)), base.classes_, classes)
     prob = _aligned(calibrated.predict_proba(x_val), calibrated.classes_, classes)
+    validation_losses = (_validation_losses(validation_labels, raw, prob, classes)
+                         if validation_labels is not None else {})
     inference_seconds = time.perf_counter() - pred_start
     elapsed = time.perf_counter() - start
     return {"scores": raw, "probabilities": prob, "model": calibrated, "raw_model": base,
             "features": features, "cache_key": cache_key, "fit_seconds": elapsed, "classes": list(classes),
-            "inference_seconds": inference_seconds, "peak_gpu_memory_bytes": None}
+            "inference_seconds": inference_seconds, "peak_gpu_memory_bytes": None,
+            **validation_losses}
+
+
+class _BalancedAccuracyMetric:
+    """CatBoost eval metric matching sklearn's unweighted macro recall."""
+
+    def __init__(self, classes):
+        self.class_to_index = {str(label): index for index, label in enumerate(classes)}
+        self.class_count = len(classes)
+
+    def is_max_optimal(self):
+        return True
+
+    def get_final_error(self, error, weight):
+        return float(error) / max(float(weight), 1.0)
+
+    def evaluate(self, approxes, target, weight):
+        predicted = np.asarray(approxes, dtype=float).argmax(axis=0)
+        actual = []
+        for value in target:
+            label = str(value)
+            if label in self.class_to_index:
+                actual.append(self.class_to_index[label])
+                continue
+            numeric = int(float(value))
+            if not 0 <= numeric < self.class_count:
+                raise ValueError(f"CatBoost validation target is not a known class: {value!r}")
+            actual.append(numeric)
+        actual = np.asarray(actual, dtype=int)
+        recalls = [float(np.mean(predicted[actual == index] == index))
+                   for index in range(self.class_count) if np.any(actual == index)]
+        return float(sum(recalls)), float(len(recalls))
 
 
 def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, output_dir,
@@ -92,40 +139,35 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         x_train = np.asarray(x_train, dtype=np.float64)
         x_validation = np.asarray(x_validation, dtype=np.float64)
         feature_names = list(feature_names)
+    metric = _BalancedAccuracyMetric(classes) if checkpoint_selection_metric == "balanced_accuracy" else "Accuracy"
     model = CatBoostClassifier(iterations=int(iterations), depth=int(depth),
         learning_rate=float(learning_rate), l2_leaf_reg=float(l2_leaf_reg),
-        loss_function="MultiClass", eval_metric="Accuracy", auto_class_weights="Balanced",
+        loss_function="MultiClass", eval_metric=metric, auto_class_weights="Balanced",
         random_seed=int(seed), thread_count=int(thread_count), verbose=False,
         allow_writing_files=False)
     fit_kwargs = {}
     if init_model is not None:
         fit_kwargs["init_model"] = str(init_model)
-    if validation_labels is not None and checkpoint_selection_metric == "accuracy":
+    if validation_labels is not None:
         fit_kwargs.update({"eval_set": (x_validation, list(validation_labels)),
                            "use_best_model": True,
                            "early_stopping_rounds": int(early_stopping_rounds)})
     model.fit(x_train, list(y_train), **fit_kwargs)
     iteration_metrics = []
-    selected_iteration = int(model.tree_count_) if model.tree_count_ else None
+    selected_iteration = (int(model.get_best_iteration()) if validation_labels is not None
+                          else int(model.tree_count_) if model.tree_count_ else None)
+    if validation_labels is not None and selected_iteration < 0:
+        raise RuntimeError("CatBoost did not identify a best validation iteration")
     selected_validation_accuracy = None
     selected_validation_balanced_accuracy = None
-    if validation_labels is not None and checkpoint_selection_metric == "balanced_accuracy":
-        from sklearn.metrics import accuracy_score, balanced_accuracy_score
-        best_score = float("-inf")
-        for tree_count, predicted in enumerate(
-                model.staged_predict(x_validation, eval_period=1), start=1):
-            accuracy = float(accuracy_score(validation_labels, predicted))
-            balanced_accuracy = float(balanced_accuracy_score(validation_labels, predicted))
-            iteration_metrics.append({"iteration": tree_count, "accuracy": accuracy,
-                                     "balanced_accuracy": balanced_accuracy})
-            if balanced_accuracy > best_score:
-                best_score = balanced_accuracy
-                selected_iteration = tree_count
-                selected_validation_accuracy = accuracy
-                selected_validation_balanced_accuracy = balanced_accuracy
-        if selected_iteration is None:
-            raise RuntimeError("CatBoost produced no staged validation predictions")
-        model.shrink(ntree_end=selected_iteration)
+    if validation_labels is not None:
+        history = model.get_evals_result().get("validation", {})
+        metric_prefix = "Balanced" if checkpoint_selection_metric == "balanced_accuracy" else "Accuracy"
+        metric_values = next((values for name, values in history.items()
+                              if metric_prefix.casefold() in name.casefold()), [])
+        iteration_metrics = [{"iteration": index + 1,
+                              f"validation_{checkpoint_selection_metric}": float(value)}
+                             for index, value in enumerate(metric_values)]
     train_raw = np.asarray(model.predict(x_train, prediction_type="RawFormulaVal"))
     pred_start = time.perf_counter()
     validation_raw = np.asarray(model.predict(x_validation, prediction_type="RawFormulaVal"))
@@ -139,14 +181,17 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
     raw = _aligned(validation_raw, model_classes, classes)
     temperature = _fit_temperature(train_raw, list(y_train), classes) if temperature_calibration else 1.0
     probabilities = softmax(raw / temperature, axis=1)
+    validation_losses = (_validation_losses(validation_labels, raw, probabilities, classes)
+                         if validation_labels is not None else {})
     from sklearn.metrics import accuracy_score
     validation_accuracy = (float(accuracy_score(validation_labels,
         np.asarray(classes)[raw.argmax(axis=1)])) if validation_labels is not None else None)
-    best_iteration = (selected_iteration if validation_labels is not None and
-                      checkpoint_selection_metric == "balanced_accuracy" else
-                      int(model.get_best_iteration()) if validation_labels is not None else None)
-    if validation_labels is not None and checkpoint_selection_metric == "accuracy":
+    if validation_labels is not None:
         selected_validation_accuracy = validation_accuracy
+        from sklearn.metrics import balanced_accuracy_score
+        selected_validation_balanced_accuracy = float(balanced_accuracy_score(
+            validation_labels, np.asarray(classes)[raw.argmax(axis=1)]))
+    best_iteration = selected_iteration if validation_labels is not None else None
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     model.save_model(str(output_dir / "model.cbm"))
@@ -177,6 +222,7 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         "selected_iteration": best_iteration, "selected_validation_accuracy": selected_validation_accuracy,
         "selected_validation_balanced_accuracy": selected_validation_balanced_accuracy,
         "validation_metrics_by_iteration": iteration_metrics,
+        **validation_losses,
         "feature_count": int(x_train.shape[1]), "feature_names": feature_names,
         "feature_recipe": feature_recipe,
         "checkpoint_selection_metric": f"validation_{checkpoint_selection_metric}" if validation_labels is not None else None,
@@ -323,7 +369,8 @@ def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *,
 
 def train_frozen_backbone_fold(model_name, train_text, y_train, validation_text, classes, *,
                                checkpoint, revision, output_dir, max_length=384, batch_size=8,
-                               c=.5, calibration_cv=3, seed=2026, fix_mistral_regex=False):
+                               c=.5, calibration_cv=3, seed=2026, fix_mistral_regex=False,
+                               validation_labels=None):
     """Fit a train-only LinearSVC readout over frozen model-specific text features."""
     if model_name not in FROZEN_BACKBONE_MODELS:
         raise ValueError(f"unsupported frozen backbone: {model_name}")
@@ -349,6 +396,8 @@ def train_frozen_backbone_fold(model_name, train_text, y_train, validation_text,
     calibrated.fit(train_features, y_train)
     raw = _aligned(np.asarray(base.decision_function(validation_features)), base.classes_, classes)
     probabilities = _aligned(calibrated.predict_proba(validation_features), calibrated.classes_, classes)
+    validation_losses = (_validation_losses(validation_labels, raw, probabilities, classes)
+                         if validation_labels is not None else {})
     validation_fraction = 1.0 if same_rows else len(validation_text) / max(1, len(train_text) + len(validation_text))
     inference_seconds = extraction_seconds * validation_fraction + time.perf_counter() - inference_started
     output_dir = Path(output_dir)
@@ -364,7 +413,8 @@ def train_frozen_backbone_fold(model_name, train_text, y_train, validation_text,
             "raw_model": base, "fit_seconds": time.perf_counter() - start,
             "inference_seconds": inference_seconds, "classes": list(classes),
             "calibration_method": "sigmoid train-only CV", "checkpoint": str(output_dir),
-            "readout_path": str(joblib_path), "peak_gpu_memory_bytes": None}
+            "readout_path": str(joblib_path), "peak_gpu_memory_bytes": None,
+            **validation_losses}
 
 
 def _require_neural():
@@ -425,10 +475,12 @@ def _live_training_progress_callback(TrainerCallback, output_dir):
                 return control
             row = self.epochs.setdefault(epoch, {"epoch": epoch})
             for source, target in (("learning_rate", "learning_rate"), ("loss", "train_loss"),
-                                   ("eval_loss", "validation_loss"), ("eval_accuracy", "accuracy"),
+                                   ("eval_loss", "validation_loss_raw"), ("eval_accuracy", "accuracy"),
                                    ("eval_balanced_accuracy", "balanced_accuracy")):
                 if logs.get(source) is not None:
                     row[target] = float(logs[source])
+            if logs.get("eval_loss") is not None:
+                row["validation_loss"] = float(logs["eval_loss"])
             self._write_progress()
             return control
     return LiveTrainingProgressCallback()
@@ -443,7 +495,9 @@ def _accuracy_early_stopping_callback(TrainerCallback, patience, metric="accurac
     class AccuracyEarlyStoppingCallback(TrainerCallback):
         def __init__(self):
             self.patience = patience
-            self.best_accuracy = float("-inf")
+            self.best_metric_value = float("-inf")
+            self.best_accuracy = None
+            self.best_balanced_accuracy = None
             self.best_epoch = None
             self.bad_epochs = 0
             self.stopped_epoch = None
@@ -454,8 +508,10 @@ def _accuracy_early_stopping_callback(TrainerCallback, patience, metric="accurac
                 return control
             epoch = int(round(float(state.epoch or 0)))
             value = float(value)
-            if value > self.best_accuracy:
-                self.best_accuracy = value
+            if value > self.best_metric_value:
+                self.best_metric_value = value
+                self.best_accuracy = (metrics or {}).get("eval_accuracy")
+                self.best_balanced_accuracy = (metrics or {}).get("eval_balanced_accuracy")
                 self.best_epoch = epoch
                 self.bad_epochs = 0
             else:
@@ -473,11 +529,31 @@ def _early_stopping_summary(callback, patience, max_epochs, metric="accuracy"):
         "metric": f"validation_{metric}",
         "patience_epochs": int(patience),
         "best_epoch": callback.best_epoch,
-        f"best_validation_{metric}": (callback.best_accuracy
-                                       if callback.best_epoch is not None else None),
+        "best_validation_accuracy": callback.best_accuracy,
+        "best_validation_balanced_accuracy": callback.best_balanced_accuracy,
+        "best_validation_metric_value": (callback.best_metric_value
+                                         if callback.best_epoch is not None else None),
         "stopped_early": callback.stopped_epoch is not None and callback.stopped_epoch < max_epochs,
         "stopped_epoch": callback.stopped_epoch,
     }
+
+
+def _epoch_prediction_capture_callback(TrainerCallback, latest_prediction):
+    """Capture the probability-model inputs emitted by each validation epoch."""
+    class EpochPredictionCaptureCallback(TrainerCallback):
+        def __init__(self):
+            self.predictions = []
+
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            logits = latest_prediction.pop("logits", None)
+            if logits is not None:
+                self.predictions.append({
+                    "epoch": int(round(float(state.epoch or len(self.predictions) + 1))),
+                    "scores": logits,
+                })
+            return control
+
+    return EpochPredictionCaptureCallback()
 
 
 def _epoch_decay_lambda(*, decay, steps_per_epoch, warmup_steps=0):
@@ -497,7 +573,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        resume_checkpoint=None, learning_rate_decay=None,
                        select_best_checkpoint=False,
                        optimizer="adamw_torch", weight_decay=0.0, lr_scheduler_type=None,
-                       warmup_ratio=0.0, warmup_epochs=None, early_stopping_patience=3,
+                       warmup_ratio=0.0, warmup_epochs=None, early_stopping_patience=2,
                        auto_batch_size=False, max_batch_size=1024,
                        batch_probe_safety_fraction=0.95,
                        checkpoint_selection_metric="accuracy"):
@@ -544,9 +620,11 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     (Path(output_dir) / "batch_size_probe.json").write_text(json.dumps(batch_probe, indent=2) + "\n")
     print(f"Encoder batch-size selection: {json.dumps(batch_probe, sort_keys=True)}", flush=True)
+    captured_validation_prediction = {}
     def compute_metrics(eval_prediction):
         from sklearn.metrics import accuracy_score, balanced_accuracy_score
         logits = eval_prediction.predictions[0] if isinstance(eval_prediction.predictions, tuple) else eval_prediction.predictions
+        captured_validation_prediction["logits"] = np.asarray(logits, dtype=np.float32).copy()
         predictions = np.asarray(logits).argmax(axis=1)
         labels = np.asarray(eval_prediction.label_ids)
         return {"accuracy": float(accuracy_score(labels, predictions)),
@@ -554,7 +632,17 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     from transformers import TrainerCallback
+    from torch.utils.data import SequentialSampler
+
+    class OrderedValidationTrainer(tr.Trainer):
+        def _get_eval_sampler(self, eval_dataset):
+            # Keep each epoch's saved validation outputs aligned to input rows.
+            # Training still uses its configured length-grouped sampler.
+            return SequentialSampler(eval_dataset)
+
     live_callback = _live_training_progress_callback(TrainerCallback, out)
+    epoch_prediction_callback = _epoch_prediction_capture_callback(
+        TrainerCallback, captured_validation_prediction)
     if learning_rate_decay is not None and not 0 < float(learning_rate_decay) <= 1:
         raise ValueError("learning_rate_decay must be in (0, 1]")
     if validation_labels is None:
@@ -594,11 +682,11 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         logging_strategy="epoch", fp16=use_fp16, bf16=use_bf16,
         dataloader_num_workers=0, **_length_grouping_args(tr))
 
-    trainer_type = tr.Trainer
+    trainer_type = OrderedValidationTrainer
     if learning_rate_decay is not None:
         decay = float(learning_rate_decay)
 
-        class EpochDecayTrainer(tr.Trainer):
+        class EpochDecayTrainer(OrderedValidationTrainer):
             def create_scheduler(self, num_training_steps, optimizer=None):
                 if self.lr_scheduler is None:
                     optimizer = optimizer or self.optimizer
@@ -611,7 +699,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
 
         trainer_type = EpochDecayTrainer
 
-    callbacks = [live_callback]
+    callbacks = [live_callback, epoch_prediction_callback]
     early_stopping_callback = None
     if validation_labels is not None:
         early_stopping_callback = _accuracy_early_stopping_callback(
@@ -685,6 +773,20 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     if not np.isfinite(logits).all(): raise ValueError("encoder produced non-finite scores")
     probs = softmax(logits / temperature, axis=1)
     epoch_history = [dict(entry) for entry in trainer.state.log_history if "eval_accuracy" in entry]
+    for entry in epoch_history:
+        if entry.get("eval_loss") is not None:
+            entry["validation_loss_raw"] = float(entry["eval_loss"])
+    result_epoch = (best_state["epoch"] if select_best_checkpoint else
+                    max((int(round(float(item.get("epoch", 0)))) for item in epoch_history), default=None))
+    selected_epoch_metrics = next((item for item in epoch_history
+        if int(round(float(item.get("epoch", 0)))) == result_epoch), {})
+    validation_loss_raw = selected_epoch_metrics.get("eval_loss")
+    if validation_loss_raw is None:
+        validation_loss_raw = log_loss(validation_labels, softmax(logits, axis=1), labels=classes)
+    validation_loss_calibrated = log_loss(validation_labels, probs, labels=classes)
+    if selected_epoch_metrics:
+        selected_epoch_metrics["validation_loss_calibrated"] = float(validation_loss_calibrated)
+        selected_epoch_metrics["calibration_temperature"] = float(temperature)
     if learning_rate_decay is not None:
         for entry in epoch_history:
             epoch = int(round(float(entry.get("epoch", 1))))
@@ -697,6 +799,10 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "classes": list(classes), "calibration_temperature": temperature, "calibration_method": "train-only scalar temperature",
             "baseline_validation_metrics": baseline_metrics,
             "validation_metrics_by_epoch": epoch_history,
+            "validation_predictions_by_epoch": epoch_prediction_callback.predictions,
+            "validation_loss_raw": float(validation_loss_raw),
+            "validation_loss_calibrated": float(validation_loss_calibrated),
+            "calibration_temperature": float(temperature),
             "best_epoch": best_state["epoch"],
             "best_validation_accuracy": best_state["accuracy"] if best_state["epoch"] is not None else None,
             "best_validation_balanced_accuracy": best_state["balanced_accuracy"] if best_state["epoch"] is not None else None,
@@ -904,7 +1010,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          lora_exclude_modules=None, text_only_backbone=False,
                          lr_scheduler_type=None, warmup_ratio=0.0,
                          warmup_epochs=None, optimizer="adamw_torch", weight_decay=0.0,
-                         early_stopping_patience=3, trust_remote_code=False,
+                         early_stopping_patience=2, trust_remote_code=False,
                          quantization="none", attention_backend=None,
                          checkpoint_selection_metric="accuracy"):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
@@ -918,7 +1024,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     # Training is deliberately cache-only, even if a caller supplies a false config value.
     local_files_only = True
     from torch import nn
-    from torch.utils.data import Dataset
+    from torch.utils.data import Dataset, SequentialSampler
     from transformers.modeling_outputs import SequenceClassifierOutput
     start = time.perf_counter(); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
@@ -1026,9 +1132,11 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         classifier_path = Path(resume_checkpoint)/"classifier.pt"
         if not classifier_path.is_file(): raise FileNotFoundError(f"continuation checkpoint has no classifier head: {classifier_path}")
         model.classifier.load_state_dict(torch.load(classifier_path, map_location="cpu", weights_only=True))
+    captured_validation_prediction = {}
     def compute_metrics(eval_prediction):
         from sklearn.metrics import accuracy_score, balanced_accuracy_score
         logits = eval_prediction.predictions[0] if isinstance(eval_prediction.predictions, tuple) else eval_prediction.predictions
+        captured_validation_prediction["logits"] = np.asarray(logits, dtype=np.float32).copy()
         labels = np.asarray(eval_prediction.label_ids)
         predicted = np.asarray(logits).argmax(axis=1)
         return {"accuracy": float(accuracy_score(labels, predicted)),
@@ -1043,9 +1151,12 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "gradient_checkpointing": bool(gradient_checkpointing),
     }
     class EpochSnapshotCallback(TrainerCallback):
-        def __init__(self): self.checkpoints=[]
+        def __init__(self): self.checkpoints=[]; self.validation_predictions=[]
         def on_evaluate(self,args,state,control,metrics=None,**kwargs):
             epoch=int(round(state.epoch or len(self.checkpoints)+1))
+            logits=captured_validation_prediction.pop("logits",None)
+            if logits is not None:
+                self.validation_predictions.append({"epoch":epoch,"scores":logits})
             epoch_dir=out/f"epoch-{epoch:02d}"
             epoch_dir.mkdir(parents=True,exist_ok=True)
             model.backbone.save_pretrained(epoch_dir,safe_serialization=True)
@@ -1128,9 +1239,13 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         bf16=use_bf16,
         remove_unused_columns=False,dataloader_num_workers=0,
         **_length_grouping_args(tr))
-    trainer_type=tr.Trainer
+    class OrderedValidationTrainer(tr.Trainer):
+        def _get_eval_sampler(self, eval_dataset):
+            return SequentialSampler(eval_dataset)
+
+    trainer_type=OrderedValidationTrainer
     if scheduler == "epoch_decay":
-        class EpochDecayTrainer(tr.Trainer):
+        class EpochDecayTrainer(OrderedValidationTrainer):
             def create_scheduler(self,num_training_steps,optimizer=None):
                 if self.lr_scheduler is None:
                     optimizer=optimizer or self.optimizer
@@ -1228,12 +1343,33 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     (out/"checkpoint_manifest.json").write_text(json.dumps(checkpoint_metadata,indent=2)+"\n")
     if not np.isfinite(logits).all(): raise ValueError("Qwen adapter produced non-finite scores")
     probs=softmax(logits/temperature,axis=1)
+    validation_loss_raw = (selected.get("eval_loss") if eval_each_epoch else None)
+    if validation_loss_raw is None and validation_labels is not None:
+        from sklearn.metrics import log_loss
+        validation_loss_raw = float(log_loss(
+            validation_labels, softmax(logits, axis=1), labels=list(classes)))
+    validation_loss_calibrated = None
+    if validation_labels is not None:
+        from sklearn.metrics import log_loss
+        validation_loss_calibrated = float(log_loss(
+            validation_labels, probs, labels=list(classes)))
+        if eval_each_epoch:
+            selected["validation_loss_raw"] = float(validation_loss_raw)
+            selected["validation_loss_calibrated"] = validation_loss_calibrated
+            selected["calibration_temperature"] = float(temperature)
+        for entry in validation_metrics_by_epoch:
+            if entry.get("eval_loss") is not None:
+                entry["validation_loss_raw"] = float(entry["eval_loss"])
     trainable=sum(p.numel() for p in model.parameters() if p.requires_grad)
     return {"scores":logits,"probabilities":probs,"model":model,"tokenizer":tokenizer,
         "fit_seconds":time.perf_counter()-start,"inference_seconds":inference_seconds,
         "classes":list(classes),"trainable_parameters":trainable,"calibration_temperature":temperature,
         "calibration_method":"train-only scalar temperature",
         "validation_metrics_by_epoch":validation_metrics_by_epoch,
+        "validation_loss_raw": (float(validation_loss_raw)
+                                if validation_loss_raw is not None else None),
+        "validation_loss_calibrated": validation_loss_calibrated,
+        "validation_predictions_by_epoch":snapshot_callback.validation_predictions,
         "early_stopping": (_early_stopping_summary(early_stopping_callback, early_stopping_patience, epochs,
                                                     metric=checkpoint_selection_metric)
                            if early_stopping_callback is not None else None),

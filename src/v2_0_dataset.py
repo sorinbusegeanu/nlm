@@ -6,6 +6,7 @@ the data factory and records row-level exclusions in data/processed.
 from __future__ import annotations
 
 import hashlib
+import argparse
 import json
 import re
 import shutil
@@ -35,6 +36,19 @@ OUT = ROOT / "data/processed/dataset_v2.0.parquet"
 PROFILE = ROOT / "data/processed/dataset_profile_v2.0.json"
 REMOVALS = ROOT / "data/processed/v2.0_removals.csv"
 REPORT = ROOT / "docs/v2.0.md"
+VERSION = "v2.0"
+INCLUDE_UNVERIFIED = False
+
+
+def configure_outputs(version: str, include_unverified: bool) -> None:
+    if version not in {"v2.0", "v2.1"}:
+        raise ValueError("supported dataset versions are v2.0 and v2.1")
+    global VERSION, INCLUDE_UNVERIFIED, OUT, PROFILE, REMOVALS, REPORT
+    VERSION, INCLUDE_UNVERIFIED = version, include_unverified
+    OUT = ROOT / f"data/processed/dataset_{version}.parquet"
+    PROFILE = ROOT / f"data/processed/dataset_profile_{version}.json"
+    REMOVALS = ROOT / f"data/processed/{version}_removals.csv"
+    REPORT = ROOT / f"docs/{version}.md"
 
 
 def stable_hash(value: str) -> str:
@@ -132,6 +146,7 @@ def load_candidates(labels: set[str]) -> tuple[pd.DataFrame, dict[str, int], dic
     g37_unverified = pd.read_parquet(g37_unverified_path)
     originals["gemini37_unverified"] = len(g37_unverified)
     input_hashes[str(g37_unverified_path.relative_to(ROOT))] = _hash_file(g37_unverified_path)
+    g37_unverified = g37_unverified.rename(columns={"prompt_group": "prompt_id"})
     g37_unverified["source_model_attribution"] = "unverified_collection"
     frames.append(_frame_defaults(g37_unverified, "gemini37_unverified"))
 
@@ -151,12 +166,18 @@ def load_candidates(labels: set[str]) -> tuple[pd.DataFrame, dict[str, int], dic
     return data, originals, input_hashes
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Build a balanced NLM external-only dataset")
+    parser.add_argument("--version", choices=("v2.0", "v2.1"), default="v2.0")
+    parser.add_argument("--include-unverified", action="store_true",
+                        help="include unflagged rows from the unverified Gemini 3.7 collection")
+    args = parser.parse_args(argv)
+    configure_outputs(args.version, args.include_unverified)
     from langdetect import DetectorFactory
     DetectorFactory.seed = SEED
     for target in (OUT, PROFILE, REMOVALS, REPORT):
         if target.exists():
-            raise FileExistsError(f"refusing to overwrite existing V2.0 output: {target}")
+            raise FileExistsError(f"refusing to overwrite existing {VERSION} output: {target}")
     v0 = pd.read_parquet(V0_PATH)
     v0_text = set(v0.text.fillna("").astype(str).map(_normal_text)) - {""}
     v0_prompt_ids = set(v0.prompt_id.fillna("").astype(str)) - {""}
@@ -173,7 +194,8 @@ def main() -> None:
 
     reject(~data._eligible_label, "invalid_or_noncompetition_label")
     reject(data.model.fillna("").str.strip().eq(""), "missing_model_attribution")
-    reject(data._source_type.eq("gemini37_unverified"), "model_attribution_unverified_collection")
+    if not INCLUDE_UNVERIFIED:
+        reject(data._source_type.eq("gemini37_unverified"), "model_attribution_unverified_collection")
     reject(data.text.str.strip().eq(""), "empty_response")
     lengths = data.text.str.len()
     reject(lengths.lt(MIN_CHARS), "response_under_50_characters")
@@ -260,7 +282,7 @@ def main() -> None:
     # For same-label source duplicates keep the candidate with best provenance,
     # preferring sources outside V1, then Open Pool/B2M/V1.3, then stable ID.
     active = data.loc[data._reason.eq("")].copy()
-    active["_source_rank"] = active._source_type.map({"open_pool": 0, "b2m": 1, "v1.3_sources": 2, "v1_fallback": 3}).fillna(9)
+    active["_source_rank"] = active._source_type.map({"open_pool": 0, "b2m": 1, "v1.3_sources": 2, "gemini37_unverified": 3, "v1_fallback": 4}).fillna(9)
     active = active.sort_values(["_in_v1", "_source_rank", "id"], kind="stable")
     duplicate_idx = active.index[active._norm.duplicated(keep="first")]
     reject(data.index.isin(duplicate_idx), "duplicate_normalized_response")
@@ -269,7 +291,7 @@ def main() -> None:
     # where feasible; then source-diverse round-robin across prompt groups.
     eligible = data.loc[data._reason.eq("")].copy()
     eligible_counts = eligible.model.value_counts().reindex(sorted(labels), fill_value=0)
-    eligible["_source_rank"] = eligible._source_type.map({"open_pool": 0, "b2m": 1, "v1.3_sources": 2, "v1_fallback": 3}).fillna(9)
+    eligible["_source_rank"] = eligible._source_type.map({"open_pool": 0, "b2m": 1, "v1.3_sources": 2, "gemini37_unverified": 3, "v1_fallback": 4}).fillna(9)
     eligible["_seed_order"] = eligible.apply(lambda r: stable_hash(f"{SEED}|{r.model}|{r.prompt_id}|{r.id}"), axis=1)
     quota = min(TARGET, int(eligible.model.value_counts().reindex(sorted(labels), fill_value=0).min()))
     if quota <= 0:
@@ -312,7 +334,8 @@ def main() -> None:
             raise RuntimeError(f"could not reach common quota {quota} for {label}")
         selected_parts.append(data.loc[chosen].copy())
     selected = pd.concat(selected_parts, ignore_index=True)
-    selected["id"] = ["v20_" + stable_hash(f"{row['_source_type']}|{row['id']}|{row['_norm']}")[:32]
+    version_tag = VERSION.replace(".", "").casefold()
+    selected["id"] = [version_tag + "_" + stable_hash(f"{row['_source_type']}|{row['id']}|{row['_norm']}")[:32]
                        for _, row in selected.iterrows()]
     selected["source_row_id"] = selected["_source_row_id"]
     selected["source_type"] = selected["_source_type"]
@@ -361,12 +384,14 @@ def main() -> None:
     selected.to_parquet(OUT, index=False)
     output_hash = _hash_file(OUT)
     profile = {
-        "dataset_version": "v2.0", "dataset_sha256": output_hash, "rows": len(selected),
+        "dataset_version": VERSION, "dataset_sha256": output_hash, "rows": len(selected),
         "seed": SEED, "target_rows_per_class": TARGET, "final_rows_per_class": quota,
         "classes": sorted(labels), "class_counts": class_counts,
         "eligible_rows_by_label_before_balancing": {str(k): int(v) for k, v in eligible_counts.items()},
         "quota_limiting_labels": [str(k) for k, v in eligible_counts.items() if int(v) == quota],
         "training_only": True, "external_source_rows_only": True,
+        "unverified_gemini37_included_by_user_request": INCLUDE_UNVERIFIED,
+        "attribution_caveat": ("The gemini37_unverified source is explicitly labeled unverified; rows without its routing-risk flag are included at the user's request. Model attribution is not independently confirmed." if INCLUDE_UNVERIFIED else None),
         "v1_fallback_rows_used": int(selected.source_type.eq("v1_fallback").sum()),
         "selected_rows_already_in_v1": selected_in_v1,
         "v1_overlap_definition": "normalized exact response match against data/processed/dataset_v1.parquet",
@@ -387,20 +412,20 @@ def main() -> None:
         "removal_audit_path": str(REMOVALS.relative_to(ROOT)),
         "removal_audit_sha256": _hash_file(REMOVALS),
         "deduplication": {"normalized_text": "NFKC, casefold, collapsed whitespace", "same-label_duplicate_retained": "best ranked source (Open Pool, B2M, V1.3, V1 fallback)", "cross-label_duplicate": "all conflicting copies removed"},
-        "selection": {"priority": "not in V1 first; then Open Pool, B2M, V1.3 source rows, V1 fallback; deterministic seed order", "prompt_diversity": "at most one per prompt group during first selection pass", "quota_reduced_below_3000": quota < TARGET},
+        "selection": {"priority": "not in V1 first; then Open Pool, B2M, V1.3, unverified Gemini 3.7 when enabled, V1 fallback; deterministic seed order", "prompt_diversity": "at most one per prompt group during first selection pass", "quota_reduced_below_3000": quota < TARGET},
         "v1_3_raw_sources": {"raw_normalized_candidate_rows": originals["v1.3_raw_normalized_rows"], "source_inputs": {k: v for k, v in input_hashes.items() if "external_candidates/" in k}},
         "quality_policy": {"min_response_chars": MIN_CHARS, "max_response_chars": MAX_CHARS, "language": "English only; source English metadata accepted, otherwise langdetect; unknown excluded", "excluded": ["invalid label", "missing source/file/license/prompt provenance", "exact V0 response or prompt-ID overlap", "duplicate responses", "code/programming signature", "reasoning/conversation/tool traces", "explicit truncation metadata or markers"]},
     }
     PROFILE.write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n")
 
-    report = ["# V2.0 dataset card", "", "## Summary", "",
-              f"V2.0 contains **{len(selected):,} external training examples**, balanced at **{quota:,} per class** across 18 competition labels. Sampling seed: **{SEED}**. It uses no training or inference.", "",
+    report = [f"# {VERSION} dataset card", "", "## Summary", "",
+              f"{VERSION} contains **{len(selected):,} external training examples**, balanced at **{quota:,} per class** across 18 competition labels. Sampling seed: **{SEED}**. It uses no training or inference.", "",
               "The available V1.3 source rows are included through the normalized V1.3 build output. Open Pool and B2M are ingested from their raw public tables. Rows not already present in V1 were prioritized. If a class did not have enough unique eligible external rows, rows already present in V1 could fill the quota; these are counted below and retain their best external provenance.", "",
               "## Class balance", "", "| Label | Rows | % |", "|---|---:|---:|"]
     for label, n in class_counts.items(): report.append(f"| {label} | {n:,} | {n / len(selected):.2%} |")
     report += ["", "## Source and V1 reuse", "", "| Source type | Retained rows |", "|---|---:|"]
     for row in profile["retained_rows_by_source_type"]: report.append(f"| {row['source_type']} | {row['rows']:,} |")
-    report += ["", f"Exact normalized-response overlap with V1 (`dataset_v1.parquet`): **{selected_in_v1:,} selected rows**; rows sourced exclusively from the V1 fallback table: **{int(selected.source_type.eq('v1_fallback').sum()):,}**. Full per-source/per-label original and retained counts are in [`dataset_profile_v2.0.json`](../data/processed/dataset_profile_v2.0.json); row-level exclusions are in [`v2.0_removals.csv`](../data/processed/v2.0_removals.csv).", "",
+    report += ["", f"Exact normalized-response overlap with V1 (`dataset_v1.parquet`): **{selected_in_v1:,} selected rows**; rows sourced exclusively from the V1 fallback table: **{int(selected.source_type.eq('v1_fallback').sum()):,}**. Full per-source/per-label original and retained counts are in [`dataset_profile_{VERSION}.json`](../data/processed/dataset_profile_{VERSION}.json); row-level exclusions are in [`{VERSION}_removals.csv`](../data/processed/{VERSION}_removals.csv).", "",
                "## Original and retained counts by source and label", "", "| Source family | Label | Original candidates | Retained |", "|---|---|---:|---:|"]
     original_counts = pd.DataFrame(profile["original_rows_by_source_and_label"]).rename(columns={"_source_type": "source_type"})
     retained_counts = pd.DataFrame(profile["retained_rows_by_source_and_label"])
@@ -418,7 +443,8 @@ def main() -> None:
         report.append(f"| {row['model']} | {int(row['source_datasets'])} | {int(row['prompt_groups']):,} |")
     report += ["", "## Audit and source availability", "",
                f"The profile records original candidate row counts, retained counts per source and label, each removal reason, source hashes, class balance, source diversity and V1 reuse. Exact duplicates are normalized with NFKC, case folding and whitespace collapse. Deterministic selection favors examples not present in V1 and spreads selections across sources and prompt groups. Selected GLM source IDs were checked against raw turn metadata; {selected_multi_turn} selected multi-turn rows were found.", "",
-              "All primary GLM and GPT V1.3 raw files were normalized temporarily for this build without the older 1,900-character cap, so V2.0 applies its own 2,000-character rule. The separate `gemini37_unverified.parquet` collection was audited but excluded because its model attribution is explicitly unverified. The indexed Claude Opus 4.8 collection was unavailable locally (download manifest records a 404), so it contributed no rows.", "",
+              ("All primary GLM and GPT V1.3 raw files were normalized temporarily for this build without the older 1,900-character cap. `gemini37_unverified.parquet` was included at the user's request; rows flagged with routing risk remain excluded, and model attribution is explicitly unverified. The indexed Claude Opus 4.8 collection was unavailable locally (download manifest records a 404), so it contributed no rows." if INCLUDE_UNVERIFIED else "All primary GLM and GPT V1.3 raw files were normalized temporarily for this build without the older 1,900-character cap, so V2.0 applies its own 2,000-character rule. The separate `gemini37_unverified.parquet` collection was audited but excluded because its model attribution is explicitly unverified. The indexed Claude Opus 4.8 collection was unavailable locally (download manifest records a 404), so it contributed no rows."), "",
+              f"Rebuild command: `python -m src.v2_0_dataset --version {VERSION}{' --include-unverified' if INCLUDE_UNVERIFIED else ''}`.", "",
                "No model training, checkpoint modification or inference was performed.", ""]
     REPORT.parent.mkdir(parents=True, exist_ok=True)
     REPORT.write_text("\n".join(report))

@@ -4,7 +4,7 @@ checkpoint_selection_version: 2
 checkpoint: meta-llama/Llama-3.2-3B
 revision: 13afe5124825b4f3751f836b40dafda64c1ed062
 epochs: 20
-early_stopping_patience: 3
+early_stopping_patience: 2
 batch_size: 1
 auto_batch_size: true
 max_batch_size: 1024

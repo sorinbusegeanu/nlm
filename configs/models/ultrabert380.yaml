@@ -4,7 +4,7 @@ auto_batch_size: true
 checkpoint: dmis-lab/UltraBERT-380M
 revision: 671a38c087233c0cc72c5bfceea6fffa2822f1db
 epochs: 3
-early_stopping_patience: 3
+early_stopping_patience: 2
 batch_size: 8
 gradient_accumulation_steps: 2
 learning_rate: 8.0e-06

@@ -4,7 +4,7 @@ checkpoint_selection_version: 2
 checkpoint: ibm-granite/granite-4.0-h-micro-base
 revision: 372ede0bc484284e08ce574e773c96cd2b89b367
 epochs: 20
-early_stopping_patience: 3
+early_stopping_patience: 2
 batch_size: 1
 auto_batch_size: true
 max_batch_size: 1024

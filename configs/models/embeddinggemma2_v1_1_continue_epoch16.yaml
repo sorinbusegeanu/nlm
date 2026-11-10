@@ -7,7 +7,7 @@ resume_checkpoint: artifacts/runs/embeddinggemma2_v1.1_data72cbc9ee_splitb7cd72d
 checkpoint_selection: highest_validation_accuracy
 checkpoint_selection_version: 2
 epochs: 100
-early_stopping_patience: 3
+early_stopping_patience: 2
 batch_size: 8
 auto_batch_size: true
 max_batch_size: 1024

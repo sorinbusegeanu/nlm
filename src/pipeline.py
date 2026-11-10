@@ -335,12 +335,9 @@ def _profile_path(data_dir, dataset):
 
 
 def _is_training_only_profile(profile):
-    """Whether this artifact contains training rows and reuses frozen V0 validation."""
+    """Whether an artifact is an external-only training dataset."""
     is_curated_openpool = str(profile.get("curation_method", "")).startswith("openpool_v11_hard_defect_")
-    is_explicit_training_only = profile.get("training_only") is True
-    return ((is_curated_openpool or is_explicit_training_only)
-            and profile.get("validation_dataset_version") == "v0"
-            and profile.get("validation_split_sha256"))
+    return is_curated_openpool or profile.get("training_only") is True
 
 
 def _effective_profile(data_dir, dataset, rows, validation_scope=None):
@@ -388,6 +385,15 @@ def _load_dataset(dataset, data_dir, *, validation_scope=None):
     data_dir = Path(data_dir)
     if validation_scope not in (None, "frozen_v0_540", "full_v0"):
         raise ValueError("validation_scope must be 'frozen_v0_540' or 'full_v0'")
+    if validation_scope is None and dataset != "v0":
+        candidate_profile_path = _profile_path(data_dir, dataset)
+        if candidate_profile_path.is_file():
+            candidate_profile = json.loads(candidate_profile_path.read_text(encoding="utf-8"))
+            external_only = _is_training_only_profile(candidate_profile)
+            has_legacy_v0_reference = (candidate_profile.get("validation_dataset_version") == "v0"
+                                       and bool(candidate_profile.get("validation_split_sha256")))
+            if external_only and not has_legacy_v0_reference:
+                validation_scope = "full_v0"
     if validation_scope == "full_v0":
         source_profile_path = _profile_path(data_dir, dataset)
         source_profile = json.loads(source_profile_path.read_text(encoding="utf-8"))
@@ -399,7 +405,11 @@ def _load_dataset(dataset, data_dir, *, validation_scope=None):
         external = pd.read_parquet(data_dir / f"dataset_{dataset}.parquet")
         v0_rows, _ = _load_dataset("v0", data_dir)
         v0_profile = json.loads(_profile_path(data_dir, "v0").read_text(encoding="utf-8"))
-        expected_v0_rows = int(v0_profile.get("rows", -1))
+        expected_v0_rows = 2699
+        if int(v0_profile.get("rows", -1)) != expected_v0_rows:
+            raise ValueError(
+                f"official V0 profile must contain {expected_v0_rows} rows; "
+                f"found {v0_profile.get('rows')}")
         rows, assignments, scope = build_full_v0_external_scope(
             external, v0_rows,
             expected_classes=len(v0_profile.get("classes", [])),
@@ -419,6 +429,9 @@ def _load_dataset(dataset, data_dir, *, validation_scope=None):
                 "normalized_text_sha256": scope["validation_normalized_text_sha256"],
                 "prompt_ids_sha256": scope["validation_prompt_ids_sha256"],
                 "prompt_content_sha256": scope["validation_prompt_content_sha256"],
+                "training_ids_sha256": scope["training_ids_sha256"],
+                "training_normalized_text_sha256": scope["training_dataset_normalized_text_sha256"],
+                "training_prompt_content_sha256": scope["training_dataset_prompt_content_sha256"],
                 "scope_split_sha256": scope["split_sha256"],
             },
             "classes": v0_profile.get("classes", []),
@@ -554,7 +567,8 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
         result = train_svc(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
                            c=cfg.get("C", .5), calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
                            feature_config=cfg.get("features", {"views": ["char", "word"]}),
-                           cache_dir=cache_dir, fold_token=cache_fold or f"fold-{fold}")
+                           cache_dir=cache_dir, fold_token=cache_fold or f"fold-{fold}",
+                           validation_labels=valid.model.tolist())
         checkpoint = Path(output_dir) / "checkpoints" / f"svc_fold{fold}.joblib"
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump({"model": result["model"], "raw_model": result["raw_model"], "features": result["features"], "classes": classes, "config": cfg}, checkpoint)
@@ -598,7 +612,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             lr_scheduler_type=cfg.get("lr_scheduler_type", "linear"),
             warmup_ratio=cfg.get("warmup_ratio", 0.0),
             warmup_epochs=cfg.get("warmup_epochs"),
-            early_stopping_patience=cfg.get("early_stopping_patience", 3),
+            early_stopping_patience=cfg.get("early_stopping_patience", 2),
             auto_batch_size=cfg.get("auto_batch_size", False),
             max_batch_size=cfg.get("max_batch_size", 1024),
             batch_probe_safety_fraction=cfg.get("batch_probe_safety_fraction", 0.95),
@@ -613,7 +627,8 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             output_dir=checkpoint, max_length=cfg["max_length"],
             batch_size=cfg.get("batch_size", 8), c=cfg.get("C", .5),
             calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
-            fix_mistral_regex=cfg.get("fix_mistral_regex", False))
+            fix_mistral_regex=cfg.get("fix_mistral_regex", False),
+            validation_labels=valid.model.tolist())
         result["checkpoint"] = str(checkpoint)
     elif model in ({"qwen06", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "phi35_mini"}
                    | FROZEN_BACKBONE_MODELS):
@@ -637,7 +652,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             task_prefix=cfg.get("task_prefix", ""),
             fix_mistral_regex=cfg.get("fix_mistral_regex", False),
             lora_exclude_modules=cfg.get("lora_exclude_modules"),
-            early_stopping_patience=cfg.get("early_stopping_patience", 3),
+            early_stopping_patience=cfg.get("early_stopping_patience", 2),
             text_only_backbone=cfg.get("text_only_backbone", False),
             lr_scheduler_type=cfg.get("lr_scheduler_type"),
             warmup_ratio=cfg.get("warmup_ratio", 0.0),
@@ -665,6 +680,43 @@ def _dataset_max_length(model, cfg, rows, *, checkpoint=None, revision=None):
         local_files_only=cfg.get("local_files_only", True))
 
 
+def _save_epoch_validation_predictions(result, valid, classes, prediction_dir, experiment_id):
+    """Persist each epoch's already-computed validation logits and probabilities."""
+    epochs = result.get("validation_predictions_by_epoch") or []
+    if not epochs:
+        return []
+    prediction_dir = Path(prediction_dir) / f"{experiment_id}_epoch_predictions"
+    prediction_dir.mkdir(parents=True, exist_ok=True)
+    base = valid[["id", "prompt_id", "model"]].rename(columns={"model": "y_true"}).copy()
+    records = []
+    for item in epochs:
+        epoch = int(item["epoch"])
+        scores = np.asarray(item["scores"], dtype=np.float64)
+        if scores.shape != (len(valid), len(classes)) or not np.isfinite(scores).all():
+            raise ValueError(f"epoch {epoch} validation predictions are not aligned to validation rows/classes")
+        shifted = scores - scores.max(axis=1, keepdims=True)
+        probabilities = np.exp(shifted)
+        probabilities /= probabilities.sum(axis=1, keepdims=True)
+        frame = base.copy()
+        frame["validation_epoch"] = epoch
+        for index, label in enumerate(classes):
+            frame[f"score::{label}"] = scores[:, index]
+            frame[f"prob::{label}"] = probabilities[:, index]
+        path = prediction_dir / f"epoch-{epoch:03d}.parquet"
+        frame.to_parquet(path, index=False)
+        epoch_checkpoints = result.get("epoch_checkpoints") or []
+        checkpoint_path = (epoch_checkpoints[epoch - 1]
+                           if epoch <= len(epoch_checkpoints) else None)
+        if checkpoint_path is None and int(result.get("best_epoch") or -1) == epoch:
+            checkpoint_path = result.get("best_checkpoint_path") or result.get("best_checkpoint")
+        records.append({"epoch": epoch, "path": str(path), "rows": len(frame),
+                        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                        "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+                        "class_order": list(classes),
+                        "probability_calibration": "uncalibrated_softmax_from_validation_logits"})
+    return records
+
+
 def build_features(dataset="v0", data_dir="data/processed", config_path="configs/features/default.yaml", cache_dir="artifacts/features"):
     rows, _ = _load_dataset(dataset, data_dir)
     cfg = _read_yaml(config_path)
@@ -679,7 +731,7 @@ def build_features(dataset="v0", data_dir="data/processed", config_path="configs
 
 
 def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None, refresh_prediction=True, validation_scope=None):
-    """Train one model; optionally use an external-only split for selection and full V0 for final scoring."""
+    """Train all external rows and validate each epoch on full V0 when available."""
     if folds is not None:
         raise ValueError("fold selection was removed; this pipeline uses one fixed train/validation split")
     cfg = _model_cfg(model, config_path)
@@ -692,6 +744,10 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         if source_profile_path.is_file():
             external_only = _is_training_only_profile(
                 json.loads(source_profile_path.read_text(encoding="utf-8")))
+    if dataset != "v0" and not external_only:
+        raise ValueError(
+            f"{dataset} is not an external-only dataset, so it cannot use all V0 for isolated validation. "
+            "Use an external-only source such as v1, v1.1, v2_openpool, or v2.0.")
     requested_scope = validation_scope or cfg.get("validation_scope")
     if external_only and requested_scope not in (None, "full_v0"):
         raise ValueError("external-only datasets must use validation_scope=full_v0")
@@ -754,12 +810,18 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
             or not np.allclose(probabilities.sum(axis=1), 1, atol=1e-5)):
         raise RuntimeError("V0 validation output is incomplete or non-finite")
     metrics = evaluate(valid.model.astype(str), scores, classes, probabilities)
+    for name in ("validation_loss_raw", "validation_loss_calibrated"):
+        if result.get(name) is not None:
+            metrics[name] = float(result[name])
+    metrics["calibration_temperature"] = result.get("calibration_temperature")
     pred = valid[["id", "prompt_id", "model"]].rename(columns={"model": "y_true"}).copy()
     for i, label in enumerate(classes):
         pred[f"score::{label}"] = scores[:, i]
         pred[f"prob::{label}"] = probabilities[:, i]
     pred_dir.mkdir(parents=True, exist_ok=True)
     pred.to_parquet(prediction_path, index=False)
+    epoch_prediction_records = _save_epoch_validation_predictions(
+        result, valid, classes, pred_dir, experiment_id)
     checkpoint = Path(result["checkpoint"])
     artifact_size = sum(f.stat().st_size for f in checkpoint.rglob("*") if f.is_file()) if checkpoint.is_dir() else checkpoint.stat().st_size
     validation_ids = sorted(valid.id.astype(str))
@@ -790,12 +852,15 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"), "checkpoint_size_bytes": artifact_size,
         "calibration_method": result.get("calibration_method", "sigmoid train-only CV" if model == "svc" else "train-only scalar temperature"),
         "calibration_temperature": result.get("calibration_temperature"),
+        "validation_loss_raw": result.get("validation_loss_raw"),
+        "validation_loss_calibrated": result.get("validation_loss_calibrated"),
         "requested_batch_size": result.get("requested_batch_size"),
         "effective_batch_size": result.get("effective_batch_size"),
         "batch_size_probe": result.get("batch_size_probe"),
         "lr_scheduler_type": result.get("lr_scheduler_type", cfg.get("lr_scheduler_type", "epoch_decay")),
         "warmup_ratio": result.get("warmup_ratio", cfg.get("warmup_ratio", 0.0)),
         "validation_metrics_by_epoch": result.get("validation_metrics_by_epoch", []),
+        "validation_predictions_by_epoch": epoch_prediction_records,
         "validation_metrics_by_iteration": result.get("validation_metrics_by_iteration", []),
         "validation_metrics": metrics,
         "checkpoint_selection_metric": result.get("checkpoint_selection_metric") or
@@ -985,16 +1050,22 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
         warmup_ratio=cfg.get("warmup_ratio",0.0),
         optimizer=cfg.get("optimizer", "adamw_torch"),
         weight_decay=cfg.get("weight_decay", 0.0),
-        early_stopping_patience=cfg.get("early_stopping_patience", 3),
+        early_stopping_patience=cfg.get("early_stopping_patience", 2),
         quantization=cfg.get("quantization", "none"),
         attention_backend=cfg.get("attention_backend"))
     classes=sorted(rows.model.astype(str).unique())
     metrics=evaluate(valid.model.astype(str),result["scores"],classes,result["probabilities"])
+    for name in ("validation_loss_raw", "validation_loss_calibrated"):
+        if result.get(name) is not None:
+            metrics[name] = float(result[name])
+    metrics["calibration_temperature"] = result.get("calibration_temperature")
     metrics["validation_metrics_by_epoch"]=result["validation_metrics_by_epoch"]
     pred=valid[["id","prompt_id","model"]].rename(columns={"model":"y_true"}).copy()
     for i,label in enumerate(classes): pred[f"score::{label}"]=result["scores"][:,i];pred[f"prob::{label}"]=result["probabilities"][:,i]
     pred_dir=Path(artifact_dir)/"predictions";pred_dir.mkdir(parents=True,exist_ok=True)
     prediction_path=pred_dir/f"{experiment_id}_validation.parquet";pred.to_parquet(prediction_path,index=False)
+    epoch_prediction_records = _save_epoch_validation_predictions(
+        result, valid, classes, pred_dir, experiment_id)
     manifest={"experiment_id":experiment_id,"model":model,"dataset":dataset,"split":"validation",
         "continued_from_experiment":source["experiment_id"],"continued_from_checkpoint":str(source_checkpoint),
         "additional_epochs":epochs,"total_epochs":int(source.get("config",{}).get("epochs",0))+epochs,
@@ -1007,6 +1078,9 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
         "fit_seconds":result["fit_seconds"],"inference_seconds":result["inference_seconds"],
         "early_stopping":result.get("early_stopping"),
         "calibration_temperature":result["calibration_temperature"],"validation_metrics_by_epoch":result["validation_metrics_by_epoch"],
+        "validation_loss_raw": result.get("validation_loss_raw"),
+        "validation_loss_calibrated": result.get("validation_loss_calibrated"),
+        "validation_predictions_by_epoch":epoch_prediction_records,
         "requested_batch_size":result.get("requested_batch_size"),
         "effective_batch_size":result.get("effective_batch_size"),
         "batch_size_probe":result.get("batch_size_probe"),
@@ -1080,7 +1154,7 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         "epochs": int(epochs), "learning_rate": float(learning_rate),
         "learning_rate_decay": float(learning_rate_decay), "seed": int(seed),
         "optimizer": optimizer, "weight_decay": float(weight_decay),
-        "early_stopping_patience": cfg.get("early_stopping_patience", 3),
+        "early_stopping_patience": cfg.get("early_stopping_patience", 2),
         "batch_size": int(source.get("config", {}).get("batch_size", 8)),
         "auto_batch_size": bool(source.get("config", {}).get("auto_batch_size", False)),
         "max_batch_size": int(source.get("config", {}).get("max_batch_size", 1024)),
@@ -1122,14 +1196,20 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         gradient_accumulation_steps=config_snapshot["gradient_accumulation_steps"],
         validation_labels=valid.model.tolist(),
         select_best_checkpoint=True, local_files_only=True,
-        early_stopping_patience=cfg.get("early_stopping_patience", 3))
+        early_stopping_patience=cfg.get("early_stopping_patience", 2))
     metrics = evaluate(valid.model.astype(str), result["scores"], classes, result["probabilities"])
+    for name in ("validation_loss_raw", "validation_loss_calibrated"):
+        if result.get(name) is not None:
+            metrics[name] = float(result[name])
+    metrics["calibration_temperature"] = result.get("calibration_temperature")
     pred = valid[["id", "prompt_id", "model"]].rename(columns={"model": "y_true"}).copy()
     for i, label in enumerate(classes):
         pred[f"score::{label}"] = result["scores"][:, i]
         pred[f"prob::{label}"] = result["probabilities"][:, i]
     manifests_dir.mkdir(parents=True, exist_ok=True)
     pred.to_parquet(prediction_path, index=False)
+    epoch_prediction_records = _save_epoch_validation_predictions(
+        result, valid, classes, manifests_dir, experiment_id)
     checkpoint = run_dir / "checkpoints" / f"{model}_continued"
     manifest = {
         "experiment_id": experiment_id, "model": model, "dataset": dataset,
@@ -1140,6 +1220,7 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         "additional_epochs": int(epochs), "learning_rate": float(learning_rate),
         "learning_rate_decay": float(learning_rate_decay),
         "validation_metrics_by_epoch": result["validation_metrics_by_epoch"],
+        "validation_predictions_by_epoch": epoch_prediction_records,
         "early_stopping": result.get("early_stopping"),
         "selected_epoch": result["best_epoch"],
         "selected_validation_accuracy": result["best_validation_accuracy"],
@@ -1152,6 +1233,8 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         "config_sha256": config_hash, "seed": seed,
         "fit_seconds": result["fit_seconds"], "inference_seconds": result["inference_seconds"],
         "calibration_temperature": result["calibration_temperature"],
+        "validation_loss_raw": result.get("validation_loss_raw"),
+        "validation_loss_calibrated": result.get("validation_loss_calibrated"),
         "checkpoint_path": str(checkpoint), "best_checkpoint_path": result["best_checkpoint_path"],
         "prediction_path": str(prediction_path), "metrics": metrics,
         "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
@@ -1401,7 +1484,7 @@ def main(argv=None):
     mix=d.add_parser("assemble");mix.add_argument("--config",default="configs/data/mixed_v1_5.yaml")
     f=sub.add_parser("features").add_subparsers(dest="action",required=True);b=f.add_parser("build");b.add_argument("--dataset",default="v0");b.add_argument("--data-dir",default="data/processed");b.add_argument("--config",default="configs/features/default.yaml")
     m=sub.add_parser("models").add_subparsers(dest="action",required=True)
-    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v0");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--validation-scope",choices=["frozen_v0_540","full_v0"],help="use the historical 540-row V0 split or all V0 rows for final evaluation with an external-only selection split");t.add_argument("--skip-prediction-refresh",action="store_true",help="save the model run without changing the active prediction roster or ensemble history");t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
+    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v0");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--validation-scope",choices=["frozen_v0_540","full_v0"],help="for external-only datasets, train on every dataset row and validate/select checkpoints on all 2,699 V0 rows");t.add_argument("--skip-prediction-refresh",action="store_true",help="save the model run without changing the active prediction roster or ensemble history");t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
     cq=m.add_parser("continue-qwen",help="continue the latest Qwen LoRA checkpoint and validate after every epoch")
     cq.add_argument("--dataset",default="v0");cq.add_argument("--epochs",type=int,default=4);cq.add_argument("--seed",type=int,default=2026)
     cq.add_argument("--model",choices=["qwen06","qwen17","qwen4","qwen8"],default="qwen06")

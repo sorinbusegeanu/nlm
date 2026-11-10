@@ -306,7 +306,10 @@ def render_current_training():
     if baseline:
         epoch_rows.append({"Epoch": "Baseline", "Learning rate": None,
                            "Accuracy": baseline.get("accuracy"), "Train error": None,
-                           "Validation error": baseline.get("validation_loss")})
+                           "Validation loss (raw)": baseline.get("validation_loss_raw",
+                                                                  baseline.get("validation_loss")),
+                           "Validation loss (calibrated)": baseline.get("validation_loss_calibrated"),
+                           "Calibration temperature": baseline.get("calibration_temperature")})
     for epoch in range(1, epoch_count + 1):
         item = history_by_epoch.get(epoch, {})
         epoch_rows.append({
@@ -315,11 +318,15 @@ def render_current_training():
                                        if learning_rate is not None else None),
             "Accuracy": item.get("accuracy", item.get("eval_accuracy")),
             "Train error": item.get("train_loss", item.get("loss")),
-            "Validation error": item.get("validation_loss", item.get("eval_loss")),
+            "Validation loss (raw)": item.get("validation_loss_raw",
+                                               item.get("validation_loss", item.get("eval_loss"))),
+            "Validation loss (calibrated)": item.get("validation_loss_calibrated"),
+            "Calibration temperature": item.get("calibration_temperature"),
         })
     st.markdown("**Epochs**")
-    st.caption("Accuracy and validation error appear after each epoch evaluation; train error appears when that epoch's training log is written.")
-    st.dataframe(pd.DataFrame(epoch_rows, columns=["Epoch", "Learning rate", "Accuracy", "Train error", "Validation error"]),
+    st.caption("Raw validation loss is the epoch eval_loss. Calibrated loss and temperature are recorded after train-only calibration is fitted.")
+    st.dataframe(pd.DataFrame(epoch_rows, columns=["Epoch", "Learning rate", "Accuracy", "Train error",
+                 "Validation loss (raw)", "Validation loss (calibrated)", "Calibration temperature"]),
                  use_container_width=True, hide_index=True)
 
 def render_prediction_factory():
@@ -442,6 +449,7 @@ with tabs[4]:
     for model, best in best_runs.items():
         row = best["row"]
         manifest = manifest_for(row)
+        validation_metrics = manifest.get("validation_metrics") or {}
         history = manifest.get("validation_metrics_by_epoch", [])
         selected_history = None
         if history:
@@ -456,6 +464,13 @@ with tabs[4]:
             "Model": model_display(model),
             "Best accuracy (balanced)": best["accuracy"],
             "Train loss": selected_history.get("train_loss") if selected_history else None,
+            "Validation loss (raw)": manifest.get("validation_loss_raw",
+                validation_metrics.get("validation_loss_raw",
+                    selected_history.get("eval_loss") if selected_history else None)),
+            "Validation loss (calibrated)": manifest.get("validation_loss_calibrated",
+                validation_metrics.get("validation_loss_calibrated",
+                    validation_metrics.get("log_loss"))),
+            "Calibration temperature": manifest.get("calibration_temperature"),
             "Best run": row.get("description") or row.get("experiment_id"),
             "Training": training_lineage(
                 manifest, Path(row.get("artifact_path") or "artifacts/predictions").parent),
@@ -513,15 +528,19 @@ with tabs[6]:
             history = manifest_for(chosen_run).get("validation_metrics_by_epoch", [])
             selected_epoch = manifest_for(chosen_run).get("selected_epoch")
             selected_iteration = manifest_for(chosen_run).get("selected_iteration")
-            selected_accuracy = manifest_for(chosen_run).get("selected_validation_accuracy")
-            if selected_accuracy is not None:
+            selected_balanced_accuracy = manifest_for(chosen_run).get("selected_validation_balanced_accuracy")
+            if selected_balanced_accuracy is None:
+                selected_balanced_accuracy = manifest_for(chosen_run).get("validation_metrics", {}).get("balanced_accuracy")
+            if selected_balanced_accuracy is not None:
                 picked = (f"epoch {selected_epoch}" if selected_epoch is not None else
                           f"boosting iteration {selected_iteration}" if selected_iteration is not None else
                           "selected checkpoint")
-                st.caption(f"Selected by highest validation accuracy: {picked} · accuracy {float(selected_accuracy):.4f}")
+                st.caption(f"Selected by highest validation balanced accuracy: {picked} · balanced accuracy {float(selected_balanced_accuracy):.4f}")
             history_frame = pd.DataFrame([{"Epoch": item.get("epoch"),
                 "Accuracy": item.get("eval_accuracy"), "Balanced accuracy": item.get("eval_balanced_accuracy"),
-                "Validation loss": item.get("eval_loss")} for item in history])
+                "Validation loss (raw)": item.get("validation_loss_raw", item.get("eval_loss")),
+                "Validation loss (calibrated)": item.get("validation_loss_calibrated"),
+                "Calibration temperature": item.get("calibration_temperature")} for item in history])
             if not history_frame.empty:
                 if selected_epoch is not None:
                     history_frame["Selected"] = history_frame["Epoch"].round().eq(int(selected_epoch))

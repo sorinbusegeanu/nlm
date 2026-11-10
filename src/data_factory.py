@@ -173,7 +173,7 @@ def build_full_v0_external_scope(external: pd.DataFrame, v0: pd.DataFrame, *,
     normalized_v0_text = [f"{row.id}\t{_normal_text(row.text)}" for row in v0_by_id.itertuples()]
     profile = {
         "validation_scope": "full_v0",
-        "selection_validation_scope": "full_v0",
+        "checkpoint_selection_scope": "full_v0",
         "validation_dataset_version": "v0", "validation_rows": int(len(v0)),
         "validation_prompt_groups": int(v0.prompt_id.nunique()),
         "validation_ids_sha256": ordered_hash(v0.id.astype(str)),

@@ -4,7 +4,7 @@ checkpoint: microsoft/Phi-3.5-mini-instruct
 revision: 2fe192450127e6a83f7441aef6e3ca586c338b77
 trust_remote_code: true
 epochs: 10
-early_stopping_patience: 3
+early_stopping_patience: 2
 batch_size: 1
 auto_batch_size: true
 max_batch_size: 1024

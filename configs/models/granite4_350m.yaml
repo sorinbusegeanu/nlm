@@ -5,7 +5,7 @@ checkpoint: ibm-granite/granite-4.0-350m-base
 revision: a50b46cef21c8a86b15f0496cb794487a78a910b
 training_mode: lora
 epochs: 20
-early_stopping_patience: 3
+early_stopping_patience: 2
 batch_size: 1
 auto_batch_size: true
 max_batch_size: 1024

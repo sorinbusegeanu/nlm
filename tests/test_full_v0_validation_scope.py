@@ -24,7 +24,7 @@ class FullV0ValidationScopeTests(unittest.TestCase):
         self.external = _rows("ext", 40)
         self.v0 = _rows("v0", 8)
 
-    def test_uses_all_v0_for_final_and_external_only_for_selection(self):
+    def test_uses_all_external_rows_for_training_and_full_v0_for_validation(self):
         rows, assignments, profile = build_full_v0_external_scope(
             self.external, self.v0, expected_classes=2, expected_v0_rows=8)
 
