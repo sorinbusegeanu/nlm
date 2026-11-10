@@ -893,25 +893,35 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     (Path(output_dir) / "batch_size_probe.json").write_text(json.dumps(batch_probe, indent=2) + "\n")
     print(f"Encoder batch-size selection: {json.dumps(batch_probe, sort_keys=True)}", flush=True)
     captured_validation_prediction = {}
+    validation_order = _length_order(val.lengths)
     def compute_metrics(eval_prediction):
         from sklearn.metrics import accuracy_score, balanced_accuracy_score
         logits = eval_prediction.predictions[0] if isinstance(eval_prediction.predictions, tuple) else eval_prediction.predictions
+        logits = _restore_prediction_order(logits, validation_order)
+        labels = _restore_prediction_order(eval_prediction.label_ids, validation_order)
         captured_validation_prediction["logits"] = np.asarray(logits, dtype=np.float32).copy()
         predictions = np.asarray(logits).argmax(axis=1)
-        labels = np.asarray(eval_prediction.label_ids)
         return {"accuracy": float(accuracy_score(labels, predictions)),
                 "balanced_accuracy": float(balanced_accuracy_score(labels, predictions))}
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     from transformers import TrainerCallback
-    from torch.utils.data import SequentialSampler
+    from torch.utils.data import Sampler
+
+    class LengthOrderedSampler(Sampler):
+        def __init__(self, dataset):
+            self.order = _length_order(dataset.lengths).tolist()
+        def __iter__(self): return iter(self.order)
+        def __len__(self): return len(self.order)
 
     class OrderedValidationTrainer(tr.Trainer):
         validation_seconds = 0.0
         def _get_eval_sampler(self, eval_dataset):
             # Keep each epoch's saved validation outputs aligned to input rows.
             # Training still uses its configured length-grouped sampler.
-            return SequentialSampler(eval_dataset)
+            if hasattr(eval_dataset, "lengths"):
+                return LengthOrderedSampler(eval_dataset)
+            return LengthOrderedSampler(val)
         def evaluate(self, *args, **kwargs):
             started = time.perf_counter()
             try:
@@ -1399,7 +1409,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     # Training is deliberately cache-only, even if a caller supplies a false config value.
     local_files_only = True
     from torch import nn
-    from torch.utils.data import Dataset, SequentialSampler
+    from torch.utils.data import Dataset, Sampler
     from transformers.modeling_outputs import SequenceClassifierOutput
     start = time.perf_counter(); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
@@ -1517,8 +1527,9 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     def compute_metrics(eval_prediction):
         from sklearn.metrics import accuracy_score, balanced_accuracy_score
         logits = eval_prediction.predictions[0] if isinstance(eval_prediction.predictions, tuple) else eval_prediction.predictions
+        logits = _restore_prediction_order(logits, validation_order)
         captured_validation_prediction["logits"] = np.asarray(logits, dtype=np.float32).copy()
-        labels = np.asarray(eval_prediction.label_ids)
+        labels = _restore_prediction_order(eval_prediction.label_ids, validation_order)
         predicted = np.asarray(logits).argmax(axis=1)
         return {"accuracy": float(accuracy_score(labels, predicted)),
                 "balanced_accuracy": float(balanced_accuracy_score(labels, predicted))}
@@ -1585,6 +1596,13 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         raise ValueError("lr_scheduler_type must be linear, cosine, constant, or epoch_decay")
     train_dataset=Rows(train_text,y_train)
     validation_dataset_rows=Rows(validation_text,validation_labels)
+    validation_order = _length_order(validation_dataset_rows.lengths)
+
+    class LengthOrderedSampler(Sampler):
+        def __init__(self, dataset):
+            self.order = _length_order(dataset.lengths).tolist()
+        def __iter__(self): return iter(self.order)
+        def __len__(self): return len(self.order)
     data_collator=tr.DataCollatorWithPadding(tokenizer=tokenizer,pad_to_multiple_of=8)
     train_dataset.collate_fn=data_collator
     use_bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -1632,7 +1650,9 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     class OrderedValidationTrainer(tr.Trainer):
         validation_seconds = 0.0
         def _get_eval_sampler(self, eval_dataset):
-            return SequentialSampler(eval_dataset)
+            if hasattr(eval_dataset, "lengths"):
+                return LengthOrderedSampler(eval_dataset)
+            return LengthOrderedSampler(validation_dataset_rows)
         def evaluate(self, *args, **kwargs):
             started = time.perf_counter()
             try:
