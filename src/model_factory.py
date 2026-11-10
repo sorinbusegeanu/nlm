@@ -573,7 +573,9 @@ def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *,
             tokenizer_obj = getattr(processor, "tokenizer", processor)
             pad_id = getattr(tokenizer_obj, "pad_token_id", None)
             if pad_id is None:
-                pad_id = getattr(tokenizer_obj, "eos_token_id", 0)
+                pad_id = getattr(tokenizer_obj, "eos_token_id", None)
+            if pad_id is None:
+                pad_id = 0
             chunk_outputs = []
             for offset in range(0, row_count, inference_batch_size):
                 indexes = order[offset:offset + inference_batch_size].tolist()
@@ -1010,7 +1012,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         compute_metrics=compute_metrics if validation_labels is not None else None,
         processing_class=tokenizer, callbacks=callbacks)
     # Trainer's length-grouped prediction sampler can return predictions in a
-    # different row order from the supplied text list. Use a sequential loader
+    # different row order from the supplied text list. Use a length-grouped loader
     # for baseline, calibration and final validation scores so outputs remain
     # aligned with their original ids and labels.
     prediction_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
