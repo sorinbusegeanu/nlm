@@ -322,6 +322,7 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
     startup_seconds = time.perf_counter() - start
     training_started = time.perf_counter()
     model.fit(x_train, list(y_train), **fit_kwargs)
+    post_training_started = time.perf_counter()
     training_seconds = time.perf_counter() - training_started
     iteration_metrics = []
     selected_iteration = (int(model.get_best_iteration()) if validation_labels is not None
