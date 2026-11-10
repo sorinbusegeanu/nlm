@@ -218,7 +218,8 @@ class CheckpointCatalogTests(unittest.TestCase):
                  patch("src.checkpoint_catalog.refresh_catalog",
                        return_value={"status": "refreshed", "checkpoint_count": 1}):
                 _refresh_ensemble_after_training(manifest, manifest_path,
-                    artifact_dir="artifacts", data_dir="data/processed")
+                    artifact_dir="artifacts", data_dir="data/processed",
+                    refresh_prediction=True, refresh_checkpoint_catalog=True)
             stored = json.loads(manifest_path.read_text())
             self.assertEqual(stored["prediction_factory_update"]["status"], "evaluated")
             self.assertEqual(stored["checkpoint_catalog_update"]["checkpoint_count"], 1)

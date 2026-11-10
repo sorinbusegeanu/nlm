@@ -485,30 +485,52 @@ def _release_completed_training_model(result):
         pass
 
 
-def _refresh_ensemble_after_training(manifest, manifest_path, *, artifact_dir, data_dir):
-    """Run prediction selection before the training command returns to its queue."""
-    from .ensemble_registry import refresh_prediction_factory
+def _refresh_ensemble_after_training(manifest, manifest_path, *, artifact_dir, data_dir,
+                                     refresh_prediction=False, refresh_checkpoint_catalog=False):
+    """Refresh selected downstream artifacts only when explicitly requested."""
     project_root = Path(__file__).resolve().parents[1]
     prediction_dir = Path(artifact_dir) / "predictions"
-    update = refresh_prediction_factory(
-        artifact_dir=artifact_dir, data_dir=data_dir, reference_dataset="v0",
-        completed_manifest=manifest_path, evaluate_if_unchanged=True,
-        registry_path=project_root / "docs" / "ensembles.md",
-        roster_path=prediction_dir / "active_model_roster.json")
-    manifest["prediction_factory_update"] = update
-    try:
-        from .checkpoint_catalog import refresh_catalog
-        manifest["checkpoint_catalog_update"] = refresh_catalog(
-            artifact_root=artifact_dir, data_dir=data_dir)
-    except Exception as exc:
-        # Catalog maintenance must not turn a completed training run into a failed run.
-        manifest["checkpoint_catalog_update"] = {
-            "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    started = time.perf_counter()
+    if refresh_prediction:
+        from .ensemble_registry import refresh_prediction_factory
+        manifest["prediction_factory_update"] = refresh_prediction_factory(
+            artifact_dir=artifact_dir, data_dir=data_dir, reference_dataset="v0",
+            completed_manifest=manifest_path, evaluate_if_unchanged=False,
+            registry_path=project_root / "docs" / "ensembles.md",
+            roster_path=prediction_dir / "active_model_roster.json")
+    else:
+        manifest["prediction_factory_update"] = {"status": "skipped", "reason": "disabled"}
+    if refresh_checkpoint_catalog:
+        try:
+            from .checkpoint_catalog import refresh_catalog
+            manifest["checkpoint_catalog_update"] = refresh_catalog(
+                artifact_root=artifact_dir, data_dir=data_dir)
+        except Exception as exc:
+            manifest["checkpoint_catalog_update"] = {
+                "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    else:
+        manifest["checkpoint_catalog_update"] = {"status": "skipped", "reason": "disabled"}
+    manifest.setdefault("runtime_breakdown", {})["downstream_refresh_seconds"] = time.perf_counter() - started
     manifest_path = Path(manifest_path)
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
     metrics_path = manifest_path.with_name(manifest_path.name.removesuffix("_manifest.json") + "_metrics.json")
     metrics_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
-    return update
+    return {"prediction_factory_update": manifest["prediction_factory_update"],
+            "checkpoint_catalog_update": manifest["checkpoint_catalog_update"],
+            "downstream_refresh_seconds": manifest["runtime_breakdown"]["downstream_refresh_seconds"]}
+
+
+def _post_training_runtime(result):
+    """Normalize post-fit stage durations across model families."""
+    runtime = dict(result.get("runtime_breakdown") or {})
+    runtime.setdefault("best_checkpoint_restoration_seconds", 0.0)
+    runtime.setdefault("calibration_inference_seconds", None)
+    runtime.setdefault("temperature_fit_seconds", None)
+    runtime.setdefault("final_validation_inference_seconds", result.get("inference_seconds"))
+    runtime.setdefault("checkpoint_serialization_seconds", runtime.get("checkpoint_save_seconds", 0.0))
+    runtime.setdefault("manifest_prediction_export_seconds", 0.0)
+    runtime.setdefault("downstream_refresh_seconds", 0.0)
+    return runtime
 
 
 def _model_cfg(model, config_path=None):
@@ -545,7 +567,11 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
                            validation_labels=valid.model.tolist())
         checkpoint = Path(output_dir) / "checkpoints" / f"svc_fold{fold}.joblib"
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_started = time.perf_counter()
         joblib.dump({"model": result["model"], "raw_model": result["raw_model"], "features": result["features"], "classes": classes, "config": cfg}, checkpoint)
+        runtime = dict(result.get("runtime_breakdown") or {})
+        runtime["checkpoint_serialization_seconds"] = time.perf_counter() - checkpoint_started
+        result["runtime_breakdown"] = runtime
         result["checkpoint"] = str(checkpoint)
     elif model == "catboost_stylometry":
         checkpoint = Path(output_dir) / "checkpoints" / f"catboost_stylometry_fold{fold}"
@@ -571,7 +597,8 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             checkpoint_selection_metric=checkpoint_selection_metric,
             calibration_max_samples=cfg.get("calibration_max_samples", 5000),
             calibration_seed=cfg.get("calibration_seed", seed),
-            calibration_full_dataset=cfg.get("calibration_full_dataset", False))
+            calibration_full_dataset=cfg.get("calibration_full_dataset", False),
+            save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False))
         result["cache_key"] = cache_key
         result["checkpoint"] = str(checkpoint)
     elif model == "ultrabert380":
@@ -732,7 +759,7 @@ def build_features(dataset="v1", data_dir="data/processed", config_path="configs
     return report
 
 
-def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None, refresh_prediction=True, validation_dataset="v0"):
+def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None, refresh_prediction=False, refresh_checkpoint_catalog=False, validation_dataset="v0"):
     """Train on every row in dataset and validate on every row in validation_dataset."""
     if folds is not None:
         raise ValueError("fold selection was removed; specify explicit training and validation datasets")
@@ -773,6 +800,8 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
     result = _train_fold(model, train, valid, classes, cfg, run_artifact_dir, seed, "validation", Path(artifact_dir)/"features",
                          cache_fold=f"{dataset}-{train_hash}-{validation_dataset}-{valid_hash}",
                          checkpoint_selection_metric=metric)
+    export_started = time.perf_counter()
+    runtime_breakdown = _post_training_runtime(result)
     scores, probabilities = result["scores"], result["probabilities"]
     if (not np.isfinite(scores).all() or not np.isfinite(probabilities).all()
             or not np.allclose(probabilities.sum(axis=1), 1, atol=1e-5)):
@@ -820,7 +849,7 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         "quantization_config": result.get("quantization_config"),
         "attention_backend": result.get("attention_backend", cfg.get("attention_backend")),
         "fit_seconds": float(result["fit_seconds"]), "inference_seconds": result.get("inference_seconds"),
-        "runtime_breakdown": result.get("runtime_breakdown"),
+        "runtime_breakdown": runtime_breakdown,
         "inference_rows_per_second": (len(valid) / result["inference_seconds"]
             if result.get("inference_seconds") else None),
         "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"), "checkpoint_size_bytes": artifact_size,
@@ -857,6 +886,8 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
             result.get("selected_validation_accuracy", metrics.get("accuracy"))),
         "baseline_validation_metrics": result.get("baseline_validation_metrics"),
         "checkpoint_scoring_method": result.get("checkpoint_scoring_method"),
+        "final_validation_reused_existing_predictions": result.get("final_validation_reused_existing_predictions",
+            result.get("final_validation_reused_epoch_predictions")),
         "feature_count": result.get("feature_count"),
         "feature_names": result.get("feature_names"),
         "feature_recipe": result.get("feature_recipe", cfg.get("feature_recipe")),
@@ -876,13 +907,29 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         runtime_seconds=manifest["fit_seconds"], artifact_path=str(prediction_path), config_hash=manifest["config_sha256"],
         split_hash=manifest["split_sha256"], model_revision=manifest["model_revision"],
         description=description)
+    runtime_breakdown["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
+    manifest["runtime_breakdown"] = runtime_breakdown
     (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     _release_completed_training_model(result)
-    if refresh_prediction:
-        manifest["prediction_factory_update"] = {"status": "skipped",
-            "reason": "prediction roster requires its configured validation dataset"}
-        manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
-        (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+    if refresh_prediction or refresh_checkpoint_catalog:
+        if validation_dataset == "v0":
+            _refresh_ensemble_after_training(manifest, manifest_path,
+                artifact_dir=artifact_dir, data_dir=data_dir,
+                refresh_prediction=refresh_prediction,
+                refresh_checkpoint_catalog=refresh_checkpoint_catalog)
+        else:
+            manifest["prediction_factory_update"] = {"status": "skipped",
+                "reason": "downstream rosters and catalog require V0 validation rows"}
+            manifest["checkpoint_catalog_update"] = {"status": "skipped",
+                "reason": "downstream rosters and catalog require V0 validation rows"}
+            manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+            (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+    else:
+        manifest["prediction_factory_update"] = {"status": "skipped", "reason": "disabled"}
+        manifest["checkpoint_catalog_update"] = {"status": "skipped", "reason": "disabled"}
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
 
@@ -890,7 +937,8 @@ TRAINING_OVERRIDE_FIELDS = (
     "epochs", "early_stopping_patience", "learning_rate", "learning_rate_decay", "lr_scheduler_type", "warmup_ratio",
     "optimizer", "weight_decay", "batch_size", "gradient_accumulation_steps",
     "lora_rank", "lora_alpha", "lora_target_modules", "quantization", "attention_backend", "C", "calibration_cv",
-    "iterations", "depth", "l2_leaf_reg", "early_stopping_rounds",
+    "iterations", "depth", "l2_leaf_reg", "early_stopping_rounds", "calibration_max_samples",
+    "calibration_full_dataset", "save_epoch_checkpoints",
 )
 
 
@@ -901,6 +949,8 @@ def _validate_training_overrides(model, cfg):
     for name in ("epochs", "early_stopping_patience", "batch_size", "gradient_accumulation_steps", "lora_rank", "lora_alpha"):
         if name in cfg and int(cfg[name]) < 1:
             raise ValueError(f"{name} must be positive")
+    if "calibration_max_samples" in cfg and int(cfg["calibration_max_samples"]) < 1:
+        raise ValueError("calibration_max_samples must be positive")
     if cfg.get("lr_scheduler_type") not in {None, "linear", "cosine", "constant", "epoch_decay"}:
         raise ValueError("lr_scheduler_type must be linear, cosine, constant, or epoch_decay")
     if cfg.get("quantization", "none") not in {"none", "qlora4"}:
@@ -948,7 +998,8 @@ def _confirm_training_config(model, cfg, *, accept_defaults=False):
 
 def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifacts",
                   registry_path="experiments/registry.sqlite", *, from_experiment=None, epochs=4, seed=2026,
-                  config_path=None, config_overrides=None, model="qwen06", validation_dataset="v0"):
+                  config_path=None, config_overrides=None, model="qwen06", validation_dataset="v0",
+                  refresh_prediction=False, refresh_checkpoint_catalog=False):
     """Continue a saved Qwen LoRA model and validate after every additional epoch."""
     from .model_factory import train_qwen_lora_fold
     if model not in {"qwen06", "qwen17", "qwen4", "qwen8"}:
@@ -1036,6 +1087,8 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         if result.get(key) is not None:
             metrics[key] = result[key]
     metrics["validation_metrics_by_epoch"]=result["validation_metrics_by_epoch"]
+    export_started = time.perf_counter()
+    runtime_breakdown = _post_training_runtime(result)
     pred=valid[["id","prompt_id","model"]].rename(columns={"model":"y_true"}).copy()
     for i,label in enumerate(classes): pred[f"score::{label}"]=result["scores"][:,i];pred[f"prob::{label}"]=result["probabilities"][:,i]
     pred_dir=Path(artifact_dir)/"predictions";pred_dir.mkdir(parents=True,exist_ok=True)
@@ -1057,7 +1110,9 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         "quantization_config":result.get("quantization_config"),
         "attention_backend":result.get("attention_backend",cfg.get("attention_backend")),
         "fit_seconds":result["fit_seconds"],"inference_seconds":result["inference_seconds"],
-        "runtime_breakdown":result.get("runtime_breakdown"),
+        "runtime_breakdown":runtime_breakdown,
+        "checkpoint_scoring_method":result.get("checkpoint_scoring_method"),
+        "final_validation_reused_existing_predictions":result.get("final_validation_reused_epoch_predictions"),
         "early_stopping":result.get("early_stopping"),
         "calibration_temperature":result["calibration_temperature"],"validation_metrics_by_epoch":result["validation_metrics_by_epoch"],
         "calibration_sample_size":result.get("calibration_sample_size"),
@@ -1080,7 +1135,27 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         dataset_hash=profile["dataset_sha256"],split_hash=profile["split_sha256"],model_revision=cfg["revision"],
         code_revision=code_revision,seed=seed,runtime_seconds=result["fit_seconds"],artifact_path=str(prediction_path),
         config_hash=config_hash,description=f"Continued Qwen LoRA from {source['experiment_id']} for {epochs} epochs; validation metrics recorded each epoch.")
+    runtime_breakdown["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
+    manifest["runtime_breakdown"] = runtime_breakdown
+    manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
+    (pred_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2)+"\n")
     _release_completed_training_model(result)
+    if refresh_prediction or refresh_checkpoint_catalog:
+        if validation_dataset == "v0":
+            _refresh_ensemble_after_training(manifest, manifest_path, artifact_dir=artifact_dir,
+                data_dir=data_dir, refresh_prediction=refresh_prediction,
+                refresh_checkpoint_catalog=refresh_checkpoint_catalog)
+        else:
+            manifest["runtime_breakdown"]["downstream_refresh_seconds"] = 0.0
+            manifest["prediction_factory_update"] = {"status":"skipped", "reason":"V0 validation required"}
+            manifest["checkpoint_catalog_update"] = {"status":"skipped", "reason":"V0 validation required"}
+            manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
+            (pred_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2)+"\n")
+    else:
+        manifest["prediction_factory_update"] = {"status":"skipped", "reason":"disabled"}
+        manifest["checkpoint_catalog_update"] = {"status":"skipped", "reason":"disabled"}
+        manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
+        (pred_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2)+"\n")
     return manifest
 
 
@@ -1088,7 +1163,8 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
                      artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *,
                      from_experiment, epochs=10, learning_rate=5e-5, validation_dataset="v0",
                      learning_rate_decay=0.9, seed=2026, optimizer="adamw_torch",
-                     weight_decay=0.0):
+                     weight_decay=0.0, refresh_prediction=False,
+                     refresh_checkpoint_catalog=False):
     """Validate a saved encoder checkpoint, continue training, and keep the best epoch.
 
     Baseline validation runs before the first optimizer step and is included in the
@@ -1155,6 +1231,10 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "checkpoint_selection_metric": "balanced_accuracy",
         "validation_dataset": validation_dataset,
         "checkpoint_selection": "highest_validation_balanced_accuracy",
+        "save_epoch_checkpoints": bool(source.get("config", {}).get("save_epoch_checkpoints", False)),
+        "calibration_max_samples": int(cfg.get("calibration_max_samples", 5000)),
+        "calibration_full_dataset": bool(cfg.get("calibration_full_dataset", False)),
+        "calibration_seed": int(cfg.get("calibration_seed", seed)),
     }
     config_hash = _sha(config_snapshot)
     experiment_id = (f"{model}_{dataset}_from{source_key}_data{profile['dataset_sha256'][:8]}_"
@@ -1181,9 +1261,10 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         select_best_checkpoint=True, local_files_only=True,
         early_stopping_patience=cfg.get("early_stopping_patience", 2),
         checkpoint_selection_metric="balanced_accuracy",
-        calibration_max_samples=cfg.get("calibration_max_samples", 5000),
-        calibration_seed=cfg.get("calibration_seed", seed),
-        calibration_full_dataset=cfg.get("calibration_full_dataset", False))
+        calibration_max_samples=config_snapshot["calibration_max_samples"],
+        calibration_seed=config_snapshot["calibration_seed"],
+        calibration_full_dataset=config_snapshot["calibration_full_dataset"],
+        save_epoch_checkpoints=config_snapshot["save_epoch_checkpoints"])
     metrics = evaluate(valid.model.astype(str), result["scores"], classes, result["probabilities"])
     for name in ("validation_loss_raw", "validation_loss_calibrated"):
         if result.get(name) is not None:
@@ -1193,6 +1274,8 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
                 "calibration_raw_loss", "calibration_calibrated_loss"):
         if result.get(key) is not None:
             metrics[key] = result[key]
+    export_started = time.perf_counter()
+    runtime_breakdown = _post_training_runtime(result)
     pred = valid[["id", "prompt_id", "model"]].rename(columns={"model": "y_true"}).copy()
     for i, label in enumerate(classes):
         pred[f"score::{label}"] = result["scores"][:, i]
@@ -1217,6 +1300,7 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "selected_validation_accuracy": result["best_validation_accuracy"],
         "checkpoint_selection_metric": result["checkpoint_selection_metric"],
         "checkpoint_scoring_method": result.get("checkpoint_scoring_method"),
+        "final_validation_reused_existing_predictions": result.get("final_validation_reused_epoch_predictions"),
         "train_rows": len(train), "validation_rows": len(valid),
         "training_dataset_rows": len(train), "validation_dataset_rows": len(valid),
         "training_dataset_sha256": train_hash, "validation_dataset_sha256": valid_hash,
@@ -1227,7 +1311,7 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "checkpoint_id": source.get("checkpoint_id"), "config": config_snapshot,
         "config_sha256": config_hash, "seed": seed,
         "fit_seconds": result["fit_seconds"], "inference_seconds": result["inference_seconds"],
-        "runtime_breakdown": result.get("runtime_breakdown"),
+        "runtime_breakdown": runtime_breakdown,
         "calibration_temperature": result["calibration_temperature"],
         "calibration_sample_size": result.get("calibration_sample_size"),
         "calibration_full_dataset": result.get("calibration_full_dataset"),
@@ -1248,7 +1332,27 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         seed=seed, runtime_seconds=manifest["fit_seconds"], artifact_path=str(prediction_path),
         config_hash=config_hash,
         description=f"Continued {model} from {from_experiment} for {epochs} epochs after baseline validation.")
+    runtime_breakdown["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
+    manifest["runtime_breakdown"] = runtime_breakdown
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    (manifests_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")
     _release_completed_training_model(result)
+    if refresh_prediction or refresh_checkpoint_catalog:
+        if validation_dataset == "v0":
+            _refresh_ensemble_after_training(manifest, manifest_path, artifact_dir=artifact_dir,
+                data_dir=data_dir, refresh_prediction=refresh_prediction,
+                refresh_checkpoint_catalog=refresh_checkpoint_catalog)
+        else:
+            manifest["runtime_breakdown"]["downstream_refresh_seconds"] = 0.0
+            manifest["prediction_factory_update"] = {"status":"skipped", "reason":"V0 validation required"}
+            manifest["checkpoint_catalog_update"] = {"status":"skipped", "reason":"V0 validation required"}
+            manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
+            (manifests_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2)+"\n")
+    else:
+        manifest["prediction_factory_update"] = {"status":"skipped", "reason":"disabled"}
+        manifest["checkpoint_catalog_update"] = {"status":"skipped", "reason":"disabled"}
+        manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
+        (manifests_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2)+"\n")
     return manifest
 
 
@@ -1483,11 +1587,12 @@ def main(argv=None):
     mix=d.add_parser("assemble");mix.add_argument("--config",default="configs/data/mixed_v1_5.yaml")
     f=sub.add_parser("features").add_subparsers(dest="action",required=True);b=f.add_parser("build");b.add_argument("--dataset",default="v1");b.add_argument("--validation-dataset",default="v0");b.add_argument("--data-dir",default="data/processed");b.add_argument("--config",default="configs/features/default.yaml")
     m=sub.add_parser("models").add_subparsers(dest="action",required=True)
-    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v1");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--validation-dataset",default="v0",help="dataset artifact used in full for validation (default: v0)");t.add_argument("--skip-prediction-refresh",action="store_true",help="save the model run without changing the active prediction roster or ensemble history");t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
+    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v1");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--validation-dataset",default="v0",help="dataset artifact used in full for validation (default: v0)");t.add_argument("--refresh-prediction",action="store_true",help="refresh the active prediction roster if its inputs changed");t.add_argument("--refresh-checkpoint-catalog",action="store_true",help="refresh the checkpoint-label catalog after training");t.add_argument("--skip-prediction-refresh",action="store_true",help=argparse.SUPPRESS);t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
     cq=m.add_parser("continue-qwen",help="continue the latest Qwen LoRA checkpoint and validate after every epoch")
     cq.add_argument("--dataset",default="v1");cq.add_argument("--validation-dataset",default="v0");cq.add_argument("--epochs",type=int,default=4);cq.add_argument("--seed",type=int,default=2026)
     cq.add_argument("--model",choices=["qwen06","qwen17","qwen4","qwen8"],default="qwen06")
     cq.add_argument("--from-experiment");cq.add_argument("--config");cq.add_argument("--accept-config-defaults",action="store_true")
+    cq.add_argument("--refresh-prediction",action="store_true");cq.add_argument("--refresh-checkpoint-catalog",action="store_true")
     ce=m.add_parser("continue-encoder",help="baseline-validate and continue a saved UltraBERT checkpoint")
     ce.add_argument("--model",choices=["ultrabert380"],default="ultrabert380")
     ce.add_argument("--dataset",default="v1");ce.add_argument("--validation-dataset",default="v0");ce.add_argument("--from-experiment",required=True)
@@ -1495,6 +1600,7 @@ def main(argv=None):
     ce.add_argument("--learning-rate-decay",type=float,default=0.9);ce.add_argument("--seed",type=int,default=2026)
     ce.add_argument("--data-dir",default="data/processed");ce.add_argument("--artifact-dir",default="artifacts")
     ce.add_argument("--registry",default="experiments/registry.sqlite");ce.add_argument("--accept-config-defaults",action="store_true")
+    ce.add_argument("--refresh-prediction",action="store_true");ce.add_argument("--refresh-checkpoint-catalog",action="store_true")
     ts=m.add_parser("catboost-two-stage",help="run sequential V1-all to V0 CatBoost feature experiments")
     ts.add_argument("--data-dir",default="data/processed")
     ts.add_argument("--artifact-dir",default="artifacts")
@@ -1618,7 +1724,9 @@ def main(argv=None):
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
         result=train_models(a.dataset,a.model,a.data_dir,a.artifact_dir,config_path=a.config,
             feature_config_path=a.features_config,seed=a.seed,config_overrides=overrides,
-            refresh_prediction=not a.skip_prediction_refresh, validation_dataset=a.validation_dataset)
+            refresh_prediction=a.refresh_prediction and not a.skip_prediction_refresh,
+            refresh_checkpoint_catalog=a.refresh_checkpoint_catalog,
+            validation_dataset=a.validation_dataset)
     elif a.command=="models" and a.action=="catboost-two-stage":
         from .catboost_two_stage import run_catboost_two_stage
         cfg = _model_cfg("catboost_stylometry", a.config)
@@ -1682,7 +1790,9 @@ def main(argv=None):
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
         result=continue_qwen(a.dataset,validation_dataset=a.validation_dataset,from_experiment=a.from_experiment,
             epochs=int(overrides.get("epochs", a.epochs)),seed=a.seed,config_path=a.config,
-            config_overrides=overrides,model=a.model)
+            config_overrides=overrides,model=a.model,
+            refresh_prediction=a.refresh_prediction,
+            refresh_checkpoint_catalog=a.refresh_checkpoint_catalog)
     elif a.command=="models" and a.action=="continue-encoder":
         cfg = _model_cfg(a.model); cfg.update({"epochs":a.epochs,"learning_rate":a.learning_rate,
                                                 "learning_rate_decay":a.learning_rate_decay})
@@ -1692,7 +1802,9 @@ def main(argv=None):
             learning_rate=float(overrides.get("learning_rate",a.learning_rate)),
             learning_rate_decay=float(overrides.get("learning_rate_decay",a.learning_rate_decay)),seed=a.seed,
             optimizer=overrides.get("optimizer",cfg.get("optimizer","adamw_torch")),
-            weight_decay=float(overrides.get("weight_decay",cfg.get("weight_decay",0.0))))
+            weight_decay=float(overrides.get("weight_decay",cfg.get("weight_decay",0.0))),
+            refresh_prediction=a.refresh_prediction,
+            refresh_checkpoint_catalog=a.refresh_checkpoint_catalog)
     elif a.command=="ensemble": result=evaluate_ensembles(a.dataset,a.artifact_dir,bootstrap_replicates=a.bootstrap_replicates,model_names=a.models,force=a.force)
     elif a.command=="prediction":
         if a.action=="evaluate":

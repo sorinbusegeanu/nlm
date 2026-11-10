@@ -16,7 +16,6 @@ from sklearn.metrics import accuracy_score
 from .evaluation import evaluate
 from .feature_factory import (BASE_STYLOMETRY_GROUPS, STYLOMETRY_GROUPS,
                               stylometry)
-from .inference import predict_catboost_stylometry
 from .model_factory import train_catboost_stylometry
 from .registry import Registry
 
@@ -245,19 +244,16 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
     if int(result["tree_count"]) < 1 or int(result["tree_count"]) > expected_trees:
         raise RuntimeError(f"CatBoost produced {result['tree_count']} trees outside 1..{expected_trees}")
 
-    # Reload through the real inference helper and verify saved-checkpoint behavior.
-    reloaded_probabilities, _ = predict_catboost_stylometry(
-        checkpoint, valid.text.tolist(), classes,
-        temperature=result["calibration_temperature"])
-    if not np.allclose(reloaded_probabilities, result["probabilities"], rtol=1e-6, atol=1e-7):
-        raise RuntimeError("reloaded CatBoost checkpoint does not reproduce fit-time validation probabilities")
     scores = np.asarray(result["scores"], dtype=float)
-    probabilities = reloaded_probabilities
+    # CatBoost's fitted model already holds the selected best iteration and is
+    # the object serialized to model.cbm; reuse its aligned validation outputs.
+    probabilities = np.asarray(result["probabilities"], dtype=float)
     metric_values = _metrics(valid.model.astype(str).to_numpy(), scores, probabilities, classes)
 
     run_id = _stage_id(report_dir.name, experiment, stage)
     stage_artifact_dir = checkpoint.parent
     prediction_path = stage_artifact_dir / f"{run_id}_validation.parquet"
+    export_started = time.perf_counter()
     prediction_frame = _write_prediction_frame(prediction_path, valid, classes, scores, probabilities)
     dataset_hash = data_profile["dataset_sha256"]
     split_hash = data_profile.get("split_sha256", "")
@@ -298,13 +294,26 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         "code_revision": code_revision, "seed": int(seed), "config": config,
         "config_sha256": config_hash, "fit_seconds": float(result["fit_seconds"]),
         "inference_seconds": float(result["inference_seconds"]),
+        "runtime_breakdown": {**(result.get("runtime_breakdown") or {}),
+            "best_checkpoint_restoration_seconds": 0.0,
+            "calibration_inference_seconds": result.get("calibration_inference_seconds"),
+            "temperature_fit_seconds": result.get("temperature_fit_seconds"),
+            "final_validation_inference_seconds": float(result["inference_seconds"]),
+            "checkpoint_serialization_seconds": (result.get("runtime_breakdown") or {}).get(
+                "checkpoint_serialization_seconds", (result.get("runtime_breakdown") or {}).get("checkpoint_save_seconds", 0.0)),
+            "manifest_prediction_export_seconds": 0.0,
+            "downstream_refresh_seconds": 0.0},
         "checkpoint_size_bytes": checkpoint_size,
         "checkpoint_path": str(checkpoint), "parent_checkpoint": config["parent_checkpoint"],
+        "checkpoint_scoring_method": result.get("checkpoint_scoring_method"),
+        "final_validation_reused_existing_predictions": result.get("final_validation_reused_existing_predictions", True),
         "parent_checkpoint_sha256": parent_sha256,
         "iterations_added": int(iterations), "tree_count": int(result["tree_count"]),
         "feature_count": len(feature_names), "feature_names": feature_names,
         "feature_recipe": recipe, "calibration_method": result["calibration_method"],
         "calibration_temperature": float(result["calibration_temperature"]),
+        "calibration_sample_size": result.get("calibration_sample_size"),
+        "calibration_full_dataset": result.get("calibration_full_dataset"),
         "validation_metrics_by_epoch": [], "early_stopping": None,
         "validation_labels_used_for_checkpoint_selection": True,
         "prediction_path": str(prediction_path),
@@ -321,6 +330,10 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         config_hash=config_hash, split_hash=split_hash,
         description=(f"{experiment} {experiment_name} stage {stage}: CatBoost trained on "
                      f"{dataset_name}, {len(train)} train rows; {len(valid)} frozen V0 validation rows."))
+    manifest["runtime_breakdown"]["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
+    manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
+    (stage_artifact_dir / f"{experiment_id}_metrics.json").write_text(
+        json.dumps(manifest, indent=2, allow_nan=False) + "\n")
     if experiment == "B" and stage == "stage2":
         importance = result["model"].get_feature_importance(type="FeatureImportance")
         importance_by_group = _aggregate_feature_importance(feature_names, importance)

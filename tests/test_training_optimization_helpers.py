@@ -46,6 +46,56 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertTrue(np.isfinite([report["calibration_raw_loss"],
                                      report["calibration_calibrated_loss"]]).all())
 
+    def test_default_calibration_sample_is_capped_at_five_thousand(self):
+        labels = np.repeat(np.asarray(["a", "b", "c", "d"]), 1500)
+        first = model_factory._calibration_indices(labels)
+        second = model_factory._calibration_indices(labels)
+        np.testing.assert_array_equal(first, second)
+        self.assertEqual(len(first), 5000)
+        self.assertEqual(set(labels[first]), {"a", "b", "c", "d"})
+
+    @unittest.skipUnless(_torch_available(), "PyTorch grouped inference ordering check")
+    def test_length_grouped_inference_restores_original_row_order(self):
+        import torch
+        class Dataset(torch.utils.data.Dataset):
+            lengths = [4, 1, 3]
+            def __len__(self): return 3
+            def __getitem__(self, index):
+                return {"input_ids": torch.full((self.lengths[index],), index + 1),
+                        "attention_mask": torch.ones(self.lengths[index], dtype=torch.long)}
+        class Model(torch.nn.Module):
+            def forward(self, input_ids, attention_mask):
+                first = input_ids[:, 0].float()
+                return SimpleNamespace(logits=torch.stack([first, first + 10], dim=1))
+        def collate(rows):
+            width = max(len(row["input_ids"]) for row in rows)
+            ids = torch.zeros((len(rows), width), dtype=torch.long)
+            mask = torch.zeros_like(ids)
+            for index, row in enumerate(rows):
+                size = len(row["input_ids"])
+                ids[index, :size] = row["input_ids"]
+                mask[index, :size] = row["attention_mask"]
+            return {"input_ids": ids, "attention_mask": mask}
+        predictions = model_factory._predict_cached_dataset(Model(), Dataset(), batch_size=2,
+            data_collator=collate, device=torch.device("cpu"))
+        np.testing.assert_array_equal(predictions[:, 0], [1, 2, 3])
+
+    def test_post_training_runtime_has_stable_stage_keys(self):
+        runtime = pipeline._post_training_runtime({"inference_seconds": 1.25,
+            "runtime_breakdown": {"temperature_fit_seconds": 0.04}})
+        self.assertEqual(runtime["temperature_fit_seconds"], 0.04)
+        self.assertEqual(runtime["final_validation_inference_seconds"], 1.25)
+        self.assertEqual(runtime["best_checkpoint_restoration_seconds"], 0.0)
+        self.assertEqual(runtime["manifest_prediction_export_seconds"], 0.0)
+
+    def test_epoch_predictions_are_reused_only_for_matching_selected_checkpoint(self):
+        epoch_predictions = [{"epoch": 1, "scores": np.ones((2, 3))},
+                             {"epoch": 2, "scores": np.full((2, 3), 2.0)}]
+        selected = model_factory._selected_epoch_scores(epoch_predictions, 2, (2, 3))
+        np.testing.assert_array_equal(selected, np.full((2, 3), 2.0))
+        self.assertIsNone(model_factory._selected_epoch_scores(epoch_predictions, 3, (2, 3)))
+        self.assertIsNone(model_factory._selected_epoch_scores(epoch_predictions, 2, (3, 3)))
+
     def test_token_length_cache_reuses_and_invalidates_on_content_change(self):
         class FakeTokenizer:
             calls = 0

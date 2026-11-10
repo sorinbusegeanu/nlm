@@ -139,8 +139,6 @@ class CatBoostTwoStageTests(unittest.TestCase):
                 (checkpoint / "stylometry.json").write_text('{"tree_count":1}\n')
                 return result
             with patch("src.catboost_two_stage.train_catboost_stylometry", side_effect=fake_train), \
-                 patch("src.catboost_two_stage.predict_catboost_stylometry",
-                       return_value=(result["probabilities"], classes)), \
                  patch("src.catboost_two_stage.Registry"):
                 _save_stage(experiment="A", experiment_name="P+F", stage="stage1",
                     dataset_name="v1_all", train=train, valid=valid, classes=classes,
