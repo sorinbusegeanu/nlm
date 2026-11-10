@@ -78,7 +78,7 @@ def _read_selected_candidates(prediction_dir, candidate_ids):
 
 
 def evaluate_svc_sweep(artifact_dir="artifacts", *, registry_path="docs/ensembles.md",
-                       output_dir=None, variant_ids=None, baseline_id=None):
+                       output_dir=None, variant_ids=None, baseline_id=None, validation_dataset="v0"):
     """Evaluate standalone SVCs and champion blends with only the SVC member replaced."""
     artifact_dir = Path(artifact_dir)
     prediction_dir = artifact_dir / "predictions"
@@ -122,8 +122,11 @@ def evaluate_svc_sweep(artifact_dir="artifacts", *, registry_path="docs/ensemble
     if excluded:
         raise ValueError(f"sweep candidates do not align to the champion validation rows: {excluded}")
     aligned_by_id = {item["candidate_id"]: item for item in aligned}
-    if len(reference_ids) != 540:
-        raise ValueError(f"expected the fixed 540-row validation set, found {len(reference_ids)} rows")
+    for candidate in aligned_candidates:
+        named = candidate["model_manifest"].get("validation_dataset",
+                 candidate["model_manifest"].get("validation_dataset_version", "v0"))
+        if named != validation_dataset:
+            raise ValueError(f"candidate {candidate['candidate_id']} was validated on {named}, expected {validation_dataset}")
 
     champion_probabilities = sum(
         weight * aligned_by_id[candidate_id]["probabilities"]
@@ -218,9 +221,11 @@ def evaluate_svc_sweep(artifact_dir="artifacts", *, registry_path="docs/ensemble
     report = {
         "experiment": "svc_v1.1_C_sweep",
         "dataset": "v1.1",
+        "validation_dataset": validation_dataset,
         "validation_rows": len(y_true),
         "validation_prompt_groups": int(len(set(groups))),
         "validation_ids_sha256": by_id[champion_svc_id]["model_manifest"].get("id_sha256"),
+        "validation_dataset_sha256": by_id[champion_svc_id]["model_manifest"].get("validation_dataset_sha256"),
         "seed": 2026,
         "features": {"views": ["char", "word"]},
         "class_weight": "balanced",
@@ -239,7 +244,7 @@ def evaluate_svc_sweep(artifact_dir="artifacts", *, registry_path="docs/ensemble
         "candidates": results.to_dict(orient="records"),
         "best_variant": best_variant,
         "selection": "highest substituted-champion accuracy, then lower blend log loss, then higher standalone accuracy",
-        "scope_note": "Exploratory: these variants are compared and ranked on the same fixed 540-row validation set. Do not treat the winning score as an independent estimate.",
+        "scope_note": f"Exploratory: these variants are compared and ranked on all {len(y_true)} rows from {validation_dataset}. Do not treat the winning score as an independent estimate.",
         "champion_replacement_note": "Each candidate replaces only the champion's SVC member; all other members, strategy, and weights are held fixed.",
         "candidate_read_problems": [],
         "results_csv": str(output_dir / "results.csv"),
@@ -251,7 +256,7 @@ def evaluate_svc_sweep(artifact_dir="artifacts", *, registry_path="docs/ensemble
 
 def run_svc_sweep(*, dataset="v1.1", data_dir="data/processed", artifact_dir="artifacts",
                   registry_path="experiments/registry.sqlite", ensemble_registry="docs/ensembles.md",
-                  output_dir=None, c_values=DEFAULT_C_VALUES, seed=2026):
+                  output_dir=None, c_values=DEFAULT_C_VALUES, seed=2026, validation_dataset="v0"):
     """Train requested C variants without refreshing the active prediction roster."""
     artifact_dir = Path(artifact_dir)
     manifests_dir = artifact_dir / "predictions"
@@ -265,6 +270,7 @@ def run_svc_sweep(*, dataset="v1.1", data_dir="data/processed", artifact_dir="ar
         config = manifest.get("config", {})
         if (manifest.get("model") == "svc" and manifest.get("dataset") == dataset
                 and manifest.get("seed") == seed and manifest.get("split") == "validation"
+                and manifest.get("validation_dataset", manifest.get("validation_dataset_version", "v0")) == validation_dataset
                 and float(config.get("C", -1)) == 0.5
                 and config.get("features", {}).get("views") == ["char", "word"]
                 and config.get("calibration") == "sigmoid"
@@ -279,16 +285,17 @@ def run_svc_sweep(*, dataset="v1.1", data_dir="data/processed", artifact_dir="ar
     for c_value in c_values:
         run = train_models(dataset, "svc", data_dir, artifact_dir, registry_path,
                            seed=seed, config_overrides={"C": float(c_value)},
-                           refresh_prediction=False)
+                           refresh_prediction=False, validation_dataset=validation_dataset)
         variant_ids.append(run["experiment_id"])
         config = run.get("config", {})
         if (float(config.get("C", -1)) != float(c_value)
                 or run.get("dataset") != dataset or run.get("seed") != seed
-                or run.get("split") != "validation"):
+                or run.get("split") != "validation"
+                or run.get("validation_dataset") != validation_dataset):
             raise RuntimeError(f"run metadata does not match requested C={c_value}: {run['experiment_id']}")
     report = evaluate_svc_sweep(artifact_dir, registry_path=ensemble_registry,
                                 output_dir=output_dir, variant_ids=variant_ids,
-                                baseline_id=baseline_id)
+                                baseline_id=baseline_id, validation_dataset=validation_dataset)
     report["trained_candidate_ids"] = variant_ids
     report["baseline_candidate_id"] = baseline_id
     report["registry_path"] = str(ensemble_registry)
@@ -302,6 +309,7 @@ def run_svc_sweep(*, dataset="v1.1", data_dir="data/processed", artifact_dir="ar
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default="v1.1")
+    parser.add_argument("--validation-dataset", default="v0")
     parser.add_argument("--data-dir", default="data/processed")
     parser.add_argument("--artifact-dir", default="artifacts")
     parser.add_argument("--registry", default="experiments/registry.sqlite")
@@ -313,7 +321,8 @@ def main():
     report = run_svc_sweep(dataset=args.dataset, data_dir=args.data_dir,
                            artifact_dir=args.artifact_dir, registry_path=args.registry,
                            ensemble_registry=args.ensemble_registry, output_dir=args.output_dir,
-                           c_values=args.c_values, seed=args.seed)
+                           c_values=args.c_values, seed=args.seed,
+                           validation_dataset=args.validation_dataset)
     print(json.dumps(report, indent=2))
 
 

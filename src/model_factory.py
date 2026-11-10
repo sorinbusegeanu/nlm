@@ -163,7 +163,7 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
                               thread_count=8, seed=2026, temperature_calibration=True,
                               validation_labels=None, early_stopping_rounds=100,
                               feature_recipe=None, feature_matrices=None, init_model=None,
-                              checkpoint_metadata=None, checkpoint_selection_metric="accuracy",
+                              checkpoint_metadata=None, checkpoint_selection_metric="balanced_accuracy",
                               calibration_max_samples=5000, calibration_seed=2026,
                               calibration_full_dataset=False):
     """Fit CatBoost on deterministic row-local style statistics; no validation fitting."""
@@ -729,7 +729,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        warmup_ratio=0.0, warmup_epochs=None, early_stopping_patience=2,
                        auto_batch_size=False, max_batch_size=1024,
                        batch_probe_safety_fraction=0.95,
-                       checkpoint_selection_metric="accuracy", calibration_max_samples=5000,
+                       checkpoint_selection_metric="balanced_accuracy", calibration_max_samples=5000,
                        calibration_seed=2026, calibration_full_dataset=False):
     """Fine-tune or continue an encoder after recording its validation baseline."""
     _force_huggingface_offline()
@@ -1063,6 +1063,24 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
     # that persistent memory. This is conservative for lower-memory optimizers.
     optimizer_probe = str(optimizer_name)
 
+    def make_probe_optimizer():
+        name = str(optimizer_name).lower()
+        if name in {"paged_adamw_8bit", "adamw_bnb_8bit"}:
+            try:
+                import bitsandbytes as bnb
+            except ImportError as exc:
+                raise RuntimeError(f"configured optimizer {name} requires bitsandbytes") from exc
+            return bnb.optim.PagedAdamW8bit(trainable, lr=1e-4, weight_decay=float(weight_decay))
+        if name in {"adamw_torch", "adamw", "adamw_torch_fused"}:
+            cls = torch.optim.AdamW
+            extra = {"fused": True} if name == "adamw_torch_fused" else {}
+            return cls(trainable, lr=1e-4, weight_decay=float(weight_decay), **extra)
+        if name == "adam":
+            return torch.optim.Adam(trainable, lr=1e-4, weight_decay=float(weight_decay))
+        if name == "sgd":
+            return torch.optim.SGD(trainable, lr=1e-4, weight_decay=float(weight_decay))
+        raise ValueError(f"unsupported optimizer for batch-size probe: {optimizer_name}")
+
     def attempt(size):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
@@ -1085,10 +1103,7 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
             if loss is None:
                 raise RuntimeError("batch size probe needs labeled training examples")
             loss.backward()
-            optimizer_type = getattr(torch.optim, str(optimizer_name).split("_")[-1].upper(), None)
-            if optimizer_type is None:
-                optimizer_type = torch.optim.AdamW
-            probe_optimizer = optimizer_type(trainable, lr=1e-4, weight_decay=float(weight_decay))
+            probe_optimizer = make_probe_optimizer()
             probe_optimizer.step()
             torch.cuda.synchronize(device)
             peak = int(torch.cuda.max_memory_allocated(device))
@@ -1129,6 +1144,7 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
             "sequence_length": max(dataset_lengths) if dataset_lengths else None,
             "optimizer": str(optimizer_name), "gradient_checkpointing": bool(
                 getattr(getattr(model, "backbone", model), "is_gradient_checkpointing", False)),
+            "weight_decay": float(weight_decay),
             "safety_fraction": float(safety_fraction),
             "max_batch_size": maximum}
         cache_key = hashlib.sha256(json.dumps(cache_payload, sort_keys=True).encode()).hexdigest()
@@ -1240,7 +1256,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          warmup_epochs=None, optimizer="adamw_torch", weight_decay=0.0,
                          early_stopping_patience=2, trust_remote_code=False,
                          quantization="none", attention_backend=None,
-                         checkpoint_selection_metric="accuracy", save_epoch_checkpoints=False,
+                         checkpoint_selection_metric="balanced_accuracy", save_epoch_checkpoints=False,
                          calibration_max_samples=5000, calibration_seed=2026,
                          calibration_full_dataset=False):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
@@ -1362,7 +1378,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             if self.ys is not None: item["labels"]=torch.tensor(label_map[self.ys[i]],dtype=torch.long)
             return item
     model=Head()
-    model._batch_probe_model_id = f"{checkpoint}@{revision}"
+    model._batch_probe_model_id = f"{checkpoint}@{revision}:{quantization}"
     if resume_checkpoint:
         classifier_path = Path(resume_checkpoint)/"classifier.pt"
         if not classifier_path.is_file(): raise FileNotFoundError(f"continuation checkpoint has no classifier head: {classifier_path}")

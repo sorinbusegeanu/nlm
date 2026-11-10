@@ -19,7 +19,6 @@ import joblib
 from sklearn.metrics import balanced_accuracy_score
 
 from .data_factory import (assemble_openpool_mix, assemble_v1_5, build_v1_3_external_dataset,
-                           build_full_v0_external_scope,
                            curate_openpool, curate_v1_all_balanced_deduped,
                            curate_v1_all_clean_compact, prepare, _normal_text)
 from .evaluation import (align_predictions, complementarity, evaluate, paired_group_bootstrap)
@@ -334,166 +333,141 @@ def _profile_path(data_dir, dataset):
     return Path(data_dir) / name
 
 
-def _is_training_only_profile(profile):
-    """Whether an artifact is an external-only training dataset."""
-    is_curated_openpool = str(profile.get("curation_method", "")).startswith("openpool_v11_hard_defect_")
-    return is_curated_openpool or profile.get("training_only") is True
-
-
-def _effective_profile(data_dir, dataset, rows, validation_scope=None):
-    if validation_scope == "full_v0":
-        scoped_path = Path(data_dir) / f"dataset_profile_{dataset}_full_v0.json"
-        if not scoped_path.is_file():
-            raise FileNotFoundError(f"full_v0 validation profile was not prepared for {dataset}")
-        profile = json.loads(scoped_path.read_text(encoding="utf-8"))
-        expected_validation = int(rows.split.eq("validation").sum())
-        expected_training = int(rows.split.eq("train").sum())
-        if (expected_validation != int(profile.get("validation_rows", -1))
-                or expected_training != int(profile.get("training_rows", -1))):
-            raise ValueError(f"{dataset} full_v0 profile row counts do not match scoped rows")
-        return profile
+def _effective_profile(data_dir, dataset, rows):
     profile = json.loads(_profile_path(data_dir, dataset).read_text())
-    if dataset == "v0":
-        return profile
-    if not _is_training_only_profile(profile):
-        return profile
-    v0_profile = json.loads(_profile_path(data_dir, "v0").read_text())
-    training = rows.loc[rows.split.eq("train")].sort_values("id", kind="stable")
-    validation = rows.loc[rows.split.eq("validation")].sort_values("id", kind="stable")
-    training_ids = sorted(training.id.astype(str))
-    validation_ids = sorted(validation.id.astype(str))
-    validation_content = validation[[c for c in ("id", "prompt_id", "text", "model") if c in validation]]
-    validation_content_hash = hashlib.sha256(
-        validation_content.to_csv(index=False, lineterminator="\n").encode("utf-8")).hexdigest()
-    components = {"openpool_dataset_sha256": profile["dataset_sha256"],
-                  "v0_validation_split_sha256": v0_profile["split_sha256"],
-                  "v0_validation_ids_sha256": hashlib.sha256("\n".join(validation_ids).encode()).hexdigest(),
-                  "v0_validation_content_sha256": validation_content_hash,
-                  "openpool_training_ids_sha256": hashlib.sha256("\n".join(training_ids).encode()).hexdigest()}
-    profile = dict(profile)
-    profile["openpool_dataset_sha256"] = profile["dataset_sha256"]
-    profile["split_sha256"] = _sha(components)
-    profile["training_dataset_version"] = dataset
-    profile["validation_dataset_version"] = "v0"
-    profile["training_rows"] = int(len(training))
-    profile["validation_rows"] = int(len(validation))
-    profile["effective_dataset_components"] = components
+    is_training_only = (profile.get("training_only") is True or
+                        str(profile.get("curation_method", "")).startswith("openpool_v11_hard_defect_"))
+    if dataset != "v0" and is_training_only and profile.get("validation_dataset_version") == "v0":
+        v0_profile = json.loads(_profile_path(data_dir, "v0").read_text())
+        train = rows.loc[rows.split.eq("train")].sort_values("id", kind="stable")
+        valid = rows.loc[rows.split.eq("validation")].sort_values("id", kind="stable")
+        components = {"training_dataset_sha256": profile["dataset_sha256"],
+                      "validation_dataset_sha256": v0_profile["dataset_sha256"],
+                      "v0_validation_split_sha256": v0_profile["split_sha256"],
+                      "training_ids_sha256": hashlib.sha256("\n".join(sorted(train.id.astype(str))).encode()).hexdigest(),
+                      "validation_ids_sha256": hashlib.sha256("\n".join(sorted(valid.id.astype(str))).encode()).hexdigest()}
+        profile = dict(profile)
+        profile.update({"split_sha256": _sha(components), "training_rows": len(train),
+                        "validation_rows": len(valid), "effective_dataset_components": components})
     return profile
 
 
-def _load_dataset(dataset, data_dir, *, validation_scope=None):
+def _load_dataset(dataset, data_dir):
+    """Load the historical split view for analysis utilities."""
     data_dir = Path(data_dir)
-    if validation_scope not in (None, "frozen_v0_540", "full_v0"):
-        raise ValueError("validation_scope must be 'frozen_v0_540' or 'full_v0'")
-    if validation_scope is None and dataset != "v0":
-        candidate_profile_path = _profile_path(data_dir, dataset)
-        if candidate_profile_path.is_file():
-            candidate_profile = json.loads(candidate_profile_path.read_text(encoding="utf-8"))
-            external_only = _is_training_only_profile(candidate_profile)
-            has_legacy_v0_reference = (candidate_profile.get("validation_dataset_version") == "v0"
-                                       and bool(candidate_profile.get("validation_split_sha256")))
-            if external_only and not has_legacy_v0_reference:
-                validation_scope = "full_v0"
-    if validation_scope == "full_v0":
-        source_profile_path = _profile_path(data_dir, dataset)
-        source_profile = json.loads(source_profile_path.read_text(encoding="utf-8"))
-        if not _is_training_only_profile(source_profile):
-            raise ValueError(
-                f"validation_scope=full_v0 requires an external-only training dataset; "
-                f"{dataset} is not marked training_only. Use its external-only source dataset "
-                "(for example v2_openpool instead of mixed v2).")
-        external = pd.read_parquet(data_dir / f"dataset_{dataset}.parquet")
-        v0_rows, _ = _load_dataset("v0", data_dir)
-        v0_profile = json.loads(_profile_path(data_dir, "v0").read_text(encoding="utf-8"))
-        expected_v0_rows = 2699
-        if int(v0_profile.get("rows", -1)) != expected_v0_rows:
-            raise ValueError(
-                f"official V0 profile must contain {expected_v0_rows} rows; "
-                f"found {v0_profile.get('rows')}")
-        rows, assignments, scope = build_full_v0_external_scope(
-            external, v0_rows,
-            expected_classes=len(v0_profile.get("classes", [])),
-            expected_v0_rows=expected_v0_rows)
-        scope.update({
-            "dataset_version": dataset,
-            "dataset_sha256": source_profile["dataset_sha256"],
-            "external_dataset_sha256": source_profile["dataset_sha256"],
-            "source_profile_path": str(source_profile_path),
-            "v0_dataset_sha256": v0_profile["dataset_sha256"],
-            "v0_source_split_sha256": v0_profile.get("split_sha256"),
-            "validation_split_sha256": scope["split_sha256"],
-            "validation_dataset_sha256": v0_profile["dataset_sha256"],
-            "validation_ids_sha256": scope["validation_ids_sha256"],
-            "validation_hashes": {
-                "ids_sha256": scope["validation_ids_sha256"],
-                "normalized_text_sha256": scope["validation_normalized_text_sha256"],
-                "prompt_ids_sha256": scope["validation_prompt_ids_sha256"],
-                "prompt_content_sha256": scope["validation_prompt_content_sha256"],
-                "training_ids_sha256": scope["training_ids_sha256"],
-                "training_normalized_text_sha256": scope["training_dataset_normalized_text_sha256"],
-                "training_prompt_content_sha256": scope["training_dataset_prompt_content_sha256"],
-                "scope_split_sha256": scope["split_sha256"],
-            },
-            "classes": v0_profile.get("classes", []),
-            "training_only": True,
-        })
-        profile_path = data_dir / f"dataset_profile_{dataset}_full_v0.json"
-        split_path = data_dir / f"splits_{dataset}_full_v0.parquet"
-        if profile_path.exists() or split_path.exists():
-            if not (profile_path.is_file() and split_path.is_file()):
-                raise FileExistsError(f"partial full_v0 scope artifacts exist for {dataset}")
-            old_profile = json.loads(profile_path.read_text(encoding="utf-8"))
-            old_assignments = pd.read_parquet(split_path)
-            if (old_profile != scope or
-                    not old_assignments.equals(assignments)):
-                raise FileExistsError(f"full_v0 scope artifacts already exist with different inputs for {dataset}")
-        else:
-            assignments.to_parquet(split_path, index=False)
-            profile_path.write_text(json.dumps(scope, indent=2) + "\n", encoding="utf-8")
-        return rows, data_dir
-    if dataset != "v0" and _is_training_only_profile(json.loads(_profile_path(data_dir, dataset).read_text())):
-        openpool = pd.read_parquet(data_dir / f"dataset_{dataset}.parquet")
-        v0_rows, _ = _load_dataset("v0", data_dir)
-        openpool_profile = json.loads(_profile_path(data_dir, dataset).read_text())
-        v0_profile = json.loads(_profile_path(data_dir, "v0").read_text())
-        if openpool.id.duplicated().any():
-            raise ValueError("Open Pool training IDs must be unique")
-        v0_validation = v0_rows.loc[v0_rows.split.eq("validation")].copy()
-        validation_ids = sorted(v0_validation.id.astype(str))
-        validation_ids_hash = hashlib.sha256("\n".join(validation_ids).encode()).hexdigest()
-        if len(v0_validation) != int(openpool_profile.get("validation_rows", -1)):
-            raise ValueError(f"{dataset} profile validation row count differs from the frozen V0 validation set")
-        if openpool_profile.get("validation_split_sha256") != v0_profile.get("split_sha256"):
-            raise ValueError(f"{dataset} profile references a different V0 validation split")
-        if openpool_profile.get("validation_ids_sha256") != validation_ids_hash:
-            raise ValueError(f"{dataset} profile validation IDs differ from the frozen V0 validation set")
-        if set(openpool.id.astype(str)) & set(v0_validation.id.astype(str)):
-            raise ValueError("Open Pool IDs overlap the frozen V0 validation IDs")
-        if set(openpool.model.astype(str).unique()) != set(v0_validation.model.astype(str).unique()):
-            raise ValueError("Open Pool and V0 label sets differ")
-        openpool = openpool.copy()
-        openpool["split"] = "train"
-        combined = pd.concat([openpool, v0_validation], ignore_index=True, sort=False)
-        if combined.id.duplicated().any():
-            raise ValueError("Open Pool and frozen V0 validation IDs must be unique")
-        train_prompts = set(openpool.prompt_id.astype(str))
-        validation_prompts = set(v0_validation.prompt_id.astype(str))
-        if train_prompts & validation_prompts:
-            raise ValueError("Open Pool training rows overlap frozen V0 validation prompt groups")
-        return combined.sort_values("id", kind="stable").reset_index(drop=True), data_dir
     rows = pd.read_parquet(data_dir / f"dataset_{dataset}.parquet")
-    assignments = pd.read_parquet(data_dir / f"splits_{dataset}.parquet")
-    if rows.id.duplicated().any() or assignments.id.duplicated().any(): raise ValueError("dataset and split assignment IDs must be unique")
-    if set(rows.id.astype(str)) != set(assignments.id.astype(str)): raise ValueError("dataset and split assignment ID sets differ")
+    if dataset != "v0" and "split" not in rows.columns:
+        profile_path = _profile_path(data_dir, dataset)
+        if profile_path.is_file():
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            is_training_only = (profile.get("training_only") is True or
+                str(profile.get("curation_method", "")).startswith("openpool_v11_hard_defect_"))
+            if is_training_only and profile.get("validation_dataset_version") == "v0":
+                v0_rows, _ = _load_dataset("v0", data_dir)
+                validation = v0_rows.loc[v0_rows.split.eq("validation")].copy()
+                if len(validation) != int(profile.get("validation_rows", -1)):
+                    raise ValueError(f"{dataset} reference validation row count differs from V0 assignments")
+                if profile.get("validation_split_sha256") != json.loads(
+                        _profile_path(data_dir, "v0").read_text()).get("split_sha256"):
+                    raise ValueError(f"{dataset} references a different V0 split artifact")
+                external = rows.copy()
+                external["split"] = "train"
+                combined = pd.concat([external, validation], ignore_index=True, sort=False)
+                if combined.id.duplicated().any():
+                    raise ValueError("training dataset and referenced V0 validation IDs overlap")
+                if set(external.prompt_id.astype(str)) & set(validation.prompt_id.astype(str)):
+                    raise ValueError("training dataset and referenced V0 validation prompts overlap")
+                return combined.sort_values("id", kind="stable").reset_index(drop=True), data_dir
+    assignments_path = data_dir / f"splits_{dataset}.parquet"
     if "split" in rows.columns:
-        inline = rows.set_index("id").split.astype(str).sort_index()
-        assigned = assignments.set_index("id").split.astype(str).sort_index()
-        if not inline.equals(assigned):
-            raise ValueError("inline split values differ from the split assignment artifact")
-        rows = rows.drop(columns="split")
+        if assignments_path.is_file():
+            assignments = pd.read_parquet(assignments_path)
+            if rows.id.duplicated().any() or assignments.id.duplicated().any():
+                raise ValueError("dataset and split assignment IDs must be unique")
+            inline = rows.set_index("id").split.astype(str).sort_index()
+            assigned = assignments.set_index("id").split.astype(str).sort_index()
+            if not inline.equals(assigned):
+                raise ValueError("inline split values differ from the split assignment artifact")
+        return rows, data_dir
+    if not assignments_path.is_file():
+        raise FileNotFoundError(f"split assignments are missing for {dataset}")
+    assignments = pd.read_parquet(assignments_path)
+    if rows.id.duplicated().any() or assignments.id.duplicated().any():
+        raise ValueError("dataset and split assignment IDs must be unique")
+    if set(rows.id.astype(str)) != set(assignments.id.astype(str)):
+        raise ValueError("dataset and split assignment ID sets differ")
     rows = rows.merge(assignments[["id", "split"]], on="id", how="left", validate="one_to_one")
-    if rows["split"].isna().any() or set(rows.split) != {"train", "validation"}: raise ValueError("rows need train and validation split assignments")
+    if rows["split"].isna().any():
+        raise ValueError("every dataset row needs a split assignment")
     return rows, data_dir
+
+
+def _dataset_rows(dataset, data_dir):
+    """Load every row in a dataset artifact, ignoring any historical split column."""
+    rows = pd.read_parquet(Path(data_dir) / f"dataset_{dataset}.parquet")
+    required = {"id", "prompt_id", "text", "model"}
+    missing = required - set(rows.columns)
+    if missing:
+        raise ValueError(f"{dataset} is missing required columns: {sorted(missing)}")
+    if (rows.id.duplicated().any() or rows.model.isna().any() or rows.text.isna().any()
+            or rows.prompt_id.isna().any()):
+        raise ValueError(f"{dataset} has duplicate IDs or missing response/label values")
+    return rows.drop(columns=["split"], errors="ignore").sort_values(
+        "id", kind="stable").reset_index(drop=True)
+
+
+def _partition_sha256(rows):
+    content = rows[[column for column in ("id", "prompt_id", "text", "model")
+                    if column in rows]].astype(str).to_csv(index=False, lineterminator="\n")
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _continuation_source_matches(source, training_dataset, validation_dataset,
+                                 train, valid, training_dataset_sha256):
+    if source.get("training_dataset", source.get("dataset")) != training_dataset:
+        return False
+    if source.get("validation_dataset", source.get("validation_dataset_version")) != validation_dataset:
+        return False
+    train_hash, valid_hash = _partition_sha256(train), _partition_sha256(valid)
+    if source.get("training_dataset_sha256") or source.get("validation_dataset_sha256"):
+        return (source.get("training_dataset_sha256") == train_hash
+                and source.get("validation_dataset_sha256") == valid_hash)
+    # Historical full-validation manifests predate explicit partition hashes.
+    expected_ids = hashlib.sha256("\n".join(sorted(valid.id.astype(str))).encode()).hexdigest()
+    legacy_validation = source.get("full_v0_validation") or {}
+    recorded_ids = source.get("validation_ids_sha256") or legacy_validation.get("ids_sha256")
+    expected_text = hashlib.sha256("\n".join(sorted(
+        f"{row.id}\t{_normal_text(row.text)}"
+        for row in valid[["id", "text"]].itertuples(index=False))).encode()).hexdigest()
+    recorded_text = source.get("validation_normalized_text_sha256") or legacy_validation.get(
+        "normalized_text_sha256")
+    return (source.get("dataset_sha256") == training_dataset_sha256
+            and int(source.get("validation_rows", -1)) == len(valid)
+            and recorded_ids == expected_ids
+            and (recorded_text is None or recorded_text == expected_text))
+
+
+def _training_partitions(training_dataset, validation_dataset, data_dir):
+    train = _dataset_rows(training_dataset, data_dir)
+    valid = _dataset_rows(validation_dataset, data_dir)
+    if set(train.model.astype(str)) != set(valid.model.astype(str)):
+        raise ValueError("training and validation datasets must contain the same classes")
+    checks = (("ID", set(train.id.astype(str)), set(valid.id.astype(str))),
+              ("normalized response", set(train.text.astype(str).map(_normal_text)),
+               set(valid.text.astype(str).map(_normal_text))),
+              ("prompt group", set(train.prompt_id.astype(str)), set(valid.prompt_id.astype(str))))
+    for name, left, right in checks:
+        overlap = left & right
+        if overlap:
+            raise ValueError(f"training and validation datasets overlap on {name}: {len(overlap)}")
+    for column in ("prompt_canon", "prompt", "prompt_text"):
+        if column in train and column in valid:
+            left = set(train[column].fillna("").astype(str).map(_normal_text)) - {""}
+            right = set(valid[column].fillna("").astype(str).map(_normal_text)) - {""}
+            overlap = left & right
+            if overlap:
+                raise ValueError(f"training and validation datasets overlap on normalized prompt content: {len(overlap)}")
+    return train, valid
 
 
 def _release_completed_training_model(result):
@@ -562,7 +536,7 @@ def _model_cfg(model, config_path=None):
 
 
 def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache_dir, *,
-                cache_fold=None, checkpoint_selection_metric="accuracy"):
+                cache_fold=None, checkpoint_selection_metric="balanced_accuracy"):
     if model == "svc":
         result = train_svc(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
                            c=cfg.get("C", .5), calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
@@ -705,22 +679,6 @@ def _resolve_checkpoint_path(path, artifact_dir):
     return candidates[0]
 
 
-def _full_v0_continuation_rows(rows):
-    """Return every selected external row and the complete official V0 validation set."""
-    train = rows.loc[rows.split.eq("train")].sort_values("id", kind="stable").reset_index(drop=True)
-    valid = rows.loc[rows.split.eq("validation")].sort_values("id", kind="stable").reset_index(drop=True)
-    if train.empty:
-        raise ValueError("continuation training dataset has no training rows")
-    if len(valid) != 2699:
-        raise ValueError(f"full V0 continuation validation requires all 2,699 rows, found {len(valid)}")
-    return train, valid
-
-
-def _require_full_v0_checkpoint(source):
-    if source.get("validation_scope") != "full_v0" or int(source.get("validation_rows", 0)) != 2699:
-        raise ValueError("continuation requires a source checkpoint selected against all 2,699 V0 rows")
-
-
 def _save_epoch_validation_predictions(result, valid, classes, prediction_dir, experiment_id):
     """Persist each epoch's already-computed validation logits and probabilities."""
     epochs = result.get("validation_predictions_by_epoch") or []
@@ -758,93 +716,62 @@ def _save_epoch_validation_predictions(result, valid, classes, prediction_dir, e
     return records
 
 
-def build_features(dataset="v0", data_dir="data/processed", config_path="configs/features/default.yaml", cache_dir="artifacts/features"):
-    rows, _ = _load_dataset(dataset, data_dir)
+def build_features(dataset="v1", data_dir="data/processed", config_path="configs/features/default.yaml", cache_dir="artifacts/features", *, validation_dataset="v0"):
+    train, valid = _training_partitions(dataset, validation_dataset, data_dir)
     cfg = _read_yaml(config_path)
-    train = rows[rows.split.eq("train")].sort_values("id", kind="stable").reset_index(drop=True)
-    valid = rows[rows.split.eq("validation")].sort_values("id", kind="stable").reset_index(drop=True)
-    x_train, x_val, features, key = load_or_fit(train.text, valid.text, config=cfg, cache_dir=cache_dir, fold_token=f"{dataset}-train-validation")
-    report = [{"cache_key": key, "train_shape": list(x_train.shape), "validation_shape": list(x_val.shape)}]
-    output = Path(cache_dir) / f"{dataset}_features_manifest.json"
+    x_train, x_val, features, key = load_or_fit(
+        train.text, valid.text, config=cfg, cache_dir=cache_dir,
+        fold_token=f"{dataset}-{_partition_sha256(train)}-{validation_dataset}-{_partition_sha256(valid)}")
+    report = [{"cache_key": key, "train_shape": list(x_train.shape),
+               "validation_shape": list(x_val.shape)}]
+    output = Path(cache_dir) / f"{dataset}_to_{validation_dataset}_features_manifest.json"
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps({"dataset": dataset, "feature_config": cfg, "split": "train_validation", "partitions": report}, indent=2) + "\n")
+    output.write_text(json.dumps({"training_dataset": dataset, "validation_dataset": validation_dataset,
+        "training_rows": len(train), "validation_rows": len(valid), "feature_config": cfg,
+        "split": "explicit_datasets", "partitions": report}, indent=2) + "\n")
     return report
 
 
-def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None, refresh_prediction=True, validation_scope=None):
-    """Train all external rows and validate each epoch on full V0 when available."""
+def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None, refresh_prediction=True, validation_dataset="v0"):
+    """Train on every row in dataset and validate on every row in validation_dataset."""
     if folds is not None:
-        raise ValueError("fold selection was removed; this pipeline uses one fixed train/validation split")
+        raise ValueError("fold selection was removed; specify explicit training and validation datasets")
     cfg = _model_cfg(model, config_path)
     if config_overrides:
         cfg.update(config_overrides)
         _validate_training_overrides(model, cfg)
-    external_only = False
-    if dataset != "v0":
-        source_profile_path = _profile_path(Path(data_dir), dataset)
-        if source_profile_path.is_file():
-            external_only = _is_training_only_profile(
-                json.loads(source_profile_path.read_text(encoding="utf-8")))
-    if dataset != "v0" and not external_only:
-        raise ValueError(
-            f"{dataset} is not an external-only dataset, so it cannot use all V0 for isolated validation. "
-            "Use an external-only source such as v1, v1.1, v2_openpool, or v2.0.")
-    requested_scope = validation_scope or cfg.get("validation_scope")
-    if external_only and requested_scope not in (None, "full_v0"):
-        raise ValueError("external-only datasets must use validation_scope=full_v0")
-    scope = "full_v0" if external_only else (requested_scope or "frozen_v0_540")
-    if scope not in {"frozen_v0_540", "full_v0"}:
-        raise ValueError("validation_scope must be 'frozen_v0_540' or 'full_v0'")
-    if validation_scope is not None or cfg.get("validation_scope") is not None:
-        cfg["validation_scope"] = scope
-    if scope == "full_v0":
-        cfg["validation_scope"] = scope
     if model in {"svc", "catboost_stylometry"} and feature_config_path:
         cfg["features"] = _read_yaml(feature_config_path)
-    rows, data_dir = _load_dataset(dataset, data_dir,
-        validation_scope="full_v0" if scope == "full_v0" else None)
+    train, valid = _training_partitions(dataset, validation_dataset, data_dir)
+    classes = sorted(train.model.astype(str).unique().tolist())
     if model not in {"svc", "catboost_stylometry"}:
-        cfg["max_length"] = _dataset_max_length(model, cfg, rows)
-    profile = _effective_profile(data_dir, dataset, rows,
-                                 validation_scope="full_v0" if scope == "full_v0" else None)
+        cfg["max_length"] = _dataset_max_length(model, cfg, pd.concat([train, valid], ignore_index=True))
+    train_profile = json.loads(_profile_path(Path(data_dir), dataset).read_text())
+    train_hash = _partition_sha256(train)
+    valid_hash = _partition_sha256(valid)
+    split_hash = _sha({"training_dataset": dataset, "training_sha256": train_hash,
+                       "validation_dataset": validation_dataset, "validation_sha256": valid_hash})
+    profile = {"dataset_sha256": train_profile.get("dataset_sha256", train_hash),
+               "split_sha256": split_hash,
+               "validation_ids_sha256": hashlib.sha256("\n".join(sorted(valid.id.astype(str))).encode()).hexdigest(),
+               "validation_prompt_ids_sha256": hashlib.sha256("\n".join(sorted(valid.prompt_id.astype(str))).encode()).hexdigest(),
+               "validation_normalized_text_sha256": hashlib.sha256("\n".join(sorted(valid.text.astype(str).map(_normal_text))).encode()).hexdigest(),
+               "validation_prompt_content_sha256": None}
     code_revision = _revision()
     config_snapshot = {k: v for k, v in cfg.items() if not k.startswith("_")}
     config_hash = _sha(config_snapshot)
-    experiment_id = f"{model}_{dataset}_data{profile['dataset_sha256'][:8]}_split{profile['split_sha256'][:8]}_seed{seed}_cfg{config_hash[:8]}_code{code_revision[:7]}"
+    experiment_id = f"{model}_{dataset}_val{validation_dataset}_data{train_hash[:8]}_split{split_hash[:8]}_seed{seed}_cfg{config_hash[:8]}_code{code_revision[:7]}"
     run_artifact_dir = Path(artifact_dir) / "runs" / experiment_id
     pred_dir = Path(artifact_dir) / "predictions"
-    prediction_suffix = "full_v0" if scope == "full_v0" else "validation"
-    prediction_path = pred_dir / f"{experiment_id}_{prediction_suffix}.parquet"
+    prediction_path = pred_dir / f"{experiment_id}_validation.parquet"
     manifest_path = pred_dir / f"{experiment_id}_manifest.json"
     if manifest_path.exists() and prediction_path.exists():
-        existing = json.loads(manifest_path.read_text())
-        if scope != "full_v0" and refresh_prediction and "prediction_factory_update" not in existing:
-            _refresh_ensemble_after_training(existing, manifest_path,
-                artifact_dir=artifact_dir, data_dir=data_dir)
-        return existing
-    if run_artifact_dir.exists(): raise FileExistsError(f"incomplete immutable experiment exists at {run_artifact_dir}; remove that generated run directory to retry")
-    classes = sorted(rows.model.astype(str).unique().tolist())
-    train = rows[rows.split.eq("train")].sort_values("id", kind="stable").reset_index(drop=True)
-    valid = rows[rows.split.eq("validation")].sort_values("id", kind="stable").reset_index(drop=True)
-    if set(train.prompt_id.astype(str)) & set(valid.prompt_id.astype(str)):
-        raise RuntimeError("prompt-group leakage between training and validation")
-    if scope == "full_v0":
-        for column, normalize in (("id", lambda values: values.astype(str)),
-                                  ("text", lambda values: values.astype(str).map(_normal_text)),
-                                  ("prompt_id", lambda values: values.astype(str))):
-            overlap = set(normalize(train[column])) & set(normalize(valid[column]))
-            if overlap:
-                raise RuntimeError(f"external training and full V0 validation overlap on {column}: {len(overlap)}")
-        if "prompt_canon" in train and "prompt_canon" in valid:
-            train_prompts = set(train.prompt_canon.fillna("").astype(str).map(_normal_text)) - {""}
-            validation_prompts = set(valid.prompt_canon.fillna("").astype(str).map(_normal_text)) - {""}
-            if train_prompts & validation_prompts:
-                raise RuntimeError(
-                    "external training and full V0 validation overlap on normalized prompt text: "
-                    f"{len(train_prompts & validation_prompts)}")
-    metric = "balanced_accuracy" if scope == "full_v0" else "accuracy"
+        return json.loads(manifest_path.read_text())
+    if run_artifact_dir.exists():
+        raise FileExistsError(f"incomplete immutable experiment exists at {run_artifact_dir}; remove that generated run directory to retry")
+    metric = "balanced_accuracy"
     result = _train_fold(model, train, valid, classes, cfg, run_artifact_dir, seed, "validation", Path(artifact_dir)/"features",
-                         cache_fold=f"{dataset}-train-validation",
+                         cache_fold=f"{dataset}-{train_hash}-{validation_dataset}-{valid_hash}",
                          checkpoint_selection_metric=metric)
     scores, probabilities = result["scores"], result["probabilities"]
     if (not np.isfinite(scores).all() or not np.isfinite(probabilities).all()
@@ -872,9 +799,10 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
     validation_ids = sorted(valid.id.astype(str))
     manifest = {"experiment_id": experiment_id, "experiment_name": config_snapshot.get("experiment_name"),
         "model": model, "dataset": dataset,
-        "split": "validation", "validation_scope": scope,
-        "validation_dataset_version": "v0" if scope == "full_v0" else profile.get("validation_dataset_version", "v0"),
-        "checkpoint_selection_scope": "full_v0" if scope == "full_v0" else "frozen_v0_540",
+        "split": "validation", "training_dataset": dataset, "validation_dataset": validation_dataset,
+        "training_dataset_rows": len(train), "validation_dataset_rows": len(valid),
+        "training_dataset_sha256": train_hash, "validation_dataset_sha256": valid_hash,
+        "checkpoint_selection_scope": validation_dataset,
         "classes": classes, "train_rows": len(train), "validation_rows": len(valid),
         "train_id_sha256": hashlib.sha256("\n".join(train.id.astype(str)).encode()).hexdigest(),
         "id_sha256": hashlib.sha256("\n".join(validation_ids).encode()).hexdigest(),
@@ -920,7 +848,7 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
              else f"validation_{metric}"),
         "selected_validation_balanced_accuracy": result.get("best_validation_balanced_accuracy",
             result.get("selected_validation_balanced_accuracy", metrics.get("balanced_accuracy"))),
-        "early_stopping_scope": "full_v0" if scope == "full_v0" else "frozen_v0_540",
+        "early_stopping_scope": validation_dataset,
         "early_stopping": result.get("early_stopping"),
         "epoch_checkpoints": result.get("epoch_checkpoints", []),
         "selected_epoch": result.get("best_epoch"),
@@ -934,23 +862,15 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         "feature_recipe": result.get("feature_recipe", cfg.get("feature_recipe")),
         "feature_cache_key": result.get("cache_key"), "checkpoint_path": str(checkpoint),
         "prediction_path": str(prediction_path), "prediction_sha256": hashlib.sha256(prediction_path.read_bytes()).hexdigest(),
-        "full_v0_validation": ({
-            "dataset_version": "v0", "rows": len(valid),
-            "prompt_groups": int(valid.prompt_id.nunique()),
-            "ids_sha256": profile.get("validation_ids_sha256"),
-            "normalized_text_sha256": profile.get("validation_normalized_text_sha256"),
-            "prompt_ids_sha256": profile.get("validation_prompt_ids_sha256"),
-            "prompt_content_sha256": profile.get("validation_prompt_content_sha256"),
-            "scope_split_sha256": profile.get("split_sha256"),
-            "used_for_epoch_metrics_early_stopping_and_checkpoint_choice": True,
-        } if scope == "full_v0" else None),
+        "validation_dataset_provenance": {"name": validation_dataset, "rows": len(valid),
+            "sha256": valid_hash, "ids_sha256": profile.get("validation_ids_sha256"),
+            "prompt_groups": int(valid.prompt_id.nunique())},
         "metrics": metrics, "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat()}
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     experiment_name = config_snapshot.get("experiment_name")
     description = (f"{experiment_name}: " if experiment_name else "") + (
-        f"{model} trained on all {len(train)} {dataset} rows; epoch validation and checkpoint selection used all "
-        f"{len(valid)} official V0 rows (balanced accuracy)." if scope == "full_v0" else
-        f"{model} trained on {len(train)} rows and validated on {len(valid)} prompt-grouped rows (80/20).")
+        f"{model} trained on all {len(train)} {dataset} rows; validation and checkpoint selection used all "
+        f"{len(valid)} {validation_dataset} rows (balanced accuracy).")
     Registry(registry_path).add(manifest["experiment_id"], model, "validation", manifest["config"], metrics,
         dataset_hash=manifest["dataset_sha256"], code_revision=manifest["code_revision"], seed=seed,
         runtime_seconds=manifest["fit_seconds"], artifact_path=str(prediction_path), config_hash=manifest["config_sha256"],
@@ -958,19 +878,11 @@ def train_models(dataset="v0", model="svc", data_dir="data/processed", artifact_
         description=description)
     (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")
     _release_completed_training_model(result)
-    if refresh_prediction and scope != "full_v0":
-        _refresh_ensemble_after_training(manifest, manifest_path,
-            artifact_dir=artifact_dir, data_dir=data_dir)
-    elif scope == "full_v0":
-        # Existing prediction-factory roster artifacts use the historical
-        # frozen-540 scope. A full-V0 result must not silently enter that path.
-        manifest["prediction_factory_update"] = {
-            "status": "skipped", "reason": "full_v0 validation scope is not a 540-row roster candidate"}
-        manifest["checkpoint_catalog_update"] = {
-            "status": "skipped", "reason": "full_v0 validation scope requires catalog scope support"}
+    if refresh_prediction:
+        manifest["prediction_factory_update"] = {"status": "skipped",
+            "reason": "prediction roster requires its configured validation dataset"}
         manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
-        (pred_dir / f"{experiment_id}_metrics.json").write_text(
-            json.dumps(manifest, indent=2, default=str) + "\n")
+        (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2, default=str) + "\n")
     return manifest
 
 
@@ -1034,9 +946,9 @@ def _confirm_training_config(model, cfg, *, accept_defaults=False):
     return overrides
 
 
-def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifacts",
+def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifacts",
                   registry_path="experiments/registry.sqlite", *, from_experiment=None, epochs=4, seed=2026,
-                  config_path=None, config_overrides=None, model="qwen06"):
+                  config_path=None, config_overrides=None, model="qwen06", validation_dataset="v0"):
     """Continue a saved Qwen LoRA model and validate after every additional epoch."""
     from .model_factory import train_qwen_lora_fold
     if model not in {"qwen06", "qwen17", "qwen4", "qwen8"}:
@@ -1045,15 +957,18 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
     if config_overrides:
         cfg.update(config_overrides)
         _validate_training_overrides(model, cfg)
-    rows, data_dir = _load_dataset(dataset, data_dir, validation_scope="full_v0")
-    profile = _effective_profile(data_dir, dataset, rows, validation_scope="full_v0")
+    train, valid = _training_partitions(dataset, validation_dataset, data_dir)
+    rows = pd.concat([train, valid], ignore_index=True)
+    train_hash, valid_hash = _partition_sha256(train), _partition_sha256(valid)
+    training_profile = json.loads(_profile_path(Path(data_dir), dataset).read_text())
+    profile = {"dataset_sha256": train_hash, "split_sha256": _sha([dataset, train_hash, validation_dataset, valid_hash])}
     manifests_dir = Path(artifact_dir)/"predictions"
     candidates = []
     for path in manifests_dir.glob(f"{model}_{dataset}_*_manifest.json"):
         record = json.loads(path.read_text())
-        if (record.get("model") == model and record.get("split_sha256") == profile["split_sha256"]
-                and record.get("validation_scope") == "full_v0"
-                and int(record.get("validation_rows", 0)) == 2699):
+        if (record.get("model") == model and _continuation_source_matches(
+                record, dataset, validation_dataset, train, valid,
+                training_profile.get("dataset_sha256"))):
             candidates.append((path, record))
     if from_experiment:
         candidates = [(p, m) for p, m in candidates if m.get("experiment_id") == from_experiment]
@@ -1073,7 +988,7 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
     cfg["max_length"] = _dataset_max_length(model, cfg, rows)
     if epochs < 1: raise ValueError("additional epochs must be positive")
     cfg["epochs"] = epochs
-    cfg["validation_scope"] = "full_v0"
+    cfg["validation_dataset"] = validation_dataset
     cfg["checkpoint_selection_metric"] = "balanced_accuracy"
     snapshot = {k:v for k,v in cfg.items() if not k.startswith("_")}
     snapshot["continued_from_experiment"] = source["experiment_id"]
@@ -1083,7 +998,6 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
     experiment_id = f"{model}_{dataset}_continue{epochs}_from{source_key}_seed{seed}_cfg{config_hash[:8]}_code{code_revision[:7]}"
     run_dir = Path(artifact_dir)/"runs"/experiment_id
     if run_dir.exists(): raise FileExistsError(f"continuation run already exists: {run_dir}; choose a new seed or clean generated run")
-    train, valid = _full_v0_continuation_rows(rows)
     checkpoint = run_dir/"checkpoints"/f"{model}_continued"
     result = train_qwen_lora_fold(train.text.tolist(),train.model.tolist(),valid.text.tolist(),
         sorted(rows.model.astype(str).unique()),checkpoint=cfg["checkpoint"],revision=cfg["revision"],
@@ -1128,12 +1042,16 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
     prediction_path=pred_dir/f"{experiment_id}_validation.parquet";pred.to_parquet(prediction_path,index=False)
     epoch_prediction_records = _save_epoch_validation_predictions(
         result, valid, classes, pred_dir, experiment_id)
-    manifest={"experiment_id":experiment_id,"model":model,"dataset":dataset,"split":"full_v0",
-        "validation_scope":"full_v0","validation_dataset_version":"v0",
+    manifest={"experiment_id":experiment_id,"model":model,"dataset":dataset,"training_dataset":dataset,
+        "validation_dataset":validation_dataset,"split":"validation",
         "continued_from_experiment":source["experiment_id"],"continued_from_checkpoint":str(source_checkpoint),
         "additional_epochs":epochs,"total_epochs":int(source.get("config",{}).get("epochs",0))+epochs,
-        "train_rows":len(train),"validation_rows":len(valid),"classes":classes,"config":snapshot,
-        "config_sha256":config_hash,"dataset_sha256":profile["dataset_sha256"],"split_sha256":profile["split_sha256"],
+        "train_rows":len(train),"validation_rows":len(valid),"training_dataset_rows":len(train),
+        "validation_dataset_rows":len(valid),"training_dataset_sha256":train_hash,
+        "validation_dataset_sha256":valid_hash,"train_id_sha256":hashlib.sha256("\n".join(train.id.astype(str)).encode()).hexdigest(),
+        "id_sha256":hashlib.sha256("\n".join(valid.id.astype(str)).encode()).hexdigest(),
+        "classes":classes,"config":snapshot,"config_sha256":config_hash,
+        "dataset_sha256":profile["dataset_sha256"],"split_sha256":profile["split_sha256"],
         "code_revision":code_revision,"model_revision":cfg["revision"],"checkpoint_id":cfg["checkpoint"],"seed":seed,
         "quantization":result.get("quantization",cfg.get("quantization","none")),
         "quantization_config":result.get("quantization_config"),
@@ -1163,14 +1081,12 @@ def continue_qwen(dataset="v0", data_dir="data/processed", artifact_dir="artifac
         code_revision=code_revision,seed=seed,runtime_seconds=result["fit_seconds"],artifact_path=str(prediction_path),
         config_hash=config_hash,description=f"Continued Qwen LoRA from {source['experiment_id']} for {epochs} epochs; validation metrics recorded each epoch.")
     _release_completed_training_model(result)
-    _refresh_ensemble_after_training(manifest, manifest_path,
-        artifact_dir=artifact_dir, data_dir=data_dir)
     return manifest
 
 
-def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processed",
+def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processed",
                      artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *,
-                     from_experiment, epochs=10, learning_rate=5e-5,
+                     from_experiment, epochs=10, learning_rate=5e-5, validation_dataset="v0",
                      learning_rate_decay=0.9, seed=2026, optimizer="adamw_torch",
                      weight_decay=0.0):
     """Validate a saved encoder checkpoint, continue training, and keep the best epoch.
@@ -1189,7 +1105,6 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
     source = json.loads(source_path.read_text())
     if source.get("model") != model:
         raise ValueError(f"source experiment is {source.get('model')}, expected {model}")
-    _require_full_v0_checkpoint(source)
     # Training manifests commonly point at the checkpoint container, while
     # `train_encoder_fold(select_best_checkpoint=True)` saves the selected
     # epoch in its nested best_checkpoint directory. Prefer an explicit best
@@ -1204,10 +1119,15 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
     if nested_best.is_dir():
         source_checkpoint = nested_best
 
-    rows, data_dir = _load_dataset(dataset, data_dir, validation_scope="full_v0")
-    profile = _effective_profile(data_dir, dataset, rows, validation_scope="full_v0")
-    train, valid = _full_v0_continuation_rows(rows)
-    classes = sorted(rows.model.astype(str).unique().tolist())
+    train, valid = _training_partitions(dataset, validation_dataset, data_dir)
+    rows = pd.concat([train, valid], ignore_index=True)
+    train_hash, valid_hash = _partition_sha256(train), _partition_sha256(valid)
+    training_profile = json.loads(_profile_path(Path(data_dir), dataset).read_text())
+    if not _continuation_source_matches(source, dataset, validation_dataset,
+                                        train, valid, training_profile.get("dataset_sha256")):
+        raise ValueError("source checkpoint dataset content hashes differ from requested continuation data")
+    profile = {"dataset_sha256": train_hash, "split_sha256": _sha([dataset, train_hash, validation_dataset, valid_hash])}
+    classes = sorted(train.model.astype(str).unique().tolist())
     if source.get("classes") != classes:
         raise ValueError("source checkpoint class labels differ from the target dataset")
 
@@ -1228,12 +1148,12 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         "max_length": _dataset_max_length(model, {
             **cfg, "checkpoint": str(source_checkpoint), "revision": None,
             "task_prefix": "", "training_mode": "full", "trust_remote_code": True,
-        }, rows, checkpoint=str(source_checkpoint), revision=None),
+        }, pd.concat([train, valid], ignore_index=True), checkpoint=str(source_checkpoint), revision=None),
         "warmup_ratio": float(source.get("config", {}).get("warmup_ratio", 0.0)),
         "lr_scheduler_type": source.get("config", {}).get("lr_scheduler_type", "linear"),
         "baseline_validation_before_training": True,
         "checkpoint_selection_metric": "balanced_accuracy",
-        "validation_scope": "full_v0",
+        "validation_dataset": validation_dataset,
         "checkpoint_selection": "highest_validation_balanced_accuracy",
     }
     config_hash = _sha(config_snapshot)
@@ -1243,11 +1163,7 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
     prediction_path = manifests_dir / f"{experiment_id}_validation.parquet"
     manifest_path = manifests_dir / f"{experiment_id}_manifest.json"
     if manifest_path.exists() and prediction_path.exists():
-        existing = json.loads(manifest_path.read_text())
-        if "prediction_factory_update" not in existing:
-            _refresh_ensemble_after_training(existing, manifest_path,
-                artifact_dir=artifact_dir, data_dir=data_dir)
-        return existing
+        return json.loads(manifest_path.read_text())
     if run_dir.exists():
         raise FileExistsError(f"incomplete continuation run exists at {run_dir}")
 
@@ -1288,7 +1204,7 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
     checkpoint = run_dir / "checkpoints" / f"{model}_continued"
     manifest = {
         "experiment_id": experiment_id, "model": model, "dataset": dataset,
-        "training_dataset": dataset, "split": "full_v0", "validation_scope": "full_v0",
+        "training_dataset": dataset, "validation_dataset": validation_dataset, "split": "validation",
         "continued_from_experiment": from_experiment,
         "continued_from_checkpoint": str(source_checkpoint),
         "baseline_validation_metrics": result["baseline_validation_metrics"],
@@ -1301,8 +1217,12 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         "selected_validation_accuracy": result["best_validation_accuracy"],
         "checkpoint_selection_metric": result["checkpoint_selection_metric"],
         "checkpoint_scoring_method": result.get("checkpoint_scoring_method"),
-        "train_rows": len(train), "validation_rows": len(valid), "classes": classes,
-        "dataset_sha256": profile["dataset_sha256"], "split_sha256": profile["split_sha256"],
+        "train_rows": len(train), "validation_rows": len(valid),
+        "training_dataset_rows": len(train), "validation_dataset_rows": len(valid),
+        "training_dataset_sha256": train_hash, "validation_dataset_sha256": valid_hash,
+        "train_id_sha256": hashlib.sha256("\n".join(train.id.astype(str)).encode()).hexdigest(),
+        "id_sha256": hashlib.sha256("\n".join(valid.id.astype(str)).encode()).hexdigest(),
+        "classes": classes, "dataset_sha256": profile["dataset_sha256"], "split_sha256": profile["split_sha256"],
         "code_revision": _revision(), "model_revision": source.get("model_revision"),
         "checkpoint_id": source.get("checkpoint_id"), "config": config_snapshot,
         "config_sha256": config_hash, "seed": seed,
@@ -1329,8 +1249,6 @@ def continue_encoder(dataset="v0", model="ultrabert380", data_dir="data/processe
         config_hash=config_hash,
         description=f"Continued {model} from {from_experiment} for {epochs} epochs after baseline validation.")
     _release_completed_training_model(result)
-    _refresh_ensemble_after_training(manifest, manifest_path,
-        artifact_dir=artifact_dir, data_dir=data_dir)
     return manifest
 
 
@@ -1563,16 +1481,16 @@ def main(argv=None):
     v13=d.add_parser("build-v1-3", help="assemble V1.3 from the downloaded GLM/GPT corpora and run clean plus compact")
     v13.add_argument("--config",default="configs/data/v1_3_external.yaml")
     mix=d.add_parser("assemble");mix.add_argument("--config",default="configs/data/mixed_v1_5.yaml")
-    f=sub.add_parser("features").add_subparsers(dest="action",required=True);b=f.add_parser("build");b.add_argument("--dataset",default="v0");b.add_argument("--data-dir",default="data/processed");b.add_argument("--config",default="configs/features/default.yaml")
+    f=sub.add_parser("features").add_subparsers(dest="action",required=True);b=f.add_parser("build");b.add_argument("--dataset",default="v1");b.add_argument("--validation-dataset",default="v0");b.add_argument("--data-dir",default="data/processed");b.add_argument("--config",default="configs/features/default.yaml")
     m=sub.add_parser("models").add_subparsers(dest="action",required=True)
-    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v0");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--validation-scope",choices=["frozen_v0_540","full_v0"],help="for external-only datasets, train on every dataset row and validate/select checkpoints on all 2,699 V0 rows");t.add_argument("--skip-prediction-refresh",action="store_true",help="save the model run without changing the active prediction roster or ensemble history");t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
+    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v1");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--validation-dataset",default="v0",help="dataset artifact used in full for validation (default: v0)");t.add_argument("--skip-prediction-refresh",action="store_true",help="save the model run without changing the active prediction roster or ensemble history");t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
     cq=m.add_parser("continue-qwen",help="continue the latest Qwen LoRA checkpoint and validate after every epoch")
-    cq.add_argument("--dataset",default="v0");cq.add_argument("--epochs",type=int,default=4);cq.add_argument("--seed",type=int,default=2026)
+    cq.add_argument("--dataset",default="v1");cq.add_argument("--validation-dataset",default="v0");cq.add_argument("--epochs",type=int,default=4);cq.add_argument("--seed",type=int,default=2026)
     cq.add_argument("--model",choices=["qwen06","qwen17","qwen4","qwen8"],default="qwen06")
     cq.add_argument("--from-experiment");cq.add_argument("--config");cq.add_argument("--accept-config-defaults",action="store_true")
     ce=m.add_parser("continue-encoder",help="baseline-validate and continue a saved UltraBERT checkpoint")
     ce.add_argument("--model",choices=["ultrabert380"],default="ultrabert380")
-    ce.add_argument("--dataset",default="v0");ce.add_argument("--from-experiment",required=True)
+    ce.add_argument("--dataset",default="v1");ce.add_argument("--validation-dataset",default="v0");ce.add_argument("--from-experiment",required=True)
     ce.add_argument("--epochs",type=int,default=10);ce.add_argument("--learning-rate",type=float,default=5e-5)
     ce.add_argument("--learning-rate-decay",type=float,default=0.9);ce.add_argument("--seed",type=int,default=2026)
     ce.add_argument("--data-dir",default="data/processed");ce.add_argument("--artifact-dir",default="artifacts")
@@ -1583,6 +1501,7 @@ def main(argv=None):
     ts.add_argument("--registry",default="experiments/registry.sqlite")
     ts.add_argument("--ensemble-registry",default="docs/ensembles.md")
     ts.add_argument("--config",default=MODEL_CONFIGS["catboost_stylometry"])
+    ts.add_argument("--validation-dataset",default="v0")
     ts.add_argument("--seed",type=int,default=2026)
     ts.add_argument("--stage1-iterations",type=int,default=800)
     ts.add_argument("--stage2-iterations",type=int,default=200)
@@ -1691,7 +1610,7 @@ def main(argv=None):
     elif a.command=="data" and a.action=="curate-clean-compact": result=curate_v1_all_clean_compact_data(a.config)
     elif a.command=="data" and a.action=="build-v1-3": result=build_v1_3_external_data(a.config)
     elif a.command=="data" and a.action=="assemble": result=assemble_training_dataset(a.config)
-    elif a.command=="features": result=build_features(a.dataset,a.data_dir,a.config)
+    elif a.command=="features": result=build_features(a.dataset,a.data_dir,a.config,validation_dataset=a.validation_dataset)
     elif a.command=="models" and a.action=="train":
         cfg = _model_cfg(a.model, a.config)
         if a.model == "svc" and a.features_config:
@@ -1699,12 +1618,12 @@ def main(argv=None):
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
         result=train_models(a.dataset,a.model,a.data_dir,a.artifact_dir,config_path=a.config,
             feature_config_path=a.features_config,seed=a.seed,config_overrides=overrides,
-            refresh_prediction=not a.skip_prediction_refresh, validation_scope=a.validation_scope)
+            refresh_prediction=not a.skip_prediction_refresh, validation_dataset=a.validation_dataset)
     elif a.command=="models" and a.action=="catboost-two-stage":
         from .catboost_two_stage import run_catboost_two_stage
         cfg = _model_cfg("catboost_stylometry", a.config)
         result=run_catboost_two_stage(load_dataset=_load_dataset,effective_profile=_effective_profile,
-            data_dir=a.data_dir,artifact_dir=a.artifact_dir,registry_path=a.registry,
+            validation_dataset=a.validation_dataset,data_dir=a.data_dir,artifact_dir=a.artifact_dir,registry_path=a.registry,
             ensemble_registry_path=a.ensemble_registry,
             config=cfg,seed=a.seed,stage1_iterations=a.stage1_iterations,
             stage2_iterations=a.stage2_iterations,run_id=a.run_id)
@@ -1761,7 +1680,7 @@ def main(argv=None):
     elif a.command=="models" and a.action=="continue-qwen":
         cfg = _model_cfg(a.model, a.config); cfg["epochs"] = a.epochs
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
-        result=continue_qwen(a.dataset,from_experiment=a.from_experiment,
+        result=continue_qwen(a.dataset,validation_dataset=a.validation_dataset,from_experiment=a.from_experiment,
             epochs=int(overrides.get("epochs", a.epochs)),seed=a.seed,config_path=a.config,
             config_overrides=overrides,model=a.model)
     elif a.command=="models" and a.action=="continue-encoder":
@@ -1769,7 +1688,7 @@ def main(argv=None):
                                                 "learning_rate_decay":a.learning_rate_decay})
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
         result=continue_encoder(a.dataset,a.model,a.data_dir,a.artifact_dir,a.registry,
-            from_experiment=a.from_experiment,epochs=int(overrides.get("epochs",a.epochs)),
+            validation_dataset=a.validation_dataset,from_experiment=a.from_experiment,epochs=int(overrides.get("epochs",a.epochs)),
             learning_rate=float(overrides.get("learning_rate",a.learning_rate)),
             learning_rate_decay=float(overrides.get("learning_rate_decay",a.learning_rate_decay)),seed=a.seed,
             optimizer=overrides.get("optimizer",cfg.get("optimizer","adamw_torch")),

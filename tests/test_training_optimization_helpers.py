@@ -22,6 +22,14 @@ def _cuda_available():
         return False
 
 
+def _torch_available():
+    try:
+        import torch  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 class TrainingOptimizationHelperTests(unittest.TestCase):
     def test_calibration_subset_is_deterministic_stratified_and_train_only(self):
         labels = ["a"] * 80 + ["b"] * 15 + ["c"] * 5
@@ -79,6 +87,7 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
             self.assertIsNone(model_factory._read_embedding_cache(cache, metadata, "key", ["r2", "r1", "r3"]))
             self.assertIsNone(model_factory._read_embedding_cache(cache, metadata, "other", ["r1", "r2", "r3"]))
 
+    @unittest.skipUnless(_torch_available(), "PyTorch checkpoint restore check")
     def test_selected_qwen_checkpoint_restores_adapter_and_classifier_together(self):
         import torch
         backbone = SimpleNamespace(adapter_value=0)
@@ -93,23 +102,78 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         for name, value in classifier.state_dict().items():
             self.assertTrue(torch.equal(value, expected[name]))
 
-    def test_continuation_uses_all_external_rows_and_full_v0_validation(self):
-        rows = pd.DataFrame({"id": ["ext-2", "ext-1"] + [f"v0-{i}" for i in range(2699)],
-            "split": ["train", "train"] + ["validation"] * 2699,
-            "prompt_id": ["p2", "p1"] + [f"vp-{i}" for i in range(2699)],
-            "text": ["second", "first"] + ["v0 response"] * 2699,
-            "model": ["a", "a"] + ["a"] * 2699})
-        train, valid = pipeline._full_v0_continuation_rows(rows)
-        self.assertEqual(train.id.tolist(), ["ext-1", "ext-2"])
-        self.assertEqual(len(train), 2)
-        self.assertEqual(len(valid), 2699)
-        with self.assertRaisesRegex(ValueError, "2,699"):
-            pipeline._full_v0_continuation_rows(rows.iloc[:-1])
+    def test_training_partitions_use_all_rows_and_validate_isolation(self):
+        rows_train = pd.DataFrame({"id": ["t1", "t2", "t3", "t4"],
+            "prompt_id": ["pt1", "pt2", "pt3", "pt4"],
+            "text": ["train one", "train two", "train three", "train four"],
+            "model": ["a", "b", "a", "b"], "split": ["train", "validation", "train", "validation"]})
+        rows_valid = pd.DataFrame({"id": ["v1", "v2", "v3", "v4"],
+            "prompt_id": ["pv1", "pv2", "pv3", "pv4"],
+            "text": ["valid one", "valid two", "valid three", "valid four"],
+            "model": ["a", "b", "a", "b"]})
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rows_train.to_parquet(root / "dataset_train.parquet", index=False)
+            rows_valid.to_parquet(root / "dataset_valid.parquet", index=False)
+            train, valid = pipeline._training_partitions("train", "valid", root)
+            self.assertEqual(train.id.tolist(), ["t1", "t2", "t3", "t4"])
+            self.assertEqual(valid.id.tolist(), ["v1", "v2", "v3", "v4"])
+            rows_valid.loc[0, "prompt_id"] = "pt1"
+            rows_valid.to_parquet(root / "dataset_valid.parquet", index=False)
+            with self.assertRaisesRegex(ValueError, "prompt group"):
+                pipeline._training_partitions("train", "valid", root)
 
-    def test_continuation_checkpoint_must_be_full_v0(self):
-        with self.assertRaisesRegex(ValueError, "all 2,699"):
-            pipeline._require_full_v0_checkpoint({"validation_rows": 540, "validation_scope": "frozen_v0_540"})
-        pipeline._require_full_v0_checkpoint({"validation_rows": 2699, "validation_scope": "full_v0"})
+    def test_continuation_source_match_accepts_legacy_full_dataset_manifest(self):
+        train = pd.DataFrame({"id": ["t1"], "prompt_id": ["pt1"],
+                              "text": ["train response"], "model": ["a"]})
+        valid = pd.DataFrame({"id": ["v1"], "prompt_id": ["pv1"],
+                              "text": ["validation response"], "model": ["a"]})
+        ids_hash = __import__("hashlib").sha256(b"v1").hexdigest()
+        text_hash = __import__("hashlib").sha256(
+            b"v1\tvalidation response").hexdigest()
+        legacy = {"dataset": "train", "dataset_sha256": "legacy-source-hash",
+                  "validation_dataset_version": "valid", "validation_rows": 1,
+                  "full_v0_validation": {"ids_sha256": ids_hash,
+                      "normalized_text_sha256": text_hash}}
+        self.assertTrue(pipeline._continuation_source_matches(
+            legacy, "train", "valid", train, valid, "legacy-source-hash"))
+        self.assertFalse(pipeline._continuation_source_matches(
+            legacy, "train", "valid", train, valid.assign(text="changed"), "legacy-source-hash"))
+
+    def test_standard_training_passes_full_rows_and_balanced_selection(self):
+        train_rows = pd.DataFrame({"id": ["t1", "t2", "t3", "t4"],
+            "prompt_id": ["pt1", "pt2", "pt3", "pt4"],
+            "text": ["train one", "train two", "train three", "train four"],
+            "model": ["a", "b", "a", "b"]})
+        valid_rows = pd.DataFrame({"id": ["v1", "v2", "v3", "v4"],
+            "prompt_id": ["pv1", "pv2", "pv3", "pv4"],
+            "text": ["valid one", "valid two", "valid three", "valid four"],
+            "model": ["a", "b", "a", "b"]})
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); data = root / "data"; artifacts = root / "artifacts"
+            data.mkdir()
+            train_rows.to_parquet(data / "dataset_train.parquet", index=False)
+            valid_rows.to_parquet(data / "dataset_valid.parquet", index=False)
+            for name in ("train", "valid"):
+                (data / f"dataset_profile_{name}.json").write_text(json.dumps({"dataset_sha256": name}))
+            checkpoint = artifacts / "runs" / "fake" / "checkpoints" / "model"
+            checkpoint.mkdir(parents=True)
+            calls = {}
+            def fake_train(model, train, valid, classes, cfg, out, seed, fold, cache_dir, **kwargs):
+                calls.update(train_rows=len(train), validation_rows=len(valid), metric=kwargs["checkpoint_selection_metric"])
+                return {"scores": np.array([[2., 0.], [0., 2.], [2., 0.], [0., 2.]]),
+                    "probabilities": np.array([[.9, .1], [.1, .9], [.9, .1], [.1, .9]]),
+                    "checkpoint": str(checkpoint), "fit_seconds": 1.0}
+            with patch.object(pipeline, "_model_cfg", return_value={"features": {"views": ["char"]}}), \
+                    patch.object(pipeline, "_train_fold", side_effect=fake_train):
+                manifest = pipeline.train_models("train", "svc", data, artifacts,
+                    root / "registry.sqlite", validation_dataset="valid", refresh_prediction=False)
+            self.assertEqual(calls, {"train_rows": 4, "validation_rows": 4,
+                                     "metric": "balanced_accuracy"})
+            self.assertEqual(manifest["training_dataset_rows"], 4)
+            self.assertEqual(manifest["validation_dataset_rows"], 4)
+            self.assertEqual(manifest["training_dataset"], "train")
+            self.assertEqual(manifest["validation_dataset"], "valid")
 
     @unittest.skipUnless(_cuda_available(), "CUDA batch probe integrity check")
     def test_batch_probe_restores_model_parameters(self):

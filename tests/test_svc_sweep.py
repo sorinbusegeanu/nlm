@@ -35,8 +35,8 @@ class SVCSweepTests(unittest.TestCase):
             prediction_dir = artifact_dir / "predictions"
             prediction_dir.mkdir(parents=True)
             registry_path = root / "ensembles.md"
-            labels = np.repeat([f"class-{i:02d}" for i in range(18)], 30)
-            groups = np.repeat([f"prompt-{i:02d}" for i in range(30)], 18)
+            labels = np.repeat([f"class-{i:02d}" for i in range(18)], 20)
+            groups = np.repeat([f"prompt-{i:02d}" for i in range(20)], 18)
             n, k = len(labels), len(set(labels))
             y = np.asarray([int(value[-2:]) for value in labels])
             probabilities = np.full((n, k), 0.01 / (k - 1), dtype=float)
@@ -67,7 +67,7 @@ class SVCSweepTests(unittest.TestCase):
             report = evaluate_svc_sweep(artifact_dir, registry_path=registry_path,
                                         output_dir=root / "sweep", variant_ids=variant_ids,
                                         baseline_id=variant_ids[0])
-            self.assertEqual(report["validation_rows"], 540)
+            self.assertEqual(report["validation_rows"], 360)
             self.assertEqual(report["champion_metrics"]["accuracy"], 1.0)
             self.assertEqual(report["champion_members"], member_ids)
             self.assertEqual(len(report["candidates"]), 4)
@@ -87,9 +87,9 @@ class SVCSweepTests(unittest.TestCase):
                     "features": {"views": ["char", "word"]}, "calibration": "sigmoid",
                     "calibration_cv": 3}}))
             with patch("src.svc_sweep.train_models", side_effect=[
-                     {"experiment_id": "svc-c1", "config": {"C": 0.1}, "dataset": "v1.1", "seed": 2026, "split": "validation"},
-                     {"experiment_id": "svc-c2", "config": {"C": 2.0}, "dataset": "v1.1", "seed": 2026, "split": "validation"},
-                     {"experiment_id": "svc-c3", "config": {"C": 5.0}, "dataset": "v1.1", "seed": 2026, "split": "validation"},
+                     {"experiment_id": "svc-c1", "config": {"C": 0.1}, "dataset": "v1.1", "validation_dataset": "v0", "seed": 2026, "split": "validation"},
+                     {"experiment_id": "svc-c2", "config": {"C": 2.0}, "dataset": "v1.1", "validation_dataset": "v0", "seed": 2026, "split": "validation"},
+                     {"experiment_id": "svc-c3", "config": {"C": 5.0}, "dataset": "v1.1", "validation_dataset": "v0", "seed": 2026, "split": "validation"},
                  ]) as train, \
                  patch("src.svc_sweep.evaluate_svc_sweep", return_value={"experiment": "test"}):
                 run_svc_sweep(artifact_dir=directory, registry_path=str(Path(directory) / "registry.sqlite"),
@@ -97,6 +97,8 @@ class SVCSweepTests(unittest.TestCase):
                               output_dir=output_dir)
             self.assertEqual(train.call_count, 3)
             self.assertTrue(all(call.kwargs["refresh_prediction"] is False
+                                for call in train.call_args_list))
+            self.assertTrue(all(call.kwargs["validation_dataset"] == "v0"
                                 for call in train.call_args_list))
 
 

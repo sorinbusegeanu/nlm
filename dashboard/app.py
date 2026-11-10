@@ -16,6 +16,9 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.registry import Registry
 from dashboard.training_lineage import training_lineage, trainer_completion
+from src.dataset_catalog import load_dataset_catalog
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 st.set_page_config(page_title="Name That LLM experiments", layout="wide")
 st.title("Name That LLM — experiment results")
@@ -35,16 +38,9 @@ records = sorted(records, key=lambda row: int(row.get("sequence_number") or 0), 
 if not records:
     st.info("No completed experiments are recorded yet. Active training appears below while it runs.")
 
-profile_path = Path("data/processed/dataset_profile.json")
+profile_path = PROJECT_ROOT / "data/processed/dataset_profile.json"
 profile_data = json.loads(profile_path.read_text()) if profile_path.exists() else {}
 profile_validation_rows = profile_data.get("validation_rows")
-DATASET_PROFILES = {
-    "V0 — Kaggle baseline": ("data/processed/dataset_profile.json", "data/processed/dataset_v0.parquet"),
-    "V1 — Balanced Open Pool": ("data/processed/dataset_profile_v1.json", "data/processed/dataset_v1.parquet"),
-    "V1-all": ("data/processed/dataset_profile_v1_all.json", "data/processed/dataset_v1_all.parquet"),
-    "V1.2-BM": ("data/processed/dataset_profile_v1.2_bm.json", "data/processed/dataset_v1.2_bm.parquet"),
-    "V1.3": ("data/processed/dataset_profile_v1.3.json", "data/processed/dataset_v1.3.parquet"),
-}
 
 def metrics(row): return json.loads(row["metrics_json"])
 
@@ -559,17 +555,50 @@ with tabs[6]:
                 st.plotly_chart(px.line(history_frame, x="Epoch", y="Accuracy", markers=True), use_container_width=True)
 
 with tabs[7]:
-    available_datasets = [name for name, (profile, _) in DATASET_PROFILES.items() if Path(profile).exists()]
-    if not available_datasets:
-        st.info("Run dataset preparation to create dataset profiles.")
+    try:
+        dataset_catalog = load_dataset_catalog(PROJECT_ROOT / "configs/datasets.yaml")
+    except (OSError, ValueError) as exc:
+        st.error(f"Could not load the dataset catalog: {exc}")
     else:
-        selected_dataset = st.selectbox("Dataset", available_datasets, key="data_tab_dataset")
-        profile_file, dataset_file = DATASET_PROFILES[selected_dataset]
-        data = json.loads(Path(profile_file).read_text())
-        st.caption(f"Dataset {data.get('dataset_version')} · {dataset_file} · SHA-256 {data.get('dataset_sha256')}")
-        if not Path(dataset_file).exists(): st.warning(f"Dataset artifact not found: {dataset_file}")
-        st.json(data)
-        counts = data.get("class_counts", {})
-        if counts: st.plotly_chart(px.bar(pd.DataFrame({"Class": list(counts), "Rows": list(counts.values())}), x="Class", y="Rows"), use_container_width=True)
-        lengths = data.get("text_length_chars", {})
-        if lengths: st.dataframe(pd.DataFrame([lengths], index=["Character length"]), use_container_width=True)
+        dataset_entries = dataset_catalog["datasets"]
+        if not dataset_entries:
+            st.info("Add dataset entries to configs/datasets.yaml.")
+        else:
+            entries_by_id = {entry["id"]: entry for entry in dataset_entries}
+            selected_id = st.selectbox(
+                "Dataset",
+                list(entries_by_id),
+                format_func=lambda dataset_id: entries_by_id[dataset_id]["name"],
+                key="data_tab_dataset_id",
+            )
+            entry = entries_by_id[selected_id]
+            artifact_path = PROJECT_ROOT / entry["artifact"]
+            selected_profile_path = PROJECT_ROOT / entry["profile"]
+            st.caption(f"Dataset {selected_id} · {entry['artifact']}")
+            st.markdown(entry["description"])
+            st.caption(f"Validation: {entry['validation']}")
+            if not artifact_path.is_file():
+                st.warning(f"Dataset artifact not found: {entry['artifact']}")
+            if not selected_profile_path.is_file():
+                st.warning(f"Dataset profile not found: {entry['profile']}")
+                data = {}
+            else:
+                try:
+                    data = json.loads(selected_profile_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    st.warning(f"Could not read dataset profile {entry['profile']}: {exc}")
+                    data = {}
+            if data:
+                st.caption(f"{data.get('rows', '—')} rows · SHA-256 {data.get('dataset_sha256', '—')}")
+                st.json(data)
+                counts = data.get("class_counts", {})
+                if counts:
+                    st.plotly_chart(px.bar(pd.DataFrame({"Class": list(counts), "Rows": list(counts.values())}),
+                                           x="Class", y="Rows"), use_container_width=True)
+                lengths = data.get("text_length_chars", {})
+                if lengths:
+                    st.dataframe(pd.DataFrame([lengths], index=["Character length"]), use_container_width=True)
+            reports = entry.get("reports", [])
+            if reports:
+                report_links = [f"[{Path(report).name}](../{report})" for report in reports]
+                st.markdown("Reports: " + " · ".join(report_links))

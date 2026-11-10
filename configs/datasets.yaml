@@ -1,0 +1,194 @@
+schema_version: 1
+title: NLM dataset catalog
+description: >-
+  Canonical descriptions and artifact locations for processed datasets in the
+  NLM workspace. Add new maintained datasets here; the dashboard and generated
+  docs/datasets.md read from this catalog.
+notes:
+  - >-
+    The V0 baseline has 2,699 rows; its historical frozen split is 2,159 train
+    and 540 validation rows. External-only training can use full V0 validation
+    where the training workflow is configured to do so.
+  - >-
+    Open Pool-derived datasets in this catalog use the locally downloaded Open
+    Pool V11 source unless a description names a later release. Some older
+    artifact profiles use the `openpool_v11_*` curation naming.
+  - >-
+    `data/processed/test_v0.parquet` is a small test fixture, not a maintained
+    dataset or the Kaggle test set, and is intentionally not cataloged.
+  - >-
+    There is no V1.6 dataset artifact or build recipe registered at this time.
+resources:
+  - label: Data factories
+    path: configs/data/
+    description: Dataset factory configuration files.
+  - label: V1 curation audit
+    path: data/processed/openpool_v1_removals.csv
+    description: Row-level V1 quality exclusions and quota sampling decisions.
+  - label: V1.1 curation audit
+    path: data/processed/openpool_v1.1_removals.csv
+    description: Row-level V1.1 quality exclusions and selection decisions.
+  - label: V2 Open Pool curation audit
+    path: data/processed/openpool_v2_openpool_removals.csv
+    description: Row-level hard-quality exclusions for the V2 Open Pool staging dataset.
+datasets:
+  - id: v0
+    name: V0 — Kaggle baseline
+    section: Baseline and historical split
+    description: Original labeled Name That LLM Kaggle training data with 18 model classes.
+    artifact: data/processed/dataset_v0.parquet
+    profile: data/processed/dataset_profile.json
+    validation: "Historical frozen prompt-group split: 2,159 train and 540 validation rows."
+
+  - id: v1
+    name: V1 — Balanced Open Pool
+    section: Training datasets
+    description: Quality-filtered Open Pool responses, reduced to 2,711 items per class with a fixed-seed source-proportional sample. Quota-excluded rows are not necessarily low quality.
+    artifact: data/processed/dataset_v1.parquet
+    profile: data/processed/dataset_profile_v1.json
+    validation: External training rows; use the V0 validation dataset in training experiments.
+
+  - id: v1.1
+    name: V1.1 — Error-focused Open Pool
+    section: Training datasets
+    description: V1 plus shorter quality-filtered Open Pool responses for `claude-fable-5`, `glm-5.3`, and `glm-5.3-flash`.
+    artifact: data/processed/dataset_v1.1.parquet
+    profile: data/processed/dataset_profile_v1.1.json
+    validation: External training rows; use the V0 validation dataset in training experiments.
+
+  - id: v1.2_bm
+    name: V1.2-BM — B2M responses absent from V1.1
+    section: Training datasets
+    description: B2M response texts not present in V1.1, retaining source, prompt, route, and provider provenance. No additional quality filtering or balancing was applied.
+    artifact: data/processed/dataset_v1.2_bm.parquet
+    profile: data/processed/dataset_profile_v1.2_bm.json
+    validation: External training rows; use the V0 validation dataset in training experiments.
+
+  - id: v1_all
+    name: V1-all — V1.1 plus V1.2-BM
+    section: Training datasets
+    description: Union of V1.1 and V1.2-BM after exact response deduplication; natural class counts are retained without additional balancing.
+    artifact: data/processed/dataset_v1_all.parquet
+    profile: data/processed/dataset_profile_v1_all.json
+    validation: External training rows; use the V0 validation dataset in training experiments.
+
+  - id: v1.5
+    name: V1.5 — V0 plus V1
+    section: Training datasets
+    description: Combines V1 Open Pool rows with the V0 training partition.
+    artifact: data/processed/dataset_v1.5.parquet
+    profile: data/processed/dataset_profile_v1.5.json
+    validation: 50,957 train and the unchanged 540 V0 validation rows, with explicit split assignments.
+
+  - id: v1.3
+    name: V1.3 — External GLM and GPT sources
+    section: Training datasets
+    description: Normalized collection from external GLM-5.3-Flash and GPT-5.6 Sol/Luna corpora, before defect cleaning.
+    artifact: data/processed/dataset_v1.3.parquet
+    profile: data/processed/dataset_profile_v1.3.json
+    validation: External training rows; only three of the 18 model labels are represented.
+    reports:
+      - docs/v1.3.md
+
+  - id: v1.3_clean
+    name: V1.3 Clean
+    section: Training datasets
+    description: V1.3 after explicit defect cleaning.
+    artifact: data/processed/dataset_v1.3_clean.parquet
+    profile: data/processed/dataset_profile_v1.3_clean.json
+    validation: External training rows; only three of the 18 model labels are represented.
+
+  - id: v1.3_compact
+    name: V1.3 Compact
+    section: Training datasets
+    description: V1.3 Clean with verified same-label near-duplicate rows removed.
+    artifact: data/processed/dataset_v1.3_compact.parquet
+    profile: data/processed/dataset_profile_v1.3_compact.json
+    validation: External training rows; only three of the 18 model labels are represented.
+
+  - id: v1-all_clean
+    name: V1-all Clean
+    section: Training datasets
+    description: V1-all screened for demonstrable defects. The audit found no defect rows, so all source rows remain.
+    artifact: data/processed/dataset_v1-all_clean.parquet
+    profile: data/processed/dataset_profile_v1-all_clean.json
+    validation: External training rows; use the V0 validation dataset in training experiments.
+    reports:
+      - docs/v1_all_clean_compact.md
+
+  - id: v1-all_compact
+    name: V1-all Compact
+    section: Training datasets
+    description: V1-all Clean screened for measured redundancy. No qualifying near-duplicate rows were found, so all source rows remain.
+    artifact: data/processed/dataset_v1-all_compact.parquet
+    profile: data/processed/dataset_profile_v1-all_compact.json
+    validation: External training rows; use the V0 validation dataset in training experiments.
+    reports:
+      - docs/v1_all_clean_compact.md
+
+  - id: v1-all_balanced_deduped
+    name: V1-all Balanced and Deduped
+    section: Training datasets
+    description: V1-all curated with verified near-duplicate detection and adaptive source/prompt diversity selection; it does not enforce equal class quotas.
+    artifact: data/processed/dataset_v1-all_balanced_deduped.parquet
+    profile: data/processed/dataset_profile_v1-all_balanced_deduped.json
+    validation: External training rows; use the V0 validation dataset in training experiments.
+    reports:
+      - docs/v1_all_balanced_deduped.md
+
+  - id: v2
+    name: V2 — Full eligible Open Pool plus V0
+    section: Training datasets
+    description: Combines the eligible Open Pool rows with the V0 training partition while preserving the Open Pool class distribution.
+    artifact: data/processed/dataset_v2.parquet
+    profile: data/processed/dataset_profile_v2.json
+    validation: Historical split contains 190,254 train and the unchanged 540 V0 validation rows.
+
+  - id: v2_openpool
+    name: V2 Open Pool — eligible source rows
+    section: Staging datasets
+    description: English Open Pool responses retained by the hard quality filters, before assembling the V2 mix.
+    artifact: data/processed/dataset_v2_openpool.parquet
+    profile: data/processed/dataset_profile_v2_openpool.json
+    validation: Staging training source; no V0 rows are included.
+
+  - id: v2.0
+    name: V2.0 — Balanced external corpus
+    section: Training datasets
+    description: Balanced external-only corpus assembled from Open Pool, B2M, and available V1.3 sources; sampling targets 3,000 examples per class, reduced to 2,867 by the limiting class.
+    artifact: data/processed/dataset_v2.0.parquet
+    profile: data/processed/dataset_profile_v2.0.json
+    validation: External training rows; use the V0 validation dataset in training experiments.
+    reports:
+      - docs/v2.0.md
+
+  - id: v2.1
+    name: V2.1 — Balanced external corpus with unverified Gemini 3.7 source
+    section: Training datasets
+    description: 3,000 examples per class from Open Pool, B2M, V1.3, and unflagged rows in the unverified Gemini 3.7 sidecar; unverified attribution is retained as a caveat.
+    artifact: data/processed/dataset_v2.1.parquet
+    profile: data/processed/dataset_profile_v2.1.json
+    validation: External training rows; use the V0 validation dataset in training experiments.
+    reports:
+      - docs/v2.1.md
+
+  - id: v2.14
+    name: V2.14 — Open Pool V14 plus B2M additions
+    section: Training datasets
+    description: All 223,840 V14 main-file rows plus 7,496 B2M response texts absent from V14 after NFKC, case-fold, and whitespace normalization. No quality filtering or balancing was added; 891 added B2M Gemini 3.7 rows retain their quarantine flag. The V14 unverified sidecar is excluded.
+    artifact: data/processed/dataset_v2.14.parquet
+    profile: data/processed/dataset_profile_v2.14.json
+    validation: External training rows; all 2,699 V0 rows are used for validation by the full-V0 training workflow.
+    reports:
+      - docs/v2.14.md
+      - docs/openpool_v14_comparison.md
+
+  - id: v2.14.balanced
+    name: V2.14 Balanced — quality-filtered V2.14
+    section: Training datasets
+    description: V2.14 filtered by response length, V0 overlap, normalized duplicates/conflicts, language, routing, truncation, multi-turn, serialized output, code, and explicit reasoning traces; balanced at the smallest eligible class count of 3,539.
+    artifact: data/processed/dataset_v2.14.balanced.parquet
+    profile: data/processed/dataset_profile_v2.14.balanced.json
+    validation: External training rows; all 2,699 V0 rows are used for validation by the full-V0 training workflow.
+    reports:
+      - docs/v2.14.balanced.md

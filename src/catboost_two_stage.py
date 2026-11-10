@@ -209,19 +209,14 @@ def _stage_artifact_dir(run_root, experiment, stage):
 def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, valid,
                 classes, recipe, iterations, cfg, seed, checkpoint, parent_checkpoint,
                 parent_sha256, matrices, report_dir, data_profile,
-                registry_path, code_revision):
+                registry_path, code_revision, validation_dataset):
     selected_matrix, feature_names = _select_matrix(matrices["full"], matrices["all_names"], recipe)
     if selected_matrix.shape[1] != len(feature_names):
         raise ValueError("feature matrix width differs from recipe schema")
-    n_stage1 = matrices["stage1_rows"]
-    n_stage2 = matrices["stage2_rows"]
-    if dataset_name == "v1_all":
-        x_train = selected_matrix[:n_stage1]
-    elif dataset_name == "v0":
-        x_train = selected_matrix[n_stage1:n_stage1 + n_stage2]
-    else:
-        raise ValueError(f"unsupported training dataset for two-stage run: {dataset_name}")
-    x_validation = selected_matrix[n_stage1 + n_stage2:]
+    start, end = matrices["offsets"][dataset_name]
+    x_train = selected_matrix[start:end]
+    valid_start, valid_end = matrices["offsets"][validation_dataset]
+    x_validation = selected_matrix[valid_start:valid_end]
     if len(x_train) != len(train) or len(x_validation) != len(valid):
         raise ValueError("stylometry matrix row count differs from selected data partition")
 
@@ -233,10 +228,13 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         learning_rate=cfg["learning_rate"], l2_leaf_reg=cfg["l2_leaf_reg"],
         thread_count=cfg["thread_count"], seed=seed,
         temperature_calibration=cfg.get("temperature_calibration", True),
-        validation_labels=None, feature_recipe=recipe,
+        validation_labels=valid.model.astype(str).tolist(),
+        early_stopping_rounds=cfg.get("early_stopping_rounds", 100),
+        checkpoint_selection_metric="balanced_accuracy", feature_recipe=recipe,
         feature_matrices=(x_train, x_validation, feature_names), init_model=init_path,
         checkpoint_metadata={"experiment": experiment, "experiment_name": experiment_name,
                              "stage": stage, "dataset": dataset_name,
+                             "validation_dataset": validation_dataset,
                              "parent_checkpoint": str(parent_checkpoint) if parent_checkpoint else None,
                              "parent_checkpoint_sha256": parent_sha256})
     if list(result["feature_names"]) != feature_names:
@@ -244,8 +242,8 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
     parent_tree_count = (int(json.loads((parent_checkpoint / "stylometry.json").read_text()).get("tree_count", 0))
                          if parent_checkpoint else 0)
     expected_trees = iterations + parent_tree_count
-    if int(result["tree_count"]) != expected_trees:
-        raise RuntimeError(f"CatBoost produced {result['tree_count']} trees; expected {expected_trees}")
+    if int(result["tree_count"]) < 1 or int(result["tree_count"]) > expected_trees:
+        raise RuntimeError(f"CatBoost produced {result['tree_count']} trees outside 1..{expected_trees}")
 
     # Reload through the real inference helper and verify saved-checkpoint behavior.
     reloaded_probabilities, _ = predict_catboost_stylometry(
@@ -262,7 +260,9 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
     prediction_path = stage_artifact_dir / f"{run_id}_validation.parquet"
     prediction_frame = _write_prediction_frame(prediction_path, valid, classes, scores, probabilities)
     dataset_hash = data_profile["dataset_sha256"]
-    split_hash = data_profile["split_sha256"]
+    split_hash = data_profile.get("split_sha256", "")
+    validation_hash = hashlib.sha256(valid[["id", "prompt_id", "text", "model"]]
+        .astype(str).to_csv(index=False, lineterminator="\n").encode()).hexdigest()
     config = {"model": "catboost_stylometry", "experiment": experiment,
               "experiment_name": experiment_name, "stage": stage,
               "training_dataset": dataset_name, "iterations_added": int(iterations),
@@ -275,7 +275,9 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
               "parent_checkpoint_sha256": parent_sha256,
               "calibration_method": result["calibration_method"],
               "calibration_temperature": result["calibration_temperature"],
-              "validation_fitting": False}
+              "validation_fitting": False,
+              "validation_dataset": validation_dataset,
+              "early_stopping_metric": "balanced_accuracy"}
     config_hash = _sha(config)
     experiment_id = _stage_id(report_dir.name, experiment, stage)
     manifest_path = stage_artifact_dir / f"{experiment_id}_manifest.json"
@@ -283,8 +285,13 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
     manifest = {
         "experiment_id": experiment_id, "experiment_name": experiment_name,
         "model": "catboost_stylometry", "dataset": dataset_name,
+        "training_dataset": dataset_name, "validation_dataset": validation_dataset,
         "stage": stage, "source_dataset": dataset_name, "split": "validation",
         "classes": list(classes), "train_rows": len(train), "validation_rows": len(valid),
+        "training_dataset_rows": len(train), "validation_dataset_rows": len(valid),
+        "training_dataset_sha256": hashlib.sha256(train[["id", "prompt_id", "text", "model"]]
+            .astype(str).to_csv(index=False, lineterminator="\n").encode()).hexdigest(),
+        "validation_dataset_sha256": validation_hash,
         "train_id_sha256": hashlib.sha256("\n".join(train.id.astype(str)).encode()).hexdigest(),
         "id_sha256": hashlib.sha256("\n".join(valid.id.astype(str)).encode()).hexdigest(),
         "dataset_sha256": dataset_hash, "split_sha256": split_hash,
@@ -299,7 +306,7 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         "feature_recipe": recipe, "calibration_method": result["calibration_method"],
         "calibration_temperature": float(result["calibration_temperature"]),
         "validation_metrics_by_epoch": [], "early_stopping": None,
-        "validation_labels_used_for_fitting": False,
+        "validation_labels_used_for_checkpoint_selection": True,
         "prediction_path": str(prediction_path),
         "prediction_sha256": _sha_file(prediction_path), "metrics": metric_values,
         "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
@@ -335,9 +342,9 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
 def _render_report(path, summary):
     lines = ["# CatBoost two-stage feature experiments", "",
              f"Run: `{summary['run_id']}`", "",
-             "Validation is the frozen 540-row V0 set. Its labels were not supplied to CatBoost fitting, "
-             "early stopping, or calibration. The scores remain development results because this fixed set "
-             "has been used for prior model selection.", "",
+             f"Validation uses all {summary['validation_rows']} rows from `{summary['validation_dataset']}`. "
+             "Balanced accuracy selects the best boosting iteration; calibration uses training rows only. "
+             "The scores remain development results because this set has been used for prior model selection.", "",
              f"Exact response-text overlap between Stage 1 V1-all training and Stage 2 V0 training: "
              f"**{summary['training_overlap']['exact_rows']}**; normalized overlap: "
              f"**{summary['training_overlap']['normalized_rows']}**.", "",
@@ -405,7 +412,7 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
                            artifact_dir="artifacts", registry_path="experiments/registry.sqlite",
                            ensemble_registry_path="docs/ensembles.md",
                            config=None, seed=2026, stage1_iterations=800,
-                           stage2_iterations=200, run_id=None):
+                           stage2_iterations=200, run_id=None, validation_dataset="v0"):
     """Train A/B/C in order without changing the active prediction roster."""
     if stage1_iterations < 1 or stage2_iterations < 1:
         raise ValueError("stage iteration budgets must be positive")
@@ -423,20 +430,22 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
     if report_dir.exists() or run_root.exists():
         raise FileExistsError(f"two-stage run already exists: {run_id}")
 
-    v1_rows, _ = load_dataset("v1_all", data_dir)
-    v0_rows, _ = load_dataset("v0", data_dir)
+    v1_rows = load_dataset("v1_all", data_dir)[0].drop(columns=["split"], errors="ignore")
+    v0_rows = load_dataset("v0", data_dir)[0].drop(columns=["split"], errors="ignore")
+    validation_rows = load_dataset(validation_dataset, data_dir)[0].drop(columns=["split"], errors="ignore")
+    v1_rows = v1_rows.sort_values("id", kind="stable").reset_index(drop=True)
+    v0_rows = v0_rows.sort_values("id", kind="stable").reset_index(drop=True)
+    validation_rows = validation_rows.sort_values("id", kind="stable").reset_index(drop=True)
     profile_v1 = effective_profile(data_dir, "v1_all", v1_rows)
     profile_v0 = effective_profile(data_dir, "v0", v0_rows)
-    stage1_train = v1_rows.loc[v1_rows.split.eq("train")].sort_values("id", kind="stable").reset_index(drop=True)
-    stage2_train = v0_rows.loc[v0_rows.split.eq("train")].sort_values("id", kind="stable").reset_index(drop=True)
-    stage1_valid = v1_rows.loc[v1_rows.split.eq("validation")].sort_values("id", kind="stable").reset_index(drop=True)
-    stage2_valid = v0_rows.loc[v0_rows.split.eq("validation")].sort_values("id", kind="stable").reset_index(drop=True)
-    classes = sorted(v0_rows.model.astype(str).unique())
+    profile_validation = effective_profile(data_dir, validation_dataset, validation_rows)
+    stage1_train, stage2_train, stage1_valid = v1_rows, v0_rows, validation_rows
+    stage2_valid = validation_rows
+    classes = sorted(validation_rows.model.astype(str).unique())
     if set(stage1_train.model.astype(str).unique()) != set(classes) or set(stage2_train.model.astype(str).unique()) != set(classes):
         raise ValueError("Stage 1 and Stage 2 must each contain all canonical classes")
     _require_same_validation(stage1_valid, stage2_valid, classes, classes)
-    champion = _saved_champion_probabilities(artifact_dir / "predictions", ensemble_registry_path,
-                                             stage1_valid, classes)
+    champion = None
     if set(stage1_train.id.astype(str)) & set(stage2_train.id.astype(str)):
         raise ValueError("training IDs overlap across Stage 1 and Stage 2")
     stage1_texts = stage1_train.text.astype(str)
@@ -444,10 +453,23 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
     exact_overlap = set(stage1_texts) & set(stage2_texts)
     normalized_overlap = set(stage1_texts.map(_normal_text)) & set(stage2_texts.map(_normal_text))
     validation_texts = stage1_valid.text.astype(str)
+    training_ids = set(stage1_train.id.astype(str)) | set(stage2_train.id.astype(str))
+    validation_ids = set(stage1_valid.id.astype(str))
+    if training_ids & validation_ids:
+        raise ValueError("validation IDs overlap a training partition")
     if (set(validation_texts) & set(stage1_texts)) or (set(validation_texts) & set(stage2_texts)):
         raise ValueError("validation response text occurs in a training partition")
     if set(validation_texts.map(_normal_text)) & (set(stage1_texts.map(_normal_text)) | set(stage2_texts.map(_normal_text))):
         raise ValueError("normalized validation response text occurs in a training partition")
+    training_prompt_ids = set(stage1_train.prompt_id.astype(str)) | set(stage2_train.prompt_id.astype(str))
+    if training_prompt_ids & set(stage1_valid.prompt_id.astype(str)):
+        raise ValueError("validation prompt groups overlap a training partition")
+    for prompt_column in ("prompt_canon", "prompt", "prompt_text"):
+        if prompt_column in stage1_train and prompt_column in stage1_valid:
+            train_prompts = set(pd.concat([stage1_train[prompt_column], stage2_train[prompt_column]], ignore_index=True).fillna("").astype(str).map(_normal_text)) - {""}
+            valid_prompts = set(stage1_valid[prompt_column].fillna("").astype(str).map(_normal_text)) - {""}
+            if train_prompts & valid_prompts:
+                raise ValueError("normalized validation prompt content occurs in a training partition")
     if set(stage1_valid.model.astype(str)) != set(classes):
         raise ValueError("validation label set differs from canonical classes")
 
@@ -457,25 +479,32 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
     full_matrix, all_feature_names = stylometry(all_texts, all_recipe, return_feature_names=True)
     feature_seconds = time.perf_counter() - feature_started
     feature_data = {"full": full_matrix, "all_names": all_feature_names,
-                    "stage1_rows": len(stage1_train), "stage2_rows": len(stage2_train)}
+                    "offsets": {"v1_all": (0, len(stage1_train)),
+                                "v0": (len(stage1_train), len(stage1_train) + len(stage2_train)),
+                                validation_dataset: (len(stage1_train) + len(stage2_train), len(all_texts))}}
     report_dir.mkdir(parents=True)
     run_root.mkdir(parents=True)
 
     summary = {"run_id": run_id, "seed": seed,
-               "dataset_hashes": {"v1_all": profile_v1["dataset_sha256"], "v0": profile_v0["dataset_sha256"]},
-               "split_hashes": {"v1_all": profile_v1["split_sha256"], "v0": profile_v0["split_sha256"]},
+               "dataset_hashes": {"v1_all": profile_v1["dataset_sha256"], "v0": profile_v0["dataset_sha256"],
+                                  validation_dataset: profile_validation["dataset_sha256"]},
+               "split_hashes": {"v1_all": profile_v1.get("split_sha256"), "v0": profile_v0.get("split_sha256"),
+                                validation_dataset: profile_validation.get("split_sha256")},
                "feature_extraction_seconds": feature_seconds,
+               "validation_dataset": validation_dataset,
                "validation_rows": len(stage1_valid),
                "validation_ids_sha256": hashlib.sha256("\n".join(stage1_valid.id.astype(str)).encode()).hexdigest(),
                "classes": classes,
                "training_overlap": {"exact_rows": len(exact_overlap), "normalized_rows": len(normalized_overlap),
                                     "v1_all_train_rows": len(stage1_train), "v0_train_rows": len(stage2_train)},
                "experiments": {}, "code_revision": _revision(),
-               "training_parameters": {"stage1_iterations": int(stage1_iterations),
+        "training_parameters": {"stage1_iterations": int(stage1_iterations),
                    "stage2_iterations": int(stage2_iterations), "depth": int(cfg["depth"]),
                    "learning_rate": float(cfg["learning_rate"]), "l2_leaf_reg": float(cfg["l2_leaf_reg"]),
                    "class_weights": "Balanced", "seed": int(seed), "thread_count": int(cfg["thread_count"]),
-                   "calibration": "train-only scalar temperature", "validation_fitting": False}}
+                   "calibration": "train-only scalar temperature", "validation_fitting": False,
+                   "early_stopping_rounds": int(cfg.get("early_stopping_rounds", 100)),
+                   "checkpoint_selection_metric": "balanced_accuracy"}}
 
     recipes = {"A": EXPERIMENTS["A"]["recipe"], "B": EXPERIMENTS["B"]["recipe"]}
     removed_groups = []
@@ -502,7 +531,8 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
                 iterations=budget, cfg=cfg, seed=seed, checkpoint=checkpoint,
                 parent_checkpoint=parent, parent_sha256=parent_hash, matrices=feature_data,
                 report_dir=report_dir, data_profile=profile,
-                registry_path=registry_path, code_revision=summary["code_revision"])
+                registry_path=registry_path, code_revision=summary["code_revision"],
+                validation_dataset=validation_dataset)
             stage_result.pop("prediction_frame")
             record[stage] = {**stage_result, "dataset": dataset_name}
         summary["experiments"][experiment] = record
@@ -534,7 +564,8 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
             iterations=budget, cfg=cfg, seed=seed, checkpoint=checkpoint,
             parent_checkpoint=parent, parent_sha256=parent_hash, matrices=feature_data,
             report_dir=report_dir, data_profile=profile,
-            registry_path=registry_path, code_revision=summary["code_revision"])
+            registry_path=registry_path, code_revision=summary["code_revision"],
+            validation_dataset=validation_dataset)
         stage_result.pop("prediction_frame")
         record[stage] = {**stage_result, "dataset": dataset_name}
     summary["experiments"]["C"] = record

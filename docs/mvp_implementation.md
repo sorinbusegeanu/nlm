@@ -37,18 +37,17 @@ LoRA model configs can enable a GPU batch-size probe before training. It exercis
 
 ### Open Pool response dataset
 
-`data curate-openpool` reads only the retained `ntl_open_pool.parquet`. It keeps English responses with source, file, license, and canonical prompt-group metadata, drops exact normalized overlaps with official `train.csv`, and creates 2,711 responses per class. Hard defects (including missing required provenance, invalid Gemini 3.7 routing, duplicate/conflicting responses, official-train overlap, and non-English or undetermined text) are recorded by reason. Remaining eligible rows are selected with a fixed-seed, source-proportional sample; quota sampling is not a claim that the discarded rows are defective. The unverified Gemini 3.7 sidecar is never included. This is a training-only corpus: it has no Open Pool train/validation split file. When `--dataset v1` is selected, all Open Pool rows form the training partition and validation uses the unchanged V0 540 rows and split assignments; no V0 training rows are added. Prompt text is not a model input; `prompt_id` is retained as metadata.
+`data curate-openpool` reads only the retained `ntl_open_pool.parquet`. It keeps English responses with source, file, license, and canonical prompt-group metadata, drops exact normalized overlaps with official `train.csv`, and creates 2,711 responses per class. Hard defects (including missing required provenance, invalid Gemini 3.7 routing, duplicate/conflicting responses, official-train overlap, and non-English or undetermined text) are recorded by reason. Remaining eligible rows are selected with a fixed-seed, source-proportional sample; quota sampling is not a claim that the discarded rows are defective. The unverified Gemini 3.7 sidecar is never included. This is a training-only corpus: it has no Open Pool train/validation split file. When `--dataset v1` is selected, all Open Pool rows form the training dataset and validation uses all rows in V0; no V0 training rows are added. Prompt groups are checked for train/validation isolation. Prompt text is not a model input; `prompt_id` is retained as metadata.
 
-The generated files are `data/processed/dataset_v1.parquet` and `dataset_profile_v1.json`. Passing `--dataset v1` trains on the Open Pool rows only; validation uses the frozen 540-row V0 validation partition. The V0 training partition is not included. Build features, train, and evaluate ensembles with the existing commands, for example:
+The generated files are `data/processed/dataset_v1.parquet` and `dataset_profile_v1.json`. Passing `--dataset v1` trains on every Open Pool row; `--validation-dataset v0` validates on all 2,699 official V0 examples. The V0 data is not included in V1 training. Build features and train with the explicit dataset pair, for example:
 
 ```bash
-python -m src.pipeline features build --dataset v1
-python -m src.pipeline models train --model svc --dataset v1
-python -m src.pipeline models train --model qwen06 --dataset v1
-python -m src.pipeline ensemble evaluate --dataset v1
+python -m src.pipeline features build --dataset v1 --validation-dataset v0
+python -m src.pipeline models train --model svc --dataset v1 --validation-dataset v0
+python -m src.pipeline models train --model qwen06 --dataset v1 --validation-dataset v0
 ```
 
-The dataset profile is stored separately from V0 and records source hashes, filter counts, class/source/language distributions, and the frozen V0 validation IDs and split hash. `openpool_v1_removals.csv` records the source row, ID, label, source and removal reason for every excluded row, including quota sampling. Curation stops if any class has fewer than 2,711 eligible English responses.
+The dataset profile is stored separately from V0 and records source hashes, filter counts, class/source/language distributions, and the V0 reference used during curation. `openpool_v1_removals.csv` records the source row, ID, label, source and removal reason for every excluded row, including quota sampling. Curation stops if any class has fewer than 2,711 eligible English responses.
 
 ### Error-focused imbalanced Open Pool dataset (V1.1)
 

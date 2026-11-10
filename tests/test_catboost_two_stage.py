@@ -105,7 +105,7 @@ class CatBoostTwoStageTests(unittest.TestCase):
         self.assertEqual(len(set(paths)), 6)
         self.assertEqual(len(set(ids)), 6)
 
-    def test_two_stage_fit_never_passes_validation_labels_to_catboost(self):
+    def test_two_stage_fit_uses_validation_labels_for_balanced_early_stopping(self):
         from src.catboost_two_stage import _save_stage
 
         classes = ["a", "b"]
@@ -114,7 +114,7 @@ class CatBoostTwoStageTests(unittest.TestCase):
         valid = pd.DataFrame({"id": ["v1", "v2"], "prompt_id": ["p1", "p2"],
                               "text": ["amber validation", "birch validation"],
                               "model": classes})
-        train = pd.DataFrame({"id": ["t1", "t2"], "text": train_text, "model": classes})
+        train = pd.DataFrame({"id": ["t1", "t2"], "prompt_id": ["tp1", "tp2"], "text": train_text, "model": classes})
         full, names = stylometry(train_text + valid.text.tolist(),
             {"baseline": list(BASE_STYLOMETRY_GROUPS), "groups": list(STYLOMETRY_GROUPS)},
             return_feature_names=True)
@@ -132,7 +132,8 @@ class CatBoostTwoStageTests(unittest.TestCase):
             root = Path(td)
             checkpoint = root / "stage1" / "checkpoint"
             def fake_train(*args, **kwargs):
-                self.assertIsNone(kwargs["validation_labels"])
+                self.assertEqual(kwargs["validation_labels"], classes)
+                self.assertEqual(kwargs["checkpoint_selection_metric"], "balanced_accuracy")
                 checkpoint.mkdir(parents=True, exist_ok=True)
                 (checkpoint / "model.cbm").write_bytes(b"fake")
                 (checkpoint / "stylometry.json").write_text('{"tree_count":1}\n')
@@ -148,9 +149,11 @@ class CatBoostTwoStageTests(unittest.TestCase):
                          "thread_count": 1, "temperature_calibration": True}, seed=2026,
                     checkpoint=checkpoint, parent_checkpoint=None, parent_sha256=None,
                     matrices={"full": full, "all_names": names,
-                              "stage1_rows": len(train), "stage2_rows": 0},
+                              "offsets": {"v1_all": (0, len(train)), "v0": (len(train), len(train)),
+                                          "val": (len(train), len(train) + len(valid))}},
                     report_dir=root / "run", data_profile={"dataset_sha256": "data", "split_sha256": "split"},
-                    registry_path=root / "registry.sqlite", code_revision="test")
+                    registry_path=root / "registry.sqlite", code_revision="test",
+                    validation_dataset="val")
 
 
 if __name__ == "__main__":
