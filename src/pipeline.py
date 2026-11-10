@@ -1074,6 +1074,10 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
     # adapter, even if the local model config has since changed.
     cfg["checkpoint"] = source.get("checkpoint_id", cfg["checkpoint"])
     cfg["revision"] = source.get("model_revision", cfg["revision"])
+    source_config = source.get("config", {})
+    for key in ("inference_batch_size", "calibration_enabled"):
+        if key not in (config_overrides or {}) and key in source_config:
+            cfg[key] = source_config[key]
     source_quantization = source.get("quantization", source.get("config", {}).get("quantization", "none"))
     configured_quantization = cfg.get("quantization", "none")
     if source_quantization != configured_quantization:
