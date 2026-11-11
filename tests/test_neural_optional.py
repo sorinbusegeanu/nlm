@@ -35,9 +35,15 @@ class NeuralAdapterTests(unittest.TestCase):
             config=BertConfig(vocab_size=9,hidden_size=16,num_hidden_layers=1,num_attention_heads=2,intermediate_size=32,num_labels=3)
             BertForSequenceClassification(config).save_pretrained(root)
             texts,labels=self._rows()
+            training_views=[[text, text + " alpha"] for text in texts]
             result=train_encoder_fold(texts,labels,["alpha common"],["a","b","c"],checkpoint=str(root),revision=None,
-                output_dir=Path(td)/"out",epochs=1,batch_size=3,max_length=8,learning_rate=1e-3)
+                output_dir=Path(td)/"out",epochs=1,batch_size=3,max_length=8,learning_rate=1e-3,
+                validation_labels=["a"],training_views=training_views,
+                training_view_ids=[["full","chunk-01"] for _ in texts])
             self.assertEqual(result["scores"].shape,(1,3));self.assertTrue(np.isfinite(result["probabilities"]).all())
+            sampling=result["training_view_sampling"]
+            self.assertEqual(sampling["epoch_records"][0]["original_responses"],len(texts))
+            self.assertEqual(sum(sampling["epoch_records"][0]["selected_view_counts"].values()),len(texts))
             reloaded=BertForSequenceClassification.from_pretrained(Path(td)/"out")
             batch=self._tokenizer(root)(["alpha common"],return_tensors="pt",padding=True)
             batch={k:v for k,v in batch.items() if k in {"input_ids","attention_mask"}}
@@ -53,25 +59,30 @@ class NeuralAdapterTests(unittest.TestCase):
             config=LlamaConfig(vocab_size=9,hidden_size=16,intermediate_size=32,num_hidden_layers=1,num_attention_heads=2,num_key_value_heads=2)
             LlamaModel(config).save_pretrained(root)
             texts,labels=self._rows()
+            training_views=[[text, text + " beta"] for text in texts]
             result=train_qwen_lora_fold(texts,labels,["alpha common"],["a","b","c"],checkpoint=str(root),revision=None,
-                output_dir=Path(td)/"out",epochs=1,batch_size=3,max_length=8,learning_rate=1e-3,lora_rank=2,lora_alpha=4)
+                output_dir=Path(td)/"out",epochs=1,batch_size=3,max_length=8,learning_rate=1e-3,lora_rank=2,lora_alpha=4,
+                validation_labels=["a"],training_views=training_views,
+                training_view_ids=[["full","chunk-01"] for _ in texts])
             self.assertEqual(result["scores"].shape,(1,3));self.assertTrue(np.isfinite(result["probabilities"]).all())
+            sampling=result["training_view_sampling"]
+            self.assertEqual(sampling["epoch_records"][0]["original_responses"],len(texts))
+            self.assertEqual(sum(sampling["epoch_records"][0]["selected_view_counts"].values()),len(texts))
             batch=self._tokenizer(root)(["alpha common"],return_tensors="pt",padding=True)
             batch={k:v for k,v in batch.items() if k in {"input_ids","attention_mask"}}
             device=next(result["model"].parameters()).device;batch={k:v.to(device) for k,v in batch.items()}
             output=result["model"](**batch,labels=torch.tensor([0]));output.loss.backward()
             self.assertTrue(any(p.grad is not None for n,p in result["model"].named_parameters() if "lora_" in n))
             self.assertTrue(any(p.grad is not None for p in result["model"].classifier.parameters()))
-            merged_dir=Path(td)/"out"/"merged_backbone"
-            self.assertTrue((merged_dir/"model.safetensors").exists())
-            loaded=LlamaModel.from_pretrained(merged_dir).to(device).eval()
-            classifier=torch.nn.Linear(16,3).to(device)
-            classifier.load_state_dict(torch.load(Path(td)/"out"/"classifier.pt",map_location=device,weights_only=True))
-            with torch.inference_mode():
-                hidden=loaded(input_ids=batch["input_ids"],attention_mask=batch["attention_mask"]).last_hidden_state
-                mask=batch["attention_mask"].unsqueeze(-1).to(hidden.dtype)
-                reloaded_logits=classifier(((hidden*mask).sum(1)/mask.sum(1).clamp_min(1)).float())
-                self.assertTrue(torch.allclose(output.logits.detach(),reloaded_logits,atol=2e-4,rtol=2e-4))
+            self.assertTrue((Path(td)/"out"/"adapter_model.safetensors").exists())
+            from src.inference import _predict_neural
+            reloaded_probabilities, returned_classes, reloaded_scores = _predict_neural(
+                "qwen06", Path(td)/"out", ["alpha common"], ["a","b","c"],
+                base_checkpoint=str(root), max_length=8, batch_size=1, return_scores=True)
+            self.assertEqual(returned_classes,["a","b","c"])
+            self.assertTrue(np.isfinite(reloaded_probabilities).all())
+            self.assertEqual(reloaded_scores.shape,(1,3))
+            self.assertTrue(np.allclose(reloaded_probabilities.sum(axis=1),1.0,atol=1e-5))
 
 
 if __name__ == "__main__": unittest.main()

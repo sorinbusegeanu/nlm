@@ -1,12 +1,12 @@
-"""Training-fed trust list for checkpoints trained without V0.
+"""Versioned V0 trust lists for the eligible external-only checkpoint roster.
 
-The dashboard reads the materialized CSV and never runs inference or computes
-metrics. New rows are appended from the completed training manifest's saved
-full-V0 metrics. The source CSV defines the eligible model roster only.
+The initial version scores the frozen roster once. Later versions are immutable
+snapshots and are updated from completed training manifests by the pipeline.
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -22,6 +22,9 @@ import pandas as pd
 ROSTER_PATH = Path("docs/v2-ckpt-nov0.csv")
 TRUST_PATH = Path("docs/v2-ckpt-nov0_active.csv")
 METADATA_PATH = Path("docs/v2-ckpt-nov0_active.json")
+VERSION_PREFIX = "trust-list-2-v"
+LATEST_PATH = Path("docs/trust-list-2-latest.json")
+PREDICTION_DIR = Path("artifacts/analysis/trust_list_2_v0")
 INITIAL_EXPERIMENTS = (
     "ultrabert380_v2.0_valv0_datad12bb8be_split870e47f9_seed2026_cfgfe74ea98_codeab9f6d2",
     "ultrabert380_v2.1_valv0_datac59bc6ca_split6330072d_seed2026_cfgaf9f028b_codeab9f6d2",
@@ -191,6 +194,9 @@ def _sort_and_rank(frame: pd.DataFrame, *, generated_at: str) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(columns=TRUST_COLUMNS)
     frame = frame.copy()
+    frame = frame.drop(columns=[column for column in
+                                ("SeqID", "trust_list_version", "trust_list_generated_at_utc")
+                                if column in frame], errors="ignore")
     for column in ("precision", "recall", "prediction_count", "true_positive", "false_positive",
                    "false_negative", "validation_training_overlap"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -202,12 +208,288 @@ def _sort_and_rank(frame: pd.DataFrame, *, generated_at: str) -> pd.DataFrame:
                               ascending=[False, False, True, True], na_position="last", kind="stable")
     frame = frame.drop(columns="_checkpoint_number").reset_index(drop=True)
     frame.insert(0, "SeqID", range(1, len(frame) + 1))
-    frame.insert(1, "trust_list_version", "trust-v2")
+    frame.insert(1, "trust_list_version", str(frame.attrs.get("trust_list_version", "trust-v2")))
     frame.insert(2, "trust_list_generated_at_utc", generated_at)
     for column in TRUST_COLUMNS:
         if column not in frame:
             frame[column] = pd.NA
     return frame[TRUST_COLUMNS]
+
+
+def _version_number(version: str) -> int:
+    match = re.fullmatch(r"trust-list-2-v(\d{3,})", str(version))
+    if not match:
+        raise ValueError(f"invalid trust list version: {version}")
+    return int(match.group(1))
+
+
+def _latest_version(root: Path) -> tuple[str, Path, Path] | None:
+    pointer = root / LATEST_PATH
+    if not pointer.is_file():
+        return None
+    value = json.loads(pointer.read_text())
+    version = str(value["version"])
+    _version_number(version)
+    return version, root / value["csv_path"], root / value["metadata_path"]
+
+
+def latest_trust_paths(root: str | Path = ".") -> tuple[Path, Path, dict] | None:
+    """Resolve the current immutable CSV/metadata pair for dashboard use."""
+    root = Path(root).resolve()
+    latest = _latest_version(root)
+    if latest is None:
+        return None
+    version, csv_path, metadata_path = latest
+    if not csv_path.is_file() or not metadata_path.is_file():
+        raise FileNotFoundError(f"latest trust list {version} is incomplete")
+    return csv_path, metadata_path, json.loads(metadata_path.read_text())
+
+
+def _atomic_json(value: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    try:
+        Path(temporary).write_text(json.dumps(value, indent=2) + "\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _publish_version(root: Path, frame: pd.DataFrame, metadata: dict, version: str) -> dict:
+    csv_path = root / "docs" / f"{version}.csv"
+    metadata_path = root / "docs" / f"{version}.json"
+    frame = frame.copy()
+    frame.attrs["trust_list_version"] = version
+    frame = _sort_and_rank(frame, generated_at=metadata["generated_at_utc"])
+    # Publish data first and move the latest pointer last. Readers never see a
+    # pointer to a partially written version.
+    _atomic_write(frame, csv_path)
+    metadata.update({"version": version, "csv_path": str(csv_path.relative_to(root)),
+                     "metadata_path": str(metadata_path.relative_to(root)),
+                     "rows": int(len(frame)),
+                     "checkpoints": int(frame.experiment_id.nunique())})
+    _atomic_json(metadata, metadata_path)
+    _atomic_json({"version": version, "csv_path": metadata["csv_path"],
+                  "metadata_path": metadata["metadata_path"],
+                  "generated_at_utc": metadata["generated_at_utc"]}, root / LATEST_PATH)
+    return metadata
+
+
+def _file_sha256(path: Path) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    if path.is_file():
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    elif path.is_dir():
+        for child in sorted(item for item in path.rglob("*") if item.is_file()):
+            digest.update(str(child.relative_to(path)).encode())
+            with child.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    else:
+        raise FileNotFoundError(path)
+    return digest.hexdigest()
+
+
+def _find_manifest(root: Path, experiment_id: str) -> Path:
+    direct = root / "artifacts" / "predictions" / f"{experiment_id}_manifest.json"
+    if direct.is_file():
+        return direct
+    matches = []
+    for path in (root / "artifacts" / "runs").glob("**/*manifest.json"):
+        try:
+            if json.loads(path.read_text()).get("experiment_id") == experiment_id:
+                matches.append(path)
+        except (OSError, ValueError):
+            continue
+    if len(matches) != 1:
+        raise FileNotFoundError(f"expected one manifest for {experiment_id}; found {len(matches)}")
+    return matches[0]
+
+
+def _predict_checkpoint(manifest: dict, checkpoint: Path, texts: list[str], root: Path,
+                        batch_size: int = 4):
+    from .inference import _predict_neural, predict_catboost_stylometry, predict_svc_bundle
+    model = str(manifest.get("model") or "")
+    config = manifest.get("config") or {}
+    classes = list(manifest.get("classes") or [])
+    temperature = float(manifest.get("calibration_temperature") or 1.0)
+    if model == "svc":
+        import joblib
+        probabilities, predicted_classes = predict_svc_bundle(joblib.load(checkpoint), texts)
+    elif model in {"catboost_stylometry", "catboost"}:
+        probabilities, predicted_classes = predict_catboost_stylometry(
+            checkpoint, texts, classes, temperature=temperature)
+    else:
+        probabilities, predicted_classes = _predict_neural(
+            model, checkpoint, texts, classes,
+            batch_size=max(1, int(config.get("inference_batch_size", batch_size))),
+            max_length=int(config.get("max_length", 384)), temperature=temperature,
+            base_checkpoint=config.get("checkpoint"), revision=manifest.get("model_revision") or config.get("revision"),
+            fix_mistral_regex=bool(config.get("fix_mistral_regex", False)),
+            text_only_backbone=bool(config.get("text_only_backbone", False)),
+            local_base_model=config.get("local_base_model"), quantization=manifest.get("quantization"),
+            attention_backend=manifest.get("attention_backend"))
+    if set(predicted_classes) != set(LABELS) or len(predicted_classes) != len(LABELS):
+        raise ValueError(f"{model} checkpoint does not expose the 18 expected labels")
+    order = [list(predicted_classes).index(label) for label in LABELS]
+    probabilities = np.asarray(probabilities, dtype=float)[:, order]
+    if probabilities.shape != (len(texts), len(LABELS)) or not np.isfinite(probabilities).all():
+        raise ValueError(f"invalid probability output from {model}")
+    if not np.allclose(probabilities.sum(axis=1), 1, atol=1e-5):
+        raise ValueError(f"probabilities do not sum to one for {model}")
+    return probabilities
+
+
+def _score_rows(ids, y_true, probabilities, *, manifest, manifest_path: Path,
+                checkpoint: Path, checkpoint_sha: str, sequence_id: str, root: Path,
+                source: str) -> list[dict]:
+    from sklearn.metrics import balanced_accuracy_score, confusion_matrix
+    predictions = np.asarray(LABELS)[probabilities.argmax(axis=1)]
+    matrix = confusion_matrix(y_true, predictions, labels=LABELS)
+    recalls = {label: float(matrix[i, i] / matrix[i].sum()) if matrix[i].sum() else 0.0
+               for i, label in enumerate(LABELS)}
+    precisions = {label: float(matrix[i, i] / matrix[:, i].sum()) if matrix[:, i].sum() else 0.0
+                  for i, label in enumerate(LABELS)}
+    balanced_accuracy = float(balanced_accuracy_score(y_true, predictions))
+    created = manifest.get("checkpoint_created_at_utc") or manifest.get("created_at_utc") or _utc_now()
+    created_dt = pd.Timestamp(created)
+    created_dt = created_dt.tz_localize("UTC") if created_dt.tzinfo is None else created_dt.tz_convert("UTC")
+    rows = []
+    for index, label in enumerate(LABELS):
+        tp = int(matrix[index, index]); predicted = int(matrix[:, index].sum())
+        actual = int(matrix[index, :].sum())
+        rows.append({
+            "sequence_id": sequence_id,
+            "experiment_id": str(manifest.get("experiment_id") or manifest_path.stem.removesuffix("_manifest")),
+            "model": str(manifest.get("model") or ""), "model_title": manifest.get("model_title") or manifest.get("model") or "",
+            "target_label": label,
+            "training_dataset": str(manifest.get("training_dataset") or manifest.get("dataset") or ""),
+            "dataset_lineage": _lineage(manifest, manifest_path), "checkpoint": checkpoint.name,
+            "checkpoint_path": _relative_path(checkpoint, root),
+            "checkpoint_created_at_utc": created,
+            "checkpoint_date": created_dt.tz_convert(LOCAL_TIMEZONE).strftime("%m.%d"),
+            "precision": precisions[label],
+            "recall": recalls[label], "prediction_count": predicted,
+            "true_positive": tp, "false_positive": predicted-tp, "false_negative": actual-tp,
+            "evaluation_eligible": True, "validation_training_overlap": 0,
+            "evaluation_note": "Full V0 (2,699 rows); inference on frozen official V0 rows.",
+            "checkpoint_available": checkpoint.exists(), "validation_split_sha256": "",
+            "catalog_source": source, "smoothed_precision": (tp+1)/(predicted+2),
+            "rule_eligible": predicted >= MINIMUM_SUPPORT,
+            "overall_accuracy": float(np.mean(predictions == np.asarray(y_true))),
+            "balanced_accuracy": balanced_accuracy, "validation_rows": len(ids),
+        })
+    return rows
+
+
+def build_roster_trust_list(*, root: str | Path = ".", batch_size: int = 4) -> dict:
+    """Run and cache predictions for every unique checkpoint in the roster."""
+    root = Path(root).resolve()
+    roster_path = root / ROSTER_PATH
+    roster = pd.read_csv(roster_path, dtype=str, keep_default_na=False).drop_duplicates("experiment_id")
+    if len(roster) != 63:
+        raise ValueError(f"expected 63 unique roster checkpoints, found {len(roster)}")
+    from .pipeline import _dataset_rows, _partition_sha256
+    v0 = _dataset_rows("v0", root / "data" / "processed")
+    if len(v0) != V0_ROWS or set(v0.model.astype(str)) != set(LABELS):
+        raise ValueError("V0 reference is not the expected complete 2,699-row, 18-label dataset")
+    v0_sha = _partition_sha256(v0)
+    ids, texts, y_true = v0.id.astype(str).tolist(), v0.text.astype(str).tolist(), v0.model.astype(str).tolist()
+    output_dir = root / PREDICTION_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prediction_rows, run_info = [], []
+    for position, record in enumerate(roster.to_dict("records"), start=1):
+        experiment_id = record["experiment_id"]
+        manifest_path = _find_manifest(root, experiment_id)
+        manifest = json.loads(manifest_path.read_text())
+        checkpoint = Path(manifest.get("checkpoint_path") or record.get("checkpoint_path") or "")
+        if not checkpoint.is_absolute(): checkpoint = root / checkpoint
+        if not checkpoint.exists(): raise FileNotFoundError(f"checkpoint missing for {experiment_id}: {checkpoint}")
+        checkpoint_sha = _file_sha256(checkpoint)
+        cache_path = output_dir / f"{experiment_id}.parquet"
+        cache_manifest = output_dir / f"{experiment_id}.json"
+        cache_key = {"experiment_id": experiment_id, "checkpoint_sha256": checkpoint_sha,
+                     "v0_sha256": v0_sha, "rows": len(v0), "labels": list(LABELS),
+                     "model": manifest.get("model"), "config": manifest.get("config"),
+                     "calibration_temperature": manifest.get("calibration_temperature", 1.0)}
+        if cache_path.is_file() and cache_manifest.is_file():
+            cached_meta = json.loads(cache_manifest.read_text())
+        else: cached_meta = {}
+        if cached_meta.get("cache_key") == cache_key:
+            pred_frame = pd.read_parquet(cache_path)
+            cache_aligned = (pred_frame.id.astype(str).tolist() == ids and
+                             all(f"prob::{label}" in pred_frame for label in LABELS))
+        else:
+            pred_frame, cache_aligned = None, False
+        if cache_aligned:
+            probabilities = pred_frame[[f"prob::{label}" for label in LABELS]].to_numpy(dtype=float)
+            source = "roster_cached_full_v0_predictions"
+        else:
+            try:
+                probabilities = _predict_checkpoint(manifest, checkpoint, texts, root, batch_size=batch_size)
+            except Exception as exc:
+                progress = {"completed": position - 1, "total": len(roster), "failed": experiment_id,
+                            "error": f"{type(exc).__name__}: {exc}", "updated_at_utc": _utc_now(),
+                            "runs": run_info}
+                _atomic_json(progress, output_dir / "progress.json")
+                raise RuntimeError(f"full-V0 prediction failed for {experiment_id} ({manifest.get('model')}): {exc}") from exc
+            columns = {"id": ids, "y_true": y_true,
+                       "y_pred": np.asarray(LABELS)[probabilities.argmax(axis=1)]}
+            columns.update({f"prob::{label}": probabilities[:, i] for i, label in enumerate(LABELS)})
+            pd.DataFrame(columns).to_parquet(cache_path, index=False)
+            cache_manifest.write_text(json.dumps({"cache_key": cache_key, "prediction_path": str(cache_path.relative_to(root)),
+                                                  "checkpoint_sha256": checkpoint_sha, "v0_sha256": v0_sha,
+                                                  "rows": len(v0)}, indent=2)+"\n")
+            source = "roster_inference_full_v0"
+        sequence_id = str(record.get("sequence_id") or "")
+        prediction_rows.extend(_score_rows(ids, y_true, probabilities, manifest=manifest,
+                                           manifest_path=manifest_path, checkpoint=checkpoint,
+                                           checkpoint_sha=checkpoint_sha, sequence_id=sequence_id,
+                                           root=root, source=source))
+        # HF/PEFT modules can form reference cycles. Collect them and release
+        # unused allocator blocks before the next checkpoint load.
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        from sklearn.metrics import balanced_accuracy_score
+        run_info.append({"experiment_id": experiment_id, "sequence_id": sequence_id,
+                         "checkpoint_sha256": checkpoint_sha, "prediction_path": str(cache_path.relative_to(root)),
+                         "balanced_accuracy": float(balanced_accuracy_score(
+                             y_true, np.asarray(LABELS)[probabilities.argmax(1)]))})
+        progress = {"completed": position, "total": len(roster), "current": experiment_id,
+                    "updated_at_utc": _utc_now(), "runs": run_info}
+        _atomic_json(progress, output_dir / "progress.json")
+
+    # Preserve the two already evaluated V2 dataset checkpoints in the initial list.
+    legacy_path = root / TRUST_PATH
+    if not legacy_path.is_file():
+        raise FileNotFoundError(f"existing V2.0/V2.1 trust rows missing: {legacy_path}")
+    legacy = pd.read_csv(legacy_path)
+    initial_rows = pd.DataFrame(prediction_rows)
+    initial_rows = initial_rows[~initial_rows.experiment_id.isin(INITIAL_EXPERIMENTS)]
+    existing_rows = legacy[legacy.experiment_id.isin(INITIAL_EXPERIMENTS)].copy()
+    combined = pd.concat([initial_rows, existing_rows], ignore_index=True, sort=False)
+    if combined.experiment_id.nunique() != 65 or len(combined) != 65 * len(LABELS):
+        raise ValueError(f"initial trust list must contain 65 complete checkpoints; got {combined.experiment_id.nunique()} checkpoints / {len(combined)} rows")
+    generated_at = _utc_now()
+    combined.attrs["trust_list_version"] = "trust-list-2-v001"
+    ranked = _sort_and_rank(combined, generated_at=generated_at)
+    metadata = {"generated_at_utc": generated_at, "source_roster": str(ROSTER_PATH),
+                "initial_runs": list(INITIAL_EXPERIMENTS), "roster_checkpoints": len(roster),
+                "validation_scope": "full_v0", "validation_rows": len(v0), "validation_sha256": v0_sha,
+                "inference_runs": run_info, "method": "one-time inference of unique roster checkpoints; V2.0/V2.1 rows retained from saved full-V0 metrics"}
+    _publish_version(root, ranked, metadata, "trust-list-2-v001")
+    return {"status": "published", "version": "trust-list-2-v001", "checkpoints": 65,
+            "rows": len(ranked), "roster_predictions": len(roster), "prediction_dir": str(output_dir)}
 
 
 def _atomic_write(frame: pd.DataFrame, path: Path) -> None:
@@ -296,10 +578,11 @@ def append_training_run(manifest: dict, manifest_path: str | Path, *,
     lineage = _lineage(manifest, manifest_path)
     if V0_TOKEN.search(training_dataset) or V0_TOKEN.search(lineage):
         return {"status": "skipped", "reason": "training lineage includes V0"}
-    if not output_path.is_file():
-        initialize_v2_trust_list(root=root, roster_path=roster_path,
-                                 output_path=output_path, metadata_path=metadata_path)
-    current = pd.read_csv(output_path)
+    latest = _latest_version(root)
+    if latest is None:
+        return {"status": "deferred", "reason": "trust-list-2-v001 roster evaluation is not published yet"}
+    current_version, current_path, current_metadata_path = latest
+    current = pd.read_csv(current_path)
     experiment_id = str(manifest.get("experiment_id") or manifest_path.stem.removesuffix("_manifest"))
     if experiment_id in set(current.experiment_id.astype(str)):
         return {"status": "already_recorded", "experiment_id": experiment_id}
@@ -309,21 +592,26 @@ def append_training_run(manifest: dict, manifest_path: str | Path, *,
         return {"status": "skipped", "reason": "complete full-V0 training metrics are unavailable"}
     merged = pd.concat([current, pd.DataFrame(rows)], ignore_index=True)
     generated_at = _utc_now()
-    ranked = _sort_and_rank(merged, generated_at=generated_at)
-    _atomic_write(ranked, output_path)
-    metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {"version": "trust-v2"}
-    metadata.update({"generated_at_utc": generated_at, "rows": int(len(ranked)),
-                     "checkpoints": int(ranked.experiment_id.nunique()),
-                     "last_added_experiment_id": experiment_id})
-    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
-    return {"status": "added", "sequence_id": sequence_id, "labels": len(rows)}
+    next_version = f"{VERSION_PREFIX}{_version_number(current_version) + 1:03d}"
+    merged.attrs["trust_list_version"] = next_version
+    metadata = json.loads(current_metadata_path.read_text())
+    metadata.update({"generated_at_utc": generated_at,
+                     "last_added_experiment_id": experiment_id,
+                     "parent_version": current_version})
+    published = _publish_version(root, merged, metadata, next_version)
+    return {"status": "added", "version": next_version, "sequence_id": sequence_id,
+            "labels": len(rows), "checkpoints": published["checkpoints"]}
 
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".")
+    parser.add_argument("action", nargs="?", choices=("initialize", "build-roster"), default="initialize")
+    parser.add_argument("--batch-size", type=int, default=4)
     args = parser.parse_args()
-    print(json.dumps(initialize_v2_trust_list(root=args.root), indent=2))
+    result = (build_roster_trust_list(root=args.root, batch_size=args.batch_size)
+              if args.action == "build-roster" else initialize_v2_trust_list(root=args.root))
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

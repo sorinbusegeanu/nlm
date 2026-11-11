@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import itertools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -28,8 +30,9 @@ from .feature_factory import load_or_fit, stylometry
 from .model_factory import (FROZEN_BACKBONE_MODELS, calculate_max_token_length,
                             train_encoder_fold,
                             train_frozen_backbone_fold, train_qwen_lora_fold,
-                            train_catboost_stylometry, train_svc)
+                            train_catboost_stylometry, train_svc, select_epoch_view_indices)
 from .registry import Registry
+from .v2_0_chunks800 import main as build_v2_0_chunks800_dataset
 
 MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert380": "configs/models/ultrabert380.yaml",
     "phi35_mini": "configs/models/phi35_mini.yaml",
@@ -47,6 +50,39 @@ MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert380": "configs/mode
     "ministral3_3b": "configs/models/ministral3_3b.yaml",
     "ministral3_8b": "configs/models/ministral3_8b_qlora.yaml",
     "catboost_stylometry": "configs/models/catboost_stylometry.yaml"}
+
+
+class _TeeTextStream:
+    """Write training output to both its original stream and a per-run log."""
+    def __init__(self, terminal, log_file):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    @property
+    def encoding(self):
+        return getattr(self.terminal, "encoding", None) or "utf-8"
+
+    @property
+    def errors(self):
+        return getattr(self.terminal, "errors", None) or "replace"
+
+    def write(self, value):
+        self.log_file.write(value)
+        self.log_file.flush()
+        return self.terminal.write(value)
+
+    def flush(self):
+        self.log_file.flush()
+        self.terminal.flush()
+
+    def isatty(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def fileno(self):
+        return self.terminal.fileno()
 DEFAULT_MVP_MODELS = ["svc", "catboost_stylometry", "ultrabert380", "qwen06"]
 ENSEMBLE_MODEL_CHOICES = [*MODEL_CONFIGS, "qwen06_best_epoch03"]
 
@@ -420,7 +456,50 @@ def _dataset_rows(dataset, data_dir):
 def _partition_sha256(rows):
     content = rows[[column for column in ("id", "prompt_id", "text", "model")
                     if column in rows]].astype(str).to_csv(index=False, lineterminator="\n")
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(content.encode("utf-8"))
+    if "training_views" in rows:
+        for index, views in enumerate(rows.training_views):
+            digest.update(str(index).encode())
+            digest.update(json.dumps(list(views), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            if "training_view_ids" in rows:
+                digest.update(json.dumps(list(rows.iloc[index].training_view_ids), separators=(",", ":")).encode())
+    return digest.hexdigest()
+
+
+def _original_response_rows(rows: pd.DataFrame, *, training: bool) -> pd.DataFrame:
+    """Collapse a multi-view artifact to one original row, retaining its views."""
+    if "view_type" not in rows or "original_response_id" not in rows:
+        return rows
+    original_ids = rows.original_response_id.astype(str)
+    full_mask = rows.view_type.astype(str).eq("full_response")
+    full_counts = original_ids[full_mask].value_counts()
+    missing_or_duplicate = full_counts[full_counts.ne(1)]
+    if len(missing_or_duplicate):
+        raise ValueError(f"multi-view dataset needs one full response for each original; invalid groups: {len(missing_or_duplicate)}")
+    full = rows.loc[full_mask].copy()
+    if training:
+        consistency = rows.assign(_original_id=original_ids).groupby("_original_id", sort=False).agg(
+            labels=("model", "nunique"), prompts=("prompt_id", "nunique"))
+        inconsistent = consistency.index[consistency["labels"].ne(1) | consistency["prompts"].ne(1)]
+        if len(inconsistent):
+            raise ValueError(f"multi-view rows disagree on label or prompt provenance for {len(inconsistent)} originals")
+        chunks = rows.loc[~full_mask].copy()
+        chunks["original_response_id"] = chunks.original_response_id.astype(str)
+        chunks = chunks.sort_values(["original_response_id", "char_start", "chunk_id"], kind="stable")
+        text_by_id = chunks.groupby("original_response_id", sort=False).text.agg(lambda values: list(map(str, values)))
+        chunk_id_by_id = chunks.groupby("original_response_id", sort=False).chunk_id.agg(lambda values: list(map(str, values)))
+        full_ids = full.original_response_id.astype(str)
+        full["training_views"] = [ [str(text), *text_by_id.get(oid, [])]
+                                   for oid, text in zip(full_ids, full.text)]
+        full["training_view_ids"] = [["full", *chunk_id_by_id.get(oid, [])] for oid in full_ids]
+    full["id"] = full.original_response_id.astype(str)
+    return full.sort_values("id", kind="stable").reset_index(drop=True)
+
+
+def select_single_training_views(training_views, view_ids=None, *, seed=2026, epoch=0):
+    """Pick one reproducible view per original for single-fit classifiers."""
+    return select_epoch_view_indices([len(views) for views in training_views], seed=seed,
+                                     epoch=epoch, view_ids=view_ids)
 
 
 def _continuation_source_matches(source, training_dataset, validation_dataset,
@@ -451,6 +530,10 @@ def _continuation_source_matches(source, training_dataset, validation_dataset,
 def _training_partitions(training_dataset, validation_dataset, data_dir):
     train = _dataset_rows(training_dataset, data_dir)
     valid = _dataset_rows(validation_dataset, data_dir)
+    if "view_type" in train:
+        train = _original_response_rows(train, training=True)
+    if "view_type" in valid:
+        valid = _original_response_rows(valid, training=False)
     # The official V0 artifact records the historical prompt-grouped holdout.
     # When V0 is named on both sides, interpret those names as its two roles.
     if training_dataset == validation_dataset == "v0":
@@ -633,6 +716,20 @@ def _model_cfg(model, config_path=None):
 
 def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache_dir, *,
                 cache_fold=None, checkpoint_selection_metric="balanced_accuracy"):
+    has_views = "training_views" in train.columns
+    training_views = train.training_views.tolist() if has_views else None
+    training_view_ids = train.training_view_ids.tolist() if has_views else None
+    dynamic_views = has_views and (model == "ultrabert380" or (
+        model not in {"svc", "catboost_stylometry"} and
+        not (model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen")))
+    static_sampling = None
+    if has_views and not dynamic_views:
+        selected, counts = select_single_training_views(training_views, training_view_ids, seed=seed)
+        train = train.copy()
+        train["text"] = [views[choice] for views, choice in zip(training_views, selected)]
+        static_sampling = {"policy": "one deterministic view per original response for single-fit classifier",
+                           "seed": int(seed), "epoch": 0, "original_responses": len(train),
+                           "selected_view_counts": counts}
     if model == "svc":
         result = train_svc(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
                            c=cfg.get("C", .5), calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
@@ -679,7 +776,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_encoder_fold(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
             checkpoint=cfg["checkpoint"], revision=cfg["revision"], output_dir=checkpoint,
-            epochs=cfg.get("epochs", 3), batch_size=cfg.get("batch_size", 16),
+            epochs=cfg.get("epochs", 20), batch_size=cfg.get("batch_size", 16),
             inference_batch_size=cfg.get("inference_batch_size"), max_length=cfg["max_length"],
             learning_rate=cfg.get("learning_rate", 2e-5), seed=seed,
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
@@ -702,7 +799,9 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             calibration_seed=cfg.get("calibration_seed", seed),
             calibration_full_dataset=cfg.get("calibration_full_dataset", False),
             calibration_enabled=cfg.get("calibration_enabled", True),
-            save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False))
+            save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False),
+            trainer_resume_checkpoint=cfg.get("trainer_resume_checkpoint"),
+            training_views=training_views, training_view_ids=training_view_ids)
         result["checkpoint"] = str(checkpoint)
     elif model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen":
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
@@ -725,7 +824,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_qwen_lora_fold(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
             checkpoint=cfg["checkpoint"], revision=cfg["revision"], output_dir=checkpoint,
-            epochs=cfg.get("epochs", 3), batch_size=cfg.get("batch_size", 4), max_length=cfg["max_length"],
+            epochs=cfg.get("epochs", 20), batch_size=cfg.get("batch_size", 4), max_length=cfg["max_length"],
             learning_rate=cfg.get("learning_rate", 1e-4), seed=seed,
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
             lora_rank=cfg.get("lora_rank", 16), lora_alpha=cfg.get("lora_alpha", 32),
@@ -758,15 +857,27 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             calibration_max_samples=cfg.get("calibration_max_samples", 5000),
             calibration_seed=cfg.get("calibration_seed", seed),
             calibration_full_dataset=cfg.get("calibration_full_dataset", False),
-            calibration_enabled=cfg.get("calibration_enabled", True))
+            calibration_enabled=cfg.get("calibration_enabled", True),
+            training_views=training_views, training_view_ids=training_view_ids)
         result["checkpoint"] = str(checkpoint)
     else: raise ValueError(f"unknown model: {model}")
+    if static_sampling is not None:
+        result["training_view_sampling"] = static_sampling
     return result
 
 
 def _dataset_max_length(model, cfg, rows, *, checkpoint=None, revision=None):
     """Count all training and validation responses with the training tokenizer."""
     frozen = model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen"
+    if "training_views" in rows:
+        texts = []
+        for row in rows.itertuples(index=False):
+            views = getattr(row, "training_views", None)
+            if isinstance(views, (list, tuple)):
+                texts.extend(str(view) for view in views)
+            else:
+                texts.append(str(row.text))
+        rows = pd.DataFrame({"text": texts})
     return calculate_max_token_length(
         model, rows.text.astype(str).tolist(), checkpoint=checkpoint or cfg["checkpoint"],
         revision=revision if revision is not None else cfg.get("revision"),
@@ -860,9 +971,12 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         cfg["features"] = _read_yaml(feature_config_path)
     train, valid = _training_partitions(dataset, validation_dataset, data_dir)
     classes = sorted(train.model.astype(str).unique().tolist())
-    if model not in {"svc", "catboost_stylometry"}:
-        cfg["max_length"] = _dataset_max_length(model, cfg, pd.concat([train, valid], ignore_index=True))
     train_profile = json.loads(_profile_path(Path(data_dir), dataset).read_text())
+    if model not in {"svc", "catboost_stylometry"}:
+        if model == "ultrabert380" and train_profile.get("chunking_strategy"):
+            cfg["max_length"] = int(train_profile["max_encoded_length"])
+        else:
+            cfg["max_length"] = _dataset_max_length(model, cfg, pd.concat([train, valid], ignore_index=True))
     train_hash = _partition_sha256(train)
     valid_hash = _partition_sha256(valid)
     split_hash = _sha({"training_dataset": dataset, "training_sha256": train_hash,
@@ -889,9 +1003,22 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
     if run_artifact_dir.exists():
         raise FileExistsError(f"incomplete immutable experiment exists at {run_artifact_dir}; remove that generated run directory to retry")
     metric = "balanced_accuracy"
-    result = _train_fold(model, train, valid, classes, cfg, run_artifact_dir, seed, "validation", Path(artifact_dir)/"features",
-                         cache_fold=f"{dataset}-{train_hash}-{validation_dataset}-{valid_hash}",
-                         checkpoint_selection_metric=metric)
+    run_artifact_dir.mkdir(parents=True, exist_ok=True)
+    console_log_path = run_artifact_dir / "training_console.log"
+    with console_log_path.open("a", encoding="utf-8", buffering=1) as console_log:
+        stdout = _TeeTextStream(sys.stdout, console_log)
+        stderr = _TeeTextStream(sys.stderr, console_log)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            print("TRAINING_RUN " + json.dumps({"pid": os.getpid(),
+                "model": model, "dataset": dataset, "started_at": time.time()}), flush=True)
+            result = _train_fold(model, train, valid, classes, cfg, run_artifact_dir, seed, "validation", Path(artifact_dir)/"features",
+                                 cache_fold=f"{dataset}-{train_hash}-{validation_dataset}-{valid_hash}",
+                                 checkpoint_selection_metric=metric)
+    training_view_sampling = result.get("training_view_sampling")
+    if training_view_sampling is not None:
+        sampling_path = run_artifact_dir / "training_view_sampling.json"
+        sampling_path.write_text(json.dumps({"training_dataset": dataset,
+            "training_dataset_sha256": train_hash, "sampling": training_view_sampling}, indent=2) + "\n")
     export_started = time.perf_counter()
     post_training_started = export_started
     runtime_breakdown = _post_training_runtime(result)
@@ -946,6 +1073,11 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         "attention_backend": result.get("attention_backend", cfg.get("attention_backend")),
         "fit_seconds": float(result["fit_seconds"]), "inference_seconds": result.get("inference_seconds"),
         "runtime_breakdown": runtime_breakdown,
+        "training_rows_per_second": (len(train) / float(runtime_breakdown.get(
+            "training_excluding_validation_seconds") or result.get("fit_seconds") or 1.0)),
+        "training_view_sampling": training_view_sampling,
+        "training_view_sampling_artifact": (str(run_artifact_dir / "training_view_sampling.json")
+                                             if training_view_sampling is not None else None),
         "inference_rows_per_second": (len(valid) / result["inference_seconds"]
             if result.get("inference_seconds") else None),
         "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"), "checkpoint_size_bytes": artifact_size,
@@ -1051,13 +1183,14 @@ TRAINING_OVERRIDE_FIELDS = (
     "iterations", "depth", "l2_leaf_reg", "early_stopping_rounds", "calibration_max_samples",
     "calibration_full_dataset", "calibration_enabled", "inference_batch_size", "save_epoch_checkpoints",
     "auto_batch_size", "max_batch_size", "batch_probe_safety_fraction", "gradient_checkpointing",
+    "trainer_resume_checkpoint",
 )
 
 CONTINUATION_CONFIG_FIELDS = set(TRAINING_OVERRIDE_FIELDS) | {
     "auto_batch_size", "max_batch_size", "batch_probe_safety_fraction",
     "gradient_checkpointing", "task_prefix", "text_only_backbone",
     "trust_remote_code", "fix_mistral_regex", "readout_hidden_size",
-    "lora_exclude_modules", "resume_checkpoint",
+    "lora_exclude_modules", "resume_checkpoint", "trainer_resume_checkpoint",
 }
 
 
@@ -1167,6 +1300,8 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
     if model not in {"qwen06", "qwen17", "qwen4", "qwen8"}:
         raise ValueError("continue-qwen supports qwen06, qwen17, qwen4, and qwen8")
     train, valid = _training_partitions(dataset, validation_dataset, data_dir)
+    training_views = train.training_views.tolist() if "training_views" in train.columns else None
+    training_view_ids = train.training_view_ids.tolist() if "training_view_ids" in train.columns else None
     rows = pd.concat([train, valid], ignore_index=True)
     train_hash, valid_hash = _partition_sha256(train), _partition_sha256(valid)
     training_profile = json.loads(_profile_path(Path(data_dir), dataset).read_text())
@@ -1196,6 +1331,8 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
     cfg["validation_dataset"] = validation_dataset
     cfg["checkpoint_selection_metric"] = "balanced_accuracy"
     snapshot = {k:v for k,v in cfg.items() if not k.startswith("_")}
+    if training_views is not None:
+        snapshot["training_view_sampling_policy"] = "one random view per original response per epoch"
     snapshot["continued_from_experiment"] = source["experiment_id"]
     snapshot["additional_epochs"] = epochs
     config_hash = _sha(snapshot); code_revision = _revision()
@@ -1231,7 +1368,14 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         calibration_max_samples=cfg.get("calibration_max_samples", 5000),
         calibration_seed=cfg.get("calibration_seed", seed),
         calibration_full_dataset=cfg.get("calibration_full_dataset", False),
-        calibration_enabled=cfg.get("calibration_enabled", cfg.get("temperature_calibration", True)))
+        calibration_enabled=cfg.get("calibration_enabled", cfg.get("temperature_calibration", True)),
+        training_views=training_views, training_view_ids=training_view_ids)
+    training_view_sampling = result.get("training_view_sampling")
+    sampling_path = None
+    if training_view_sampling is not None:
+        sampling_path = run_dir / "training_view_sampling.json"
+        sampling_path.write_text(json.dumps({"training_dataset": dataset,
+            "training_dataset_sha256": train_hash, "sampling": training_view_sampling}, indent=2) + "\n")
     classes=sorted(rows.model.astype(str).unique())
     metrics=evaluate(valid.model.astype(str),result["scores"],classes,result["probabilities"])
     for name in ("validation_loss_raw", "validation_loss_calibrated"):
@@ -1271,6 +1415,10 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         "attention_backend":result.get("attention_backend",cfg.get("attention_backend")),
         "fit_seconds":result["fit_seconds"],"inference_seconds":result["inference_seconds"],
         "runtime_breakdown":runtime_breakdown,
+        "training_view_sampling": training_view_sampling,
+        "training_view_sampling_artifact": str(sampling_path) if sampling_path else None,
+        "training_rows_per_second": (len(train) / float(runtime_breakdown.get(
+            "training_excluding_validation_seconds") or result.get("fit_seconds") or 1.0)),
         "checkpoint_scoring_method":result.get("checkpoint_scoring_method"),
         "final_validation_reused_existing_predictions":result.get("final_validation_reused_epoch_predictions"),
         "early_stopping":result.get("early_stopping"),
@@ -1370,6 +1518,8 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         source_checkpoint = nested_best
 
     train, valid = _training_partitions(dataset, validation_dataset, data_dir)
+    training_views = train.training_views.tolist() if "training_views" in train.columns else None
+    training_view_ids = train.training_view_ids.tolist() if "training_view_ids" in train.columns else None
     rows = pd.concat([train, valid], ignore_index=True)
     train_hash, valid_hash = _partition_sha256(train), _partition_sha256(valid)
     training_profile = json.loads(_profile_path(Path(data_dir), dataset).read_text())
@@ -1389,7 +1539,7 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         if value is not None:
             explicit[key] = value
     cfg = _continuation_config(model, source.get("config", {}), config_path, explicit)
-    epochs = int(cfg.get("epochs", 10))
+    epochs = int(cfg.get("epochs", 20))
     learning_rate = float(cfg.get("learning_rate", 5e-5))
     learning_rate_decay = float(cfg.get("learning_rate_decay", 0.9))
     optimizer = str(cfg.get("optimizer", "adamw_torch"))
@@ -1409,10 +1559,11 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "max_batch_size": int(cfg.get("max_batch_size", 1024)),
         "batch_probe_safety_fraction": float(cfg.get("batch_probe_safety_fraction", 0.95)),
         "gradient_accumulation_steps": int(cfg.get("gradient_accumulation_steps", 1)),
-        "max_length": _dataset_max_length(model, {
-            **cfg, "checkpoint": str(source_checkpoint), "revision": None,
-            "task_prefix": "", "training_mode": "full", "trust_remote_code": True,
-        }, pd.concat([train, valid], ignore_index=True), checkpoint=str(source_checkpoint), revision=None),
+        "max_length": (int(training_profile["max_encoded_length"])
+            if training_profile.get("chunking_strategy") else _dataset_max_length(model, {
+                **cfg, "checkpoint": str(source_checkpoint), "revision": None,
+                "task_prefix": "", "training_mode": "full", "trust_remote_code": True,
+            }, pd.concat([train, valid], ignore_index=True), checkpoint=str(source_checkpoint), revision=None)),
         "warmup_ratio": float(cfg.get("warmup_ratio", 0.0)),
         "lr_scheduler_type": cfg.get("lr_scheduler_type", "linear"),
         "baseline_validation_before_training": True,
@@ -1426,6 +1577,8 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "calibration_enabled": bool(cfg.get("calibration_enabled", cfg.get("temperature_calibration", True))),
         "inference_batch_size": int(cfg.get("inference_batch_size", max(8, int(cfg.get("batch_size", 8))))),
     }
+    if training_views is not None:
+        config_snapshot["training_view_sampling_policy"] = "one random view per original response per epoch"
     config_hash = _sha(config_snapshot)
     experiment_id = (f"{model}_{dataset}_from{source_key}_data{profile['dataset_sha256'][:8]}_"
                     f"split{profile['split_sha256'][:8]}_seed{seed}_cfg{config_hash[:8]}_code{_revision()[:7]}")
@@ -1462,7 +1615,14 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         calibration_seed=config_snapshot["calibration_seed"],
         calibration_full_dataset=config_snapshot["calibration_full_dataset"],
         calibration_enabled=config_snapshot["calibration_enabled"],
-        save_epoch_checkpoints=config_snapshot["save_epoch_checkpoints"])
+        save_epoch_checkpoints=config_snapshot["save_epoch_checkpoints"],
+        training_views=training_views, training_view_ids=training_view_ids)
+    training_view_sampling = result.get("training_view_sampling")
+    sampling_path = None
+    if training_view_sampling is not None:
+        sampling_path = run_dir / "training_view_sampling.json"
+        sampling_path.write_text(json.dumps({"training_dataset": dataset,
+            "training_dataset_sha256": train_hash, "sampling": training_view_sampling}, indent=2) + "\n")
     metrics = evaluate(valid.model.astype(str), result["scores"], classes, result["probabilities"])
     for name in ("validation_loss_raw", "validation_loss_calibrated"):
         if result.get(name) is not None:
@@ -1514,6 +1674,10 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "config_sha256": config_hash, "seed": seed,
         "fit_seconds": result["fit_seconds"], "inference_seconds": result["inference_seconds"],
         "runtime_breakdown": runtime_breakdown,
+        "training_view_sampling": training_view_sampling,
+        "training_view_sampling_artifact": str(sampling_path) if sampling_path else None,
+        "training_rows_per_second": (len(train) / float(runtime_breakdown.get(
+            "training_excluding_validation_seconds") or result.get("fit_seconds") or 1.0)),
         "calibration_temperature": result["calibration_temperature"],
         "calibration_enabled": result.get("calibration_enabled", config_snapshot["calibration_enabled"]),
         "calibration_sample_size": result.get("calibration_sample_size"),
@@ -1838,6 +2002,10 @@ def main(argv=None):
     vc.add_argument("--config",default="configs/data/v1_all_clean_compact.yaml")
     v13=d.add_parser("build-v1-3", help="assemble V1.3 from the downloaded GLM/GPT corpora and run clean plus compact")
     v13.add_argument("--config",default="configs/data/v1_3_external.yaml")
+    v2c=d.add_parser("build-v2-0-chunks800", help="derive deterministic 800-character views from V2.0")
+    v2c.add_argument("--seed",type=int,default=2026);v2c.add_argument("--force",action="store_true")
+    v2t=d.add_parser("build-v2-token-chunks", help="derive 200- and 300-token UltraBERT training datasets from V2.0")
+    v2t.add_argument("--force",action="store_true");v2t.add_argument("--batch-size",type=int,default=256)
     mix=d.add_parser("assemble");mix.add_argument("--config",default="configs/data/mixed_v1_5.yaml")
     f=sub.add_parser("features").add_subparsers(dest="action",required=True);b=f.add_parser("build");b.add_argument("--dataset",default="v1");b.add_argument("--validation-dataset",default="v0");b.add_argument("--data-dir",default="data/processed");b.add_argument("--config",default="configs/features/default.yaml")
     m=sub.add_parser("models").add_subparsers(dest="action",required=True)
@@ -1963,6 +2131,17 @@ def main(argv=None):
     z4.add_argument("--seed", type=int, default=2026)
     z4.add_argument("--refresh-features", action="store_true",
         help="re-extract hidden states even if a compatible feature cache exists")
+    tc = analysis.add_parser("trust-list-v2-complementarity",
+        help="compare global trust precision with incremental cascade value using saved full-V0 predictions")
+    tc.add_argument("--trust-list", default="docs/trust-list-2-v001.csv")
+    tc.add_argument("--trust-metadata", default="docs/trust-list-2-v001.json")
+    tc.add_argument("--predictions-dir", default="artifacts/analysis/trust_list_2_v0")
+    tc.add_argument("--artifact-dir", default="artifacts/predictions")
+    tc.add_argument("--data-dir", default="data/processed")
+    tc.add_argument("--output-dir", default="artifacts/analysis/trust_list_2_v0")
+    tc.add_argument("--report", default="docs/trust_list_v2_complementarity.md")
+    tc.add_argument("--minimum-incremental-support", type=int, default=10)
+    tc.add_argument("--fallback-sequence-id", default="N0081")
     a=parser.parse_args(argv)
     if a.command=="restart": result=restart_mvp(models=a.models,seed=a.seed,bootstrap_replicates=a.bootstrap_replicates)
     elif a.command=="data" and a.action=="prepare": result=prepare_data(a.config)
@@ -1970,6 +2149,12 @@ def main(argv=None):
     elif a.command=="data" and a.action=="curate-balanced-deduped": result=curate_v1_all_balanced_deduped_data(a.config)
     elif a.command=="data" and a.action=="curate-clean-compact": result=curate_v1_all_clean_compact_data(a.config)
     elif a.command=="data" and a.action=="build-v1-3": result=build_v1_3_external_data(a.config)
+    elif a.command=="data" and a.action=="build-v2-0-chunks800":
+        argv=["--seed",str(a.seed)]+(["--force"] if a.force else [])
+        result=build_v2_0_chunks800_dataset(argv)
+    elif a.command=="data" and a.action=="build-v2-token-chunks":
+        from .v2_0_token_chunks import build_all
+        result=build_all(force=a.force, batch_size=a.batch_size)
     elif a.command=="data" and a.action=="assemble": result=assemble_training_dataset(a.config)
     elif a.command=="features": result=build_features(a.dataset,a.data_dir,a.config,validation_dataset=a.validation_dataset)
     elif a.command=="models" and a.action=="train":
@@ -2040,6 +2225,13 @@ def main(argv=None):
             output_dir=a.output_dir,report_path=a.report,experiment_id=a.experiment_id,
             batch_size=a.batch_size,n_splits=a.n_splits,seed=a.seed,
             refresh_features=a.refresh_features)
+    elif a.command=="analysis" and a.action=="trust-list-v2-complementarity":
+        from .v2_checkpoint_complementarity import run_v2_checkpoint_complementarity
+        result=run_v2_checkpoint_complementarity(trust_list=a.trust_list,
+            trust_metadata=a.trust_metadata,cache_dir=a.predictions_dir,
+            artifact_dir=a.artifact_dir,data_dir=a.data_dir,output_dir=a.output_dir,
+            report_path=a.report,minimum_incremental_support=a.minimum_incremental_support,
+            fallback_sequence_id=a.fallback_sequence_id)
     elif a.command=="models" and a.action=="continue-qwen":
         _, parent = _matching_continuation_source(a.model, a.dataset, a.validation_dataset,
             "data/processed", "artifacts", a.from_experiment)
@@ -2062,7 +2254,7 @@ def main(argv=None):
         effective = {**cfg, **overrides}
         result=continue_encoder(a.dataset,a.model,a.data_dir,a.artifact_dir,a.registry,
             validation_dataset=a.validation_dataset,from_experiment=a.from_experiment,
-            epochs=int(effective.get("epochs",10)),
+            epochs=int(effective.get("epochs",20)),
             learning_rate=float(effective.get("learning_rate",5e-5)),
             learning_rate_decay=float(effective.get("learning_rate_decay",0.9)),seed=a.seed,
             optimizer=effective.get("optimizer","adamw_torch"),
