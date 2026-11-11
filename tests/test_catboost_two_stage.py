@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from src.catboost_two_stage import (
     _select_matrix,
     _stage_artifact_dir,
     _stage_id,
+    _historical_v0_partitions,
 )
 from src.feature_factory import BASE_STYLOMETRY_GROUPS, STYLOMETRY_GROUPS, stylometry
 from src.inference import predict_catboost_stylometry
@@ -105,6 +107,15 @@ class CatBoostTwoStageTests(unittest.TestCase):
         self.assertEqual(len(set(paths)), 6)
         self.assertEqual(len(set(ids)), 6)
 
+    def test_default_stage2_uses_historical_v0_train_and_validation_roles(self):
+        rows = pd.DataFrame({"id": ["t1", "v1"], "prompt_id": ["pt", "pv"],
+            "text": ["train response", "validation response"], "model": ["a", "a"],
+            "split": ["train", "validation"]})
+        train, valid = _historical_v0_partitions(rows)
+        self.assertEqual(train.id.tolist(), ["t1"])
+        self.assertEqual(valid.id.tolist(), ["v1"])
+        self.assertFalse(set(train.id) & set(valid.id))
+
     def test_two_stage_fit_uses_validation_labels_for_balanced_early_stopping(self):
         from src.catboost_two_stage import _save_stage
 
@@ -122,6 +133,9 @@ class CatBoostTwoStageTests(unittest.TestCase):
                   "probabilities": np.array([[.9, .1], [.1, .9]]),
                   "model": None, "fit_seconds": 0.1, "inference_seconds": 0.01,
                   "calibration_temperature": 1.0, "calibration_method": "train-only scalar temperature",
+                  "runtime_breakdown": {"calibration_inference_seconds": 0.0,
+                      "temperature_fit_seconds": 0.0},
+                  "final_validation_reused_existing_predictions": True,
                   "feature_names": _select_matrix(full, names, recipe)[1], "tree_count": 1}
 
         class FakeModel:
@@ -140,18 +154,24 @@ class CatBoostTwoStageTests(unittest.TestCase):
                 return result
             with patch("src.catboost_two_stage.train_catboost_stylometry", side_effect=fake_train), \
                  patch("src.catboost_two_stage.Registry"):
-                _save_stage(experiment="A", experiment_name="P+F", stage="stage1",
+                saved = _save_stage(experiment="A", experiment_name="P+F", stage="stage1",
                     dataset_name="v1_all", train=train, valid=valid, classes=classes,
                     recipe=recipe, iterations=1,
                     cfg={"depth": 2, "learning_rate": .05, "l2_leaf_reg": 5,
                          "thread_count": 1, "temperature_calibration": True}, seed=2026,
                     checkpoint=checkpoint, parent_checkpoint=None, parent_sha256=None,
                     matrices={"full": full, "all_names": names,
-                              "offsets": {"v1_all": (0, len(train)), "v0": (len(train), len(train)),
-                                          "val": (len(train), len(train) + len(valid))}},
+                              "offsets": {"stage1_train": (0, len(train)),
+                                          "stage2_train": (len(train), len(train)),
+                                          "validation": (len(train), len(train) + len(valid))}},
                     report_dir=root / "run", data_profile={"dataset_sha256": "data", "split_sha256": "split"},
                     registry_path=root / "registry.sqlite", code_revision="test",
-                    validation_dataset="val")
+                    validation_dataset="v0", train_matrix_role="stage1_train")
+            manifest = json.loads(Path(saved["manifest_path"]).read_text())
+            self.assertEqual(manifest["runtime_breakdown"]["calibration_inference_seconds"], 0.0)
+            self.assertEqual(manifest["runtime_breakdown"]["temperature_fit_seconds"], 0.0)
+            self.assertFalse(manifest["final_validation_reused_existing_predictions"])
+            self.assertEqual(manifest["checkpoint_scoring_method"], "fresh_validation_prediction_after_fit")
 
 
 if __name__ == "__main__":

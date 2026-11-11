@@ -20,7 +20,8 @@ from sklearn.metrics import balanced_accuracy_score
 
 from .data_factory import (assemble_openpool_mix, assemble_v1_5, build_v1_3_external_dataset,
                            curate_openpool, curate_v1_all_balanced_deduped,
-                           curate_v1_all_clean_compact, prepare, _normal_text)
+                           curate_v1_all_clean_compact, prepare, _normal_text,
+                           validate_data, make_splits)
 from .evaluation import (align_predictions, complementarity, evaluate, paired_group_bootstrap)
 from .ensemble_factory import ensemble_probabilities
 from .feature_factory import load_or_fit, stylometry
@@ -450,6 +451,18 @@ def _continuation_source_matches(source, training_dataset, validation_dataset,
 def _training_partitions(training_dataset, validation_dataset, data_dir):
     train = _dataset_rows(training_dataset, data_dir)
     valid = _dataset_rows(validation_dataset, data_dir)
+    # The official V0 artifact records the historical prompt-grouped holdout.
+    # When V0 is named on both sides, interpret those names as its two roles.
+    if training_dataset == validation_dataset == "v0":
+        source, _ = _load_dataset("v0", Path(data_dir))
+        if "split" not in source:
+            raise ValueError("V0 train/validation roles require the historical split assignments")
+        train = source[source.split.astype(str).eq("train")].drop(
+            columns=["split"], errors="ignore").sort_values("id", kind="stable").reset_index(drop=True)
+        valid = source[source.split.astype(str).eq("validation")].drop(
+            columns=["split"], errors="ignore").sort_values("id", kind="stable").reset_index(drop=True)
+        if train.empty or valid.empty:
+            raise ValueError("historical V0 split must have non-empty train and validation partitions")
     if set(train.model.astype(str)) != set(valid.model.astype(str)):
         raise ValueError("training and validation datasets must contain the same classes")
     checks = (("ID", set(train.id.astype(str)), set(valid.id.astype(str))),
@@ -520,6 +533,23 @@ def _refresh_ensemble_after_training(manifest, manifest_path, *, artifact_dir, d
             "downstream_refresh_seconds": manifest["runtime_breakdown"]["downstream_refresh_seconds"]}
 
 
+def _append_v2_checkpoint_trust(manifest, manifest_path):
+    """Append saved full-V0 training metrics to the separate v2 trust list."""
+    try:
+        from .v2_checkpoint_trust import append_training_run
+        result = append_training_run(manifest, manifest_path,
+                                     root=Path(__file__).resolve().parents[1])
+    except Exception as exc:
+        result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    manifest["v2_checkpoint_trust_update"] = result
+    manifest_path = Path(manifest_path)
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+    metrics_path = manifest_path.with_name(
+        manifest_path.name.removesuffix("_manifest.json") + "_metrics.json")
+    metrics_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+    return result
+
+
 def _post_training_runtime(result):
     """Normalize post-fit stage durations across model families."""
     runtime = dict(result.get("runtime_breakdown") or {})
@@ -541,6 +571,33 @@ def _post_training_runtime(result):
     runtime.setdefault("total_post_training_seconds", 0.0)
     runtime.setdefault("model_post_training_seconds", 0.0)
     return runtime
+
+
+def _register_completed_manifest(manifest, registry_path):
+    """Validate published outputs and idempotently make the manifest discoverable."""
+    prediction_path = Path(manifest.get("prediction_path", ""))
+    if not prediction_path.is_file():
+        raise FileNotFoundError(f"completed experiment prediction artifact is missing: {prediction_path}")
+    if manifest.get("prediction_sha256"):
+        digest = hashlib.sha256(prediction_path.read_bytes()).hexdigest()
+        if digest != manifest["prediction_sha256"]:
+            raise ValueError("completed experiment prediction artifact does not match its manifest hash")
+    for key in ("selected_checkpoint_path", "best_checkpoint_path", "checkpoint_path"):
+        checkpoint = manifest.get(key)
+        if checkpoint and not Path(checkpoint).exists():
+            raise FileNotFoundError(f"completed experiment {key} is missing: {checkpoint}")
+    experiment_id = manifest.get("experiment_id")
+    model = manifest.get("model")
+    metrics = manifest.get("validation_metrics", manifest.get("metrics"))
+    if not experiment_id or not model or not isinstance(metrics, dict):
+        raise ValueError("completed experiment manifest is missing registration metadata")
+    Registry(registry_path).add(experiment_id, model, manifest.get("split", "validation"),
+        manifest.get("config", {}), metrics, dataset_hash=manifest.get("dataset_sha256"),
+        split_hash=manifest.get("split_sha256"), model_revision=manifest.get("model_revision"),
+        code_revision=manifest.get("code_revision"), seed=manifest.get("seed"),
+        runtime_seconds=manifest.get("fit_seconds"), artifact_path=str(prediction_path),
+        config_hash=manifest.get("config_sha256"),
+        description=manifest.get("description", f"{model} experiment on {manifest.get('training_dataset', manifest.get('dataset'))}."))
 
 
 def _model_cfg(model, config_path=None):
@@ -644,20 +701,24 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             calibration_max_samples=cfg.get("calibration_max_samples", 5000),
             calibration_seed=cfg.get("calibration_seed", seed),
             calibration_full_dataset=cfg.get("calibration_full_dataset", False),
-            calibration_enabled=cfg.get("calibration_enabled", True))
+            calibration_enabled=cfg.get("calibration_enabled", True),
+            save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False))
         result["checkpoint"] = str(checkpoint)
     elif model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen":
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_frozen_backbone_fold(model, train.text.tolist(), train.model.tolist(),
             valid.text.tolist(), classes, checkpoint=cfg["checkpoint"], revision=cfg["revision"],
             output_dir=checkpoint, max_length=cfg["max_length"],
-            batch_size=cfg.get("batch_size", 8), c=cfg.get("C", .5),
+            batch_size=cfg.get("batch_size", 8),
+            inference_batch_size=cfg.get("inference_batch_size", cfg.get("batch_size", 8)),
+            c=cfg.get("C", .5),
             calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
             fix_mistral_regex=cfg.get("fix_mistral_regex", False),
             validation_labels=valid.model.tolist(),
             train_row_ids=train.id.astype(str).tolist(),
             validation_row_ids=valid.id.astype(str).tolist(),
-            embedding_cache_dir=Path(cache_dir).parent / "frozen_embeddings")
+            embedding_cache_dir=Path(cache_dir).parent / "frozen_embeddings",
+            trust_remote_code=cfg.get("trust_remote_code", False))
         result["checkpoint"] = str(checkpoint)
     elif model in ({"qwen06", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "phi35_mini"}
                    | FROZEN_BACKBONE_MODELS):
@@ -759,7 +820,10 @@ def _save_epoch_validation_predictions(result, valid, classes, prediction_dir, e
         checkpoint_path = (epoch_checkpoints[epoch - 1]
                            if epoch <= len(epoch_checkpoints) else None)
         if checkpoint_path is None and int(result.get("best_epoch") or -1) == epoch:
-            checkpoint_path = result.get("best_checkpoint_path") or result.get("best_checkpoint")
+            checkpoint_path = (result.get("selected_checkpoint_path") or
+                               result.get("best_checkpoint_path") or result.get("best_checkpoint"))
+        if checkpoint_path and not Path(checkpoint_path).exists():
+            raise FileNotFoundError(f"epoch {epoch} checkpoint link does not resolve: {checkpoint_path}")
         records.append({"epoch": epoch, "path": str(path), "rows": len(frame),
                         "sha256": hashlib.sha256(payload).hexdigest(),
                         "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
@@ -818,7 +882,10 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
     prediction_path = pred_dir / f"{experiment_id}_validation.parquet"
     manifest_path = pred_dir / f"{experiment_id}_manifest.json"
     if manifest_path.exists() and prediction_path.exists():
-        return json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text())
+        _register_completed_manifest(manifest, registry_path)
+        _append_v2_checkpoint_trust(manifest, manifest_path)
+        return manifest
     if run_artifact_dir.exists():
         raise FileExistsError(f"incomplete immutable experiment exists at {run_artifact_dir}; remove that generated run directory to retry")
     metric = "balanced_accuracy"
@@ -924,6 +991,10 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         "feature_names": result.get("feature_names"),
         "feature_recipe": result.get("feature_recipe", cfg.get("feature_recipe")),
         "feature_cache_key": result.get("cache_key"), "checkpoint_path": str(checkpoint),
+        "selected_checkpoint_path": result.get("selected_checkpoint_path") or
+            result.get("best_checkpoint_path") or str(checkpoint),
+        "best_checkpoint_path": result.get("best_checkpoint_path") or
+            result.get("selected_checkpoint_path") or str(checkpoint),
         "prediction_path": str(prediction_path), "prediction_sha256": hashlib.sha256(prediction_path.read_bytes()).hexdigest(),
         "validation_dataset_provenance": {"name": validation_dataset, "rows": len(valid),
             "sha256": valid_hash, "ids_sha256": profile.get("validation_ids_sha256"),
@@ -934,11 +1005,8 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
     description = (f"{experiment_name}: " if experiment_name else "") + (
         f"{model} trained on all {len(train)} {dataset} rows; validation and checkpoint selection used all "
         f"{len(valid)} {validation_dataset} rows (balanced accuracy).")
-    Registry(registry_path).add(manifest["experiment_id"], model, "validation", manifest["config"], metrics,
-        dataset_hash=manifest["dataset_sha256"], code_revision=manifest["code_revision"], seed=seed,
-        runtime_seconds=manifest["fit_seconds"], artifact_path=str(prediction_path), config_hash=manifest["config_sha256"],
-        split_hash=manifest["split_sha256"], model_revision=manifest["model_revision"],
-        description=description)
+    manifest["description"] = description
+    _register_completed_manifest(manifest, registry_path)
     runtime_breakdown["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
     runtime_breakdown["manifest_export_seconds"] = time.perf_counter() - manifest_export_started
     manifest["runtime_breakdown"] = runtime_breakdown
@@ -969,6 +1037,7 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
     manifest["runtime_breakdown"] = runtime_breakdown
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
     (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+    _append_v2_checkpoint_trust(manifest, manifest_path)
     return manifest
 
 
@@ -978,7 +1047,51 @@ TRAINING_OVERRIDE_FIELDS = (
     "lora_rank", "lora_alpha", "lora_target_modules", "quantization", "attention_backend", "C", "calibration_cv",
     "iterations", "depth", "l2_leaf_reg", "early_stopping_rounds", "calibration_max_samples",
     "calibration_full_dataset", "calibration_enabled", "inference_batch_size", "save_epoch_checkpoints",
+    "auto_batch_size", "max_batch_size", "batch_probe_safety_fraction", "gradient_checkpointing",
 )
+
+CONTINUATION_CONFIG_FIELDS = set(TRAINING_OVERRIDE_FIELDS) | {
+    "auto_batch_size", "max_batch_size", "batch_probe_safety_fraction",
+    "gradient_checkpointing", "task_prefix", "text_only_backbone",
+    "trust_remote_code", "fix_mistral_regex", "readout_hidden_size",
+    "lora_exclude_modules", "resume_checkpoint",
+}
+
+
+def _continuation_config(model, parent_config=None, custom_config_path=None, explicit_overrides=None):
+    """Apply continuation recipe precedence: defaults, parent, explicit YAML, CLI/UI."""
+    cfg = _model_cfg(model)
+    cfg.update({key: value for key, value in (parent_config or {}).items()
+                if key in CONTINUATION_CONFIG_FIELDS})
+    if custom_config_path:
+        custom = _read_yaml(custom_config_path)
+        if custom.get("model", model) != model:
+            raise ValueError(f"continuation config must declare model {model!r}")
+        cfg.update({key: value for key, value in custom.items() if not key.startswith("_")})
+        cfg["_config_path"] = str(custom_config_path)
+    cfg.update(explicit_overrides or {})
+    cfg["model"] = model
+    _validate_training_overrides(model, cfg)
+    return cfg
+
+
+def _matching_continuation_source(model, dataset, validation_dataset, data_dir,
+                                  artifact_dir, from_experiment=None):
+    train, valid = _training_partitions(dataset, validation_dataset, data_dir)
+    profile = json.loads(_profile_path(Path(data_dir), dataset).read_text())
+    candidates = []
+    manifests_dir = Path(artifact_dir) / "predictions"
+    for path in manifests_dir.glob(f"{model}_{dataset}_*_manifest.json"):
+        record = json.loads(path.read_text())
+        if (record.get("model") == model and _continuation_source_matches(
+                record, dataset, validation_dataset, train, valid, profile.get("dataset_sha256"))):
+            candidates.append((path, record))
+    if from_experiment:
+        candidates = [(path, item) for path, item in candidates
+                      if item.get("experiment_id") == from_experiment]
+    if not candidates:
+        raise FileNotFoundError(f"no matching {model} validation run found to continue")
+    return max(candidates, key=lambda item: item[1].get("created_at_utc", ""))
 
 
 def _validate_training_overrides(model, cfg):
@@ -991,6 +1104,10 @@ def _validate_training_overrides(model, cfg):
     for name in ("inference_batch_size",):
         if name in cfg and int(cfg[name]) < 1:
             raise ValueError(f"{name} must be positive")
+    if "max_batch_size" in cfg and int(cfg["max_batch_size"]) < 1:
+        raise ValueError("max_batch_size must be positive")
+    if "batch_probe_safety_fraction" in cfg and not 0 < float(cfg["batch_probe_safety_fraction"]) <= 1:
+        raise ValueError("batch_probe_safety_fraction must be in (0, 1]")
     if "calibration_max_samples" in cfg and int(cfg["calibration_max_samples"]) < 1:
         raise ValueError("calibration_max_samples must be positive")
     if cfg.get("lr_scheduler_type") not in {None, "linear", "cosine", "constant", "epoch_decay"}:
@@ -1039,45 +1156,33 @@ def _confirm_training_config(model, cfg, *, accept_defaults=False):
 
 
 def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifacts",
-                  registry_path="experiments/registry.sqlite", *, from_experiment=None, epochs=4, seed=2026,
+                  registry_path="experiments/registry.sqlite", *, from_experiment=None, epochs=None, seed=2026,
                   config_path=None, config_overrides=None, model="qwen06", validation_dataset="v0",
                   refresh_prediction=False, refresh_checkpoint_catalog=False):
     """Continue a saved Qwen LoRA model and validate after every additional epoch."""
     from .model_factory import train_qwen_lora_fold
     if model not in {"qwen06", "qwen17", "qwen4", "qwen8"}:
         raise ValueError("continue-qwen supports qwen06, qwen17, qwen4, and qwen8")
-    cfg = _model_cfg(model, config_path)
-    if config_overrides:
-        cfg.update(config_overrides)
-        _validate_training_overrides(model, cfg)
     train, valid = _training_partitions(dataset, validation_dataset, data_dir)
     rows = pd.concat([train, valid], ignore_index=True)
     train_hash, valid_hash = _partition_sha256(train), _partition_sha256(valid)
     training_profile = json.loads(_profile_path(Path(data_dir), dataset).read_text())
     profile = {"dataset_sha256": train_hash, "split_sha256": _sha([dataset, train_hash, validation_dataset, valid_hash])}
     manifests_dir = Path(artifact_dir)/"predictions"
-    candidates = []
-    for path in manifests_dir.glob(f"{model}_{dataset}_*_manifest.json"):
-        record = json.loads(path.read_text())
-        if (record.get("model") == model and _continuation_source_matches(
-                record, dataset, validation_dataset, train, valid,
-                training_profile.get("dataset_sha256"))):
-            candidates.append((path, record))
-    if from_experiment:
-        candidates = [(p, m) for p, m in candidates if m.get("experiment_id") == from_experiment]
-    if not candidates: raise FileNotFoundError("no matching Qwen validation run found to continue")
-    source_path, source = max(candidates, key=lambda item: item[1].get("created_at_utc", ""))
+    source_path, source = _matching_continuation_source(
+        model, dataset, validation_dataset, data_dir, artifact_dir, from_experiment)
     source_checkpoint = _resolve_checkpoint_path(source.get("best_checkpoint_path") or
                                                   source["checkpoint_path"], artifact_dir)
     if not source_checkpoint.is_dir(): raise FileNotFoundError(f"Qwen continuation checkpoint not found: {source_checkpoint}")
+    explicit = dict(config_overrides or {})
+    if epochs is not None:
+        explicit["epochs"] = epochs
+    cfg = _continuation_config(model, source.get("config", {}), config_path, explicit)
+    epochs = int(cfg.get("epochs", 4))
     # A continuation must use the exact base model revision that produced its
     # adapter, even if the local model config has since changed.
     cfg["checkpoint"] = source.get("checkpoint_id", cfg["checkpoint"])
     cfg["revision"] = source.get("model_revision", cfg["revision"])
-    source_config = source.get("config", {})
-    for key in ("inference_batch_size", "calibration_enabled"):
-        if key not in (config_overrides or {}) and key in source_config:
-            cfg[key] = source_config[key]
     source_quantization = source.get("quantization", source.get("config", {}).get("quantization", "none"))
     configured_quantization = cfg.get("quantization", "none")
     if source_quantization != configured_quantization:
@@ -1183,6 +1288,8 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         "batch_size_probe":result.get("batch_size_probe"),
         "epoch_checkpoints":result.get("epoch_checkpoints",[]),
         "checkpoint_path":str(checkpoint),"prediction_path":str(prediction_path),"metrics":metrics,
+        "selected_checkpoint_path":result.get("selected_checkpoint_path") or result.get("best_checkpoint_path"),
+        "best_checkpoint_path":result.get("best_checkpoint_path") or result.get("selected_checkpoint_path"),
         "created_at_utc":pd.Timestamp.now(tz="UTC").isoformat()}
     manifest_path=pred_dir/f"{experiment_id}_manifest.json";manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
     (pred_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2)+"\n")
@@ -1218,14 +1325,15 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
     manifest["runtime_breakdown"]=runtime_breakdown
     manifest_path.write_text(json.dumps(manifest,indent=2,default=str)+"\n")
     (pred_dir/f"{experiment_id}_metrics.json").write_text(json.dumps(manifest,indent=2,default=str)+"\n")
+    _append_v2_checkpoint_trust(manifest, manifest_path)
     return manifest
 
 
 def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processed",
                      artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *,
-                     from_experiment, epochs=10, learning_rate=5e-5, validation_dataset="v0",
-                     learning_rate_decay=0.9, seed=2026, optimizer="adamw_torch",
-                     weight_decay=0.0, refresh_prediction=False,
+                     from_experiment, epochs=None, learning_rate=None, validation_dataset="v0",
+                     learning_rate_decay=None, seed=2026, optimizer=None,
+                     weight_decay=None, config_path=None, config_overrides=None, refresh_prediction=False,
                      refresh_checkpoint_catalog=False):
     """Validate a saved encoder checkpoint, continue training, and keep the best epoch.
 
@@ -1234,8 +1342,6 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
     """
     if model != "ultrabert380":
         raise ValueError("continue-encoder currently supports only ultrabert380; use the model-specific continuation path for LoRA models")
-    if epochs < 1 or learning_rate <= 0 or not 0 < learning_rate_decay <= 1:
-        raise ValueError("epochs, learning_rate, and learning_rate_decay must be positive; decay must be <= 1")
     manifests_dir = Path(artifact_dir) / "predictions"
     source_path = manifests_dir / f"{from_experiment}_manifest.json"
     if not source_path.is_file():
@@ -1270,30 +1376,44 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         raise ValueError("source checkpoint class labels differ from the target dataset")
 
     source_key = hashlib.sha256(from_experiment.encode()).hexdigest()[:8]
-    cfg = source.get("config", {})
+    explicit = dict(config_overrides or {})
+    for key, value in (("epochs", epochs), ("learning_rate", learning_rate),
+                       ("learning_rate_decay", learning_rate_decay), ("optimizer", optimizer),
+                       ("weight_decay", weight_decay)):
+        if value is not None:
+            explicit[key] = value
+    cfg = _continuation_config(model, source.get("config", {}), config_path, explicit)
+    epochs = int(cfg.get("epochs", 10))
+    learning_rate = float(cfg.get("learning_rate", 5e-5))
+    learning_rate_decay = float(cfg.get("learning_rate_decay", 0.9))
+    optimizer = str(cfg.get("optimizer", "adamw_torch"))
+    weight_decay = float(cfg.get("weight_decay", 0.0))
+    if epochs < 1 or learning_rate <= 0 or not 0 < learning_rate_decay <= 1:
+        raise ValueError("epochs, learning_rate, and learning_rate_decay must be positive; decay must be <= 1")
     config_snapshot = {
+        **{key: value for key, value in cfg.items() if not key.startswith("_")},
         "model": model, "dataset": dataset, "training_dataset": dataset,
         "continued_from_experiment": from_experiment,
         "epochs": int(epochs), "learning_rate": float(learning_rate),
         "learning_rate_decay": float(learning_rate_decay), "seed": int(seed),
         "optimizer": optimizer, "weight_decay": float(weight_decay),
         "early_stopping_patience": cfg.get("early_stopping_patience", 2),
-        "batch_size": int(source.get("config", {}).get("batch_size", 8)),
-        "auto_batch_size": bool(source.get("config", {}).get("auto_batch_size", False)),
-        "max_batch_size": int(source.get("config", {}).get("max_batch_size", 1024)),
-        "batch_probe_safety_fraction": float(source.get("config", {}).get("batch_probe_safety_fraction", 0.95)),
-        "gradient_accumulation_steps": int(source.get("config", {}).get("gradient_accumulation_steps", 1)),
+        "batch_size": int(cfg.get("batch_size", 8)),
+        "auto_batch_size": bool(cfg.get("auto_batch_size", False)),
+        "max_batch_size": int(cfg.get("max_batch_size", 1024)),
+        "batch_probe_safety_fraction": float(cfg.get("batch_probe_safety_fraction", 0.95)),
+        "gradient_accumulation_steps": int(cfg.get("gradient_accumulation_steps", 1)),
         "max_length": _dataset_max_length(model, {
             **cfg, "checkpoint": str(source_checkpoint), "revision": None,
             "task_prefix": "", "training_mode": "full", "trust_remote_code": True,
         }, pd.concat([train, valid], ignore_index=True), checkpoint=str(source_checkpoint), revision=None),
-        "warmup_ratio": float(source.get("config", {}).get("warmup_ratio", 0.0)),
-        "lr_scheduler_type": source.get("config", {}).get("lr_scheduler_type", "linear"),
+        "warmup_ratio": float(cfg.get("warmup_ratio", 0.0)),
+        "lr_scheduler_type": cfg.get("lr_scheduler_type", "linear"),
         "baseline_validation_before_training": True,
         "checkpoint_selection_metric": "balanced_accuracy",
         "validation_dataset": validation_dataset,
         "checkpoint_selection": "highest_validation_balanced_accuracy",
-        "save_epoch_checkpoints": bool(source.get("config", {}).get("save_epoch_checkpoints", False)),
+        "save_epoch_checkpoints": bool(cfg.get("save_epoch_checkpoints", False)),
         "calibration_max_samples": int(cfg.get("calibration_max_samples", 5000)),
         "calibration_full_dataset": bool(cfg.get("calibration_full_dataset", False)),
         "calibration_seed": int(cfg.get("calibration_seed", seed)),
@@ -1307,7 +1427,10 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
     prediction_path = manifests_dir / f"{experiment_id}_validation.parquet"
     manifest_path = manifests_dir / f"{experiment_id}_manifest.json"
     if manifest_path.exists() and prediction_path.exists():
-        return json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text())
+        _register_completed_manifest(manifest, registry_path)
+        _append_v2_checkpoint_trust(manifest, manifest_path)
+        return manifest
     if run_dir.exists():
         raise FileExistsError(f"incomplete continuation run exists at {run_dir}")
 
@@ -1322,6 +1445,9 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         learning_rate_decay=learning_rate_decay, seed=seed,
         optimizer=optimizer, weight_decay=weight_decay,
         gradient_accumulation_steps=config_snapshot["gradient_accumulation_steps"],
+        auto_batch_size=config_snapshot["auto_batch_size"],
+        max_batch_size=config_snapshot["max_batch_size"],
+        batch_probe_safety_fraction=config_snapshot["batch_probe_safety_fraction"],
         validation_labels=valid.model.tolist(),
         select_best_checkpoint=True, local_files_only=True,
         early_stopping_patience=cfg.get("early_stopping_patience", 2),
@@ -1396,17 +1522,14 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "validation_loss_raw": result.get("validation_loss_raw"),
         "validation_loss_calibrated": result.get("validation_loss_calibrated"),
         "checkpoint_path": str(checkpoint), "best_checkpoint_path": result["best_checkpoint_path"],
+        "selected_checkpoint_path": result.get("selected_checkpoint_path") or result["best_checkpoint_path"],
         "prediction_path": str(prediction_path), "metrics": metrics,
         "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     (manifests_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    Registry(registry_path).add(experiment_id, model, "validation", config_snapshot, metrics,
-        dataset_hash=profile["dataset_sha256"], split_hash=profile["split_sha256"],
-        model_revision=source.get("model_revision"), code_revision=manifest["code_revision"],
-        seed=seed, runtime_seconds=manifest["fit_seconds"], artifact_path=str(prediction_path),
-        config_hash=config_hash,
-        description=f"Continued {model} from {from_experiment} for {epochs} epochs after baseline validation.")
+    manifest["description"] = f"Continued {model} from {from_experiment} for {epochs} epochs after baseline validation."
+    _register_completed_manifest(manifest, registry_path)
     runtime_breakdown["manifest_prediction_export_seconds"] = time.perf_counter() - export_started
     runtime_breakdown["manifest_export_seconds"] = time.perf_counter() - manifest_export_started
     manifest["runtime_breakdown"] = runtime_breakdown
@@ -1435,6 +1558,7 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
     manifest["runtime_breakdown"] = runtime_breakdown
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
     (manifests_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+    _append_v2_checkpoint_trust(manifest, manifest_path)
     return manifest
 
 
@@ -1618,12 +1742,54 @@ def restart_mvp(*, models=None, seed=2026, bootstrap_replicates=2000, data_confi
                 feature_config="configs/features/default.yaml", registry_path="experiments/registry.sqlite"):
     """Clear generated experiment state and rebuild the complete MVP from raw CSVs."""
     root = Path(__file__).resolve().parents[1]
+    data_cfg = _read_yaml(root / data_config)
+    feature_cfg_path = root / feature_config
+    if not feature_cfg_path.is_file():
+        raise FileNotFoundError(f"feature config not found: {feature_cfg_path}")
+    feature_cfg = _read_yaml(feature_cfg_path)
+    selected = list(models or DEFAULT_MVP_MODELS)
+    unknown = set(selected) - set(MODEL_CONFIGS)
+    if unknown:
+        raise ValueError(f"unknown restart model(s): {sorted(unknown)}")
+    for name in selected:
+        _model_cfg(name, root / MODEL_CONFIGS[name])
+    train_path = Path(data_cfg["train_path"])
+    test_path = Path(data_cfg["test_path"]) if data_cfg.get("test_path") else None
+    train_path = train_path if train_path.is_absolute() else root / train_path
+    test_path = test_path if test_path is None or test_path.is_absolute() else root / test_path
+    configured_output = Path(data_cfg.get("output_dir", "data/processed"))
+    configured_output = configured_output if configured_output.is_absolute() else root / configured_output
+    if configured_output.resolve() != (root / "data/processed").resolve():
+        raise ValueError("restart data output must be data/processed; generated state has not been cleared")
+    if data_cfg.get("dataset_version", "v0") != "v0":
+        raise ValueError("restart only rebuilds the official V0 dataset; generated state has not been cleared")
+    if not train_path.is_file() or (test_path is not None and not test_path.is_file()):
+        raise FileNotFoundError("restart input CSV is missing; generated state has not been cleared")
+    raw_train = pd.read_csv(train_path, dtype={"id": "string", "prompt_id": "string", "model": "string"})
+    raw_test = (pd.read_csv(test_path, dtype={"id": "string"}) if test_path is not None else None)
+    errors = validate_data(raw_train, raw_test, expected_classes=data_cfg.get("expected_classes", 18))
+    if errors:
+        raise ValueError("invalid restart inputs; generated state has not been cleared:\n- " + "\n- ".join(errors))
+    assignments = make_splits(raw_train, seed=seed,
+        validation_fraction=data_cfg.get("validation_fraction", .2),
+        candidates=data_cfg.get("split_candidates", 1000))
+    if set(assignments.split.astype(str)) != {"train", "validation"}:
+        raise ValueError("restart split plan is incomplete; generated state has not been cleared")
+    assigned = assignments
+    expected_labels = set(raw_train.model.astype(str))
+    for role in ("train", "validation"):
+        partition = assigned[assigned.split.eq(role)]
+        if set(partition.model.astype(str)) != expected_labels:
+            raise ValueError(f"restart {role} split omits labels; generated state has not been cleared")
     processed = (root / "data/processed").resolve()
     artifacts = (root / "artifacts").resolve()
     protected = [(root / "data/raw").resolve(), (Path.home()/".cache/huggingface").resolve()]
     for target in (processed, artifacts):
         if target in protected or root not in target.parents:
             raise RuntimeError(f"refusing to clean unexpected path: {target}")
+    registry = (root / registry_path).resolve()
+    if root not in registry.parents or registry in protected:
+        raise RuntimeError(f"refusing to remove unexpected registry path: {registry}")
     for target in (processed, artifacts):
         if target.exists():
             for child in target.iterdir():
@@ -1631,21 +1797,18 @@ def restart_mvp(*, models=None, seed=2026, bootstrap_replicates=2000, data_confi
                 else: shutil.rmtree(child)
         else:
             target.mkdir(parents=True)
-    registry = (root / registry_path).resolve()
-    if root not in registry.parents or registry in protected:
-        raise RuntimeError(f"refusing to remove unexpected registry path: {registry}")
     for suffix in ("", "-wal", "-shm"):
         Path(str(registry) + suffix).unlink(missing_ok=True)
-    data_cfg = _read_yaml(root / data_config)
     data_cfg["seed"] = seed
     profile = prepare(root / data_cfg["train_path"], root / data_cfg["output_dir"],
         root / data_cfg["test_path"] if data_cfg.get("test_path") else None,
         seed=seed, validation_fraction=data_cfg.get("validation_fraction", .2),
         candidates=data_cfg.get("split_candidates", 1000), expected_classes=data_cfg.get("expected_classes", 18))
-    feature_report = build_features("v0", root / "data/processed", root / feature_config, root / "artifacts/features")
-    selected = models or list(DEFAULT_MVP_MODELS)
+    feature_report = build_features("v0", root / "data/processed", feature_cfg_path,
+        root / "artifacts/features", validation_dataset="v0")
     model_reports = [train_models("v0", name, root/"data/processed", root/"artifacts", registry,
-        config_path=root/MODEL_CONFIGS[name], feature_config_path=root/feature_config if name == "svc" else None, seed=seed)
+        config_path=root/MODEL_CONFIGS[name], feature_config_path=root/feature_config if name == "svc" else None,
+        seed=seed, validation_dataset="v0")
         for name in selected]
     ensemble_report = evaluate_ensembles("v0", root/"artifacts", registry, bootstrap_replicates=bootstrap_replicates,
         seed=seed, model_names=selected)
@@ -1671,15 +1834,16 @@ def main(argv=None):
     m=sub.add_parser("models").add_subparsers(dest="action",required=True)
     t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v1");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--validation-dataset",default="v0",help="dataset artifact used in full for validation (default: v0)");t.add_argument("--refresh-prediction",action="store_true",help="refresh the active prediction roster if its inputs changed");t.add_argument("--refresh-checkpoint-catalog",action="store_true",help="refresh the checkpoint-label catalog after training");t.add_argument("--skip-prediction-refresh",action="store_true",help=argparse.SUPPRESS);t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
     cq=m.add_parser("continue-qwen",help="continue the latest Qwen LoRA checkpoint and validate after every epoch")
-    cq.add_argument("--dataset",default="v1");cq.add_argument("--validation-dataset",default="v0");cq.add_argument("--epochs",type=int,default=4);cq.add_argument("--seed",type=int,default=2026)
+    cq.add_argument("--dataset",default="v1");cq.add_argument("--validation-dataset",default="v0");cq.add_argument("--epochs",type=int);cq.add_argument("--seed",type=int,default=2026)
     cq.add_argument("--model",choices=["qwen06","qwen17","qwen4","qwen8"],default="qwen06")
     cq.add_argument("--from-experiment");cq.add_argument("--config");cq.add_argument("--accept-config-defaults",action="store_true")
     cq.add_argument("--refresh-prediction",action="store_true");cq.add_argument("--refresh-checkpoint-catalog",action="store_true")
     ce=m.add_parser("continue-encoder",help="baseline-validate and continue a saved UltraBERT checkpoint")
     ce.add_argument("--model",choices=["ultrabert380"],default="ultrabert380")
     ce.add_argument("--dataset",default="v1");ce.add_argument("--validation-dataset",default="v0");ce.add_argument("--from-experiment",required=True)
-    ce.add_argument("--epochs",type=int,default=10);ce.add_argument("--learning-rate",type=float,default=5e-5)
-    ce.add_argument("--learning-rate-decay",type=float,default=0.9);ce.add_argument("--seed",type=int,default=2026)
+    ce.add_argument("--epochs",type=int);ce.add_argument("--learning-rate",type=float)
+    ce.add_argument("--learning-rate-decay",type=float);ce.add_argument("--seed",type=int,default=2026)
+    ce.add_argument("--config")
     ce.add_argument("--data-dir",default="data/processed");ce.add_argument("--artifact-dir",default="artifacts")
     ce.add_argument("--registry",default="experiments/registry.sqlite");ce.add_argument("--accept-config-defaults",action="store_true")
     ce.add_argument("--refresh-prediction",action="store_true");ce.add_argument("--refresh-checkpoint-catalog",action="store_true")
@@ -1868,23 +2032,33 @@ def main(argv=None):
             batch_size=a.batch_size,n_splits=a.n_splits,seed=a.seed,
             refresh_features=a.refresh_features)
     elif a.command=="models" and a.action=="continue-qwen":
-        cfg = _model_cfg(a.model, a.config); cfg["epochs"] = a.epochs
+        _, parent = _matching_continuation_source(a.model, a.dataset, a.validation_dataset,
+            "data/processed", "artifacts", a.from_experiment)
+        explicit = {"epochs": a.epochs} if a.epochs is not None else {}
+        cfg = _continuation_config(a.model, parent.get("config", {}), a.config, explicit)
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
+        effective = {**cfg, **overrides}
         result=continue_qwen(a.dataset,validation_dataset=a.validation_dataset,from_experiment=a.from_experiment,
-            epochs=int(overrides.get("epochs", a.epochs)),seed=a.seed,config_path=a.config,
-            config_overrides=overrides,model=a.model,
+            epochs=int(effective["epochs"]),seed=a.seed,config_path=a.config,
+            config_overrides=effective,model=a.model,
             refresh_prediction=a.refresh_prediction,
             refresh_checkpoint_catalog=a.refresh_checkpoint_catalog)
     elif a.command=="models" and a.action=="continue-encoder":
-        cfg = _model_cfg(a.model); cfg.update({"epochs":a.epochs,"learning_rate":a.learning_rate,
-                                                "learning_rate_decay":a.learning_rate_decay})
+        _, parent = _matching_continuation_source(a.model, a.dataset, a.validation_dataset,
+            a.data_dir, a.artifact_dir, a.from_experiment)
+        explicit={key:value for key,value in (("epochs",a.epochs),("learning_rate",a.learning_rate),
+            ("learning_rate_decay",a.learning_rate_decay)) if value is not None}
+        cfg = _continuation_config(a.model, parent.get("config", {}), a.config, explicit)
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
+        effective = {**cfg, **overrides}
         result=continue_encoder(a.dataset,a.model,a.data_dir,a.artifact_dir,a.registry,
-            validation_dataset=a.validation_dataset,from_experiment=a.from_experiment,epochs=int(overrides.get("epochs",a.epochs)),
-            learning_rate=float(overrides.get("learning_rate",a.learning_rate)),
-            learning_rate_decay=float(overrides.get("learning_rate_decay",a.learning_rate_decay)),seed=a.seed,
-            optimizer=overrides.get("optimizer",cfg.get("optimizer","adamw_torch")),
-            weight_decay=float(overrides.get("weight_decay",cfg.get("weight_decay",0.0))),
+            validation_dataset=a.validation_dataset,from_experiment=a.from_experiment,
+            epochs=int(effective.get("epochs",10)),
+            learning_rate=float(effective.get("learning_rate",5e-5)),
+            learning_rate_decay=float(effective.get("learning_rate_decay",0.9)),seed=a.seed,
+            optimizer=effective.get("optimizer","adamw_torch"),
+            weight_decay=float(effective.get("weight_decay",0.0)),config_path=a.config,
+            config_overrides=effective,
             refresh_prediction=a.refresh_prediction,
             refresh_checkpoint_catalog=a.refresh_checkpoint_catalog)
     elif a.command=="ensemble": result=evaluate_ensembles(a.dataset,a.artifact_dir,bootstrap_replicates=a.bootstrap_replicates,model_names=a.models,force=a.force)

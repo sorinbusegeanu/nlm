@@ -2,7 +2,8 @@
 from __future__ import annotations
 import numpy as np
 import pandas as pd
-from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score, log_loss, recall_score
+from sklearn.metrics import (balanced_accuracy_score, confusion_matrix, f1_score,
+                             log_loss, precision_score, recall_score)
 
 
 def evaluate(y_true, scores, classes, probabilities=None):
@@ -17,6 +18,8 @@ def evaluate(y_true, scores, classes, probabilities=None):
     result = {
         "balanced_accuracy": float(balanced_accuracy_score(y_true, pred)),
         "macro_f1": float(f1_score(y_true, pred, labels=classes, average="macro", zero_division=0)),
+        "per_class_precision": {str(c): float(p) for c, p in zip(
+            classes, precision_score(y_true, pred, labels=classes, average=None, zero_division=0))},
         "per_class_recall": {str(c): float(r) for c, r in zip(classes, recall_score(y_true, pred, labels=classes, average=None, zero_division=0))},
         "confusion_matrix": confusion_matrix(y_true, pred, labels=classes).tolist(),
         "classes": classes,

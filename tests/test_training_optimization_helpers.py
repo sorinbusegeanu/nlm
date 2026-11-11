@@ -55,6 +55,18 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertEqual(len(first), 5000)
         self.assertEqual(set(labels[first]), {"a", "b", "c", "d"})
 
+    def test_ragged_tokenization_cache_preserves_row_order_and_invalidates_mismatches(self):
+        rows = [{"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]},
+                {"input_ids": [4], "attention_mask": [1]}]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "tokens.npz"
+            model_factory._write_ragged_token_cache(path, "content-key", rows)
+            loaded = model_factory._read_ragged_token_cache(path, "content-key", 2)
+            self.assertEqual([value.tolist() for value in loaded["input_ids"]], [[1, 2, 3], [4]])
+            self.assertEqual([value.tolist() for value in loaded["attention_mask"]], [[1, 1, 1], [1]])
+            self.assertIsNone(model_factory._read_ragged_token_cache(path, "different-key", 2))
+            self.assertIsNone(model_factory._read_ragged_token_cache(path, "content-key", 3))
+
     @unittest.skipUnless(_torch_available(), "PyTorch grouped inference ordering check")
     def test_length_grouped_inference_restores_original_row_order(self):
         import torch
@@ -133,9 +145,35 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         for key, value in model.state_dict().items():
             torch.testing.assert_close(value.cpu(), expected[key])
 
+    def test_ultrabert_restores_only_when_selected_epoch_precedes_last_validation(self):
+        self.assertFalse(model_factory._should_restore_selected_epoch(5, 5))
+        self.assertTrue(model_factory._should_restore_selected_epoch(3, 5))
+
     def test_catboost_call_signature_has_no_unsupported_epoch_checkpoint_argument(self):
         self.assertNotIn("save_epoch_checkpoints",
                          inspect.signature(model_factory.train_catboost_stylometry).parameters)
+
+    def test_pipeline_forwards_epoch_checkpoints_and_frozen_inference_batch(self):
+        rows = pd.DataFrame({"id": ["1", "2"], "prompt_id": ["p1", "p2"],
+            "text": ["text one", "text two"], "model": ["a", "b"]})
+        encoder_calls, frozen_calls = {}, {}
+        def fake_encoder(*args, **kwargs):
+            encoder_calls.update(kwargs)
+            return {"scores": np.zeros((2, 2)), "probabilities": np.full((2, 2), .5)}
+        def fake_frozen(*args, **kwargs):
+            frozen_calls.update(kwargs)
+            return {"scores": np.zeros((2, 2)), "probabilities": np.full((2, 2), .5)}
+        with patch.object(pipeline, "train_encoder_fold", side_effect=fake_encoder), \
+             patch.object(pipeline, "train_frozen_backbone_fold", side_effect=fake_frozen):
+            pipeline._train_fold("ultrabert380", rows, rows, ["a", "b"],
+                {"checkpoint": "base", "revision": "a" * 40, "max_length": 8,
+                 "save_epoch_checkpoints": True}, Path("/tmp/encoder"), 1, "validation", Path("/tmp/cache"))
+            pipeline._train_fold("embeddinggemma2", rows, rows, ["a", "b"],
+                {"training_mode": "frozen", "checkpoint": "base", "revision": "b" * 40,
+                 "max_length": 8, "batch_size": 2, "inference_batch_size": 11},
+                Path("/tmp/frozen"), 1, "validation", Path("/tmp/cache"))
+        self.assertTrue(encoder_calls["save_epoch_checkpoints"])
+        self.assertEqual(frozen_calls["inference_batch_size"], 11)
 
     def test_catboost_disabled_temperature_skips_calibration_prediction(self):
         import sys
@@ -340,6 +378,8 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
             profile = data / "dataset_profile_v1.json"
             profile.write_text(json.dumps({"dataset_sha256": "train-hash"}))
             calls = {}
+            selected_checkpoint = root / "selected"
+            selected_checkpoint.mkdir()
             def fake_result(**extra):
                 return {"scores": scores, "probabilities": probabilities,
                     "fit_seconds": .1, "inference_seconds": 0.,
@@ -349,7 +389,7 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                     "best_validation_accuracy": 1., "best_validation_balanced_accuracy": 1.,
                     "checkpoint_selection_metric": "validation_balanced_accuracy",
                     "checkpoint_scoring_method": "test", "early_stopping": None,
-                    "best_checkpoint_path": str(root / "selected"),
+                    "best_checkpoint_path": str(selected_checkpoint),
                     "baseline_validation_metrics": {"accuracy": 1.},
                     "requested_batch_size": 1, "effective_batch_size": 1,
                     "requested_inference_batch_size": 7, "effective_inference_batch_size": 7,
@@ -360,7 +400,9 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                 "checkpoint_path": str(qwen_checkpoint), "best_checkpoint_path": str(qwen_checkpoint),
                 "checkpoint_id": "Qwen/Qwen3-0.6B", "model_revision": "rev",
                 "classes": ["a", "b"], "config": {"batch_size": 1, "epochs": 1,
-                    "quantization": "none", "calibration_enabled": False, "inference_batch_size": 7},
+                    "quantization": "none", "calibration_enabled": False, "inference_batch_size": 7,
+                    "auto_batch_size": True, "max_batch_size": 32,
+                    "gradient_checkpointing": True},
                 "created_at_utc": "2026-01-01"}
             (predictions / "qwen06_v1_qwen-source_manifest.json").write_text(json.dumps(qwen_source))
             encoder_checkpoint = artifacts / "runs" / "encoder-source" / "checkpoint"
@@ -369,7 +411,10 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                 "checkpoint_path": str(encoder_checkpoint), "best_checkpoint_path": str(encoder_checkpoint),
                 "checkpoint_id": "ultrabert", "model_revision": "rev", "classes": ["a", "b"],
                 "config": {"batch_size": 2, "inference_batch_size": 6,
-                    "calibration_enabled": False, "epochs": 1}, "created_at_utc": "2026-01-01"}
+                    "calibration_enabled": False, "epochs": 1,
+                    "auto_batch_size": True, "max_batch_size": 64,
+                    "batch_probe_safety_fraction": 0.8}, "created_at_utc": "2026-01-01"}
+            (predictions / "ultrabert380_v1_encoder-source_manifest.json").write_text(json.dumps(encoder_source))
             (predictions / "encoder-source_manifest.json").write_text(json.dumps(encoder_source))
 
             def fake_qwen(*args, **kwargs):
@@ -377,6 +422,7 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                 return fake_result()
             def fake_encoder(*args, **kwargs):
                 calls["encoder"] = kwargs
+                Path(kwargs["output_dir"]).mkdir(parents=True, exist_ok=True)
                 return fake_result()
             with patch.object(pipeline, "_training_partitions", return_value=(train, valid)), \
                     patch.object(pipeline, "_profile_path", return_value=profile), \
@@ -387,14 +433,140 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                     patch.object(pipeline, "Registry"):
                 pipeline.continue_qwen("v1", data_dir=str(data), artifact_dir=str(artifacts),
                     registry_path=str(root / "registry.sqlite"), from_experiment="qwen-source",
-                    model="qwen06", epochs=1)
+                    model="qwen06", epochs=1,
+                    config_overrides={"batch_size": 3, "inference_batch_size": 5,
+                                      "calibration_enabled": True})
                 pipeline.continue_encoder("v1", data_dir=str(data), artifact_dir=str(artifacts),
                     registry_path=str(root / "registry.sqlite"), from_experiment="encoder-source",
-                    epochs=1)
-        self.assertEqual(calls["qwen"]["inference_batch_size"], 7)
-        self.assertFalse(calls["qwen"]["calibration_enabled"])
-        self.assertEqual(calls["encoder"]["inference_batch_size"], 6)
-        self.assertFalse(calls["encoder"]["calibration_enabled"])
+                    epochs=1, config_overrides={"batch_size": 4, "inference_batch_size": 8,
+                                                "calibration_enabled": True})
+        self.assertEqual(calls["qwen"]["inference_batch_size"], 5)
+        self.assertEqual(calls["qwen"]["batch_size"], 3)
+        self.assertTrue(calls["qwen"]["calibration_enabled"])
+        self.assertTrue(calls["qwen"]["auto_batch_size"])
+        self.assertTrue(calls["qwen"]["gradient_checkpointing"])
+        self.assertEqual(calls["encoder"]["inference_batch_size"], 8)
+        self.assertEqual(calls["encoder"]["batch_size"], 4)
+        self.assertTrue(calls["encoder"]["calibration_enabled"])
+        self.assertTrue(calls["encoder"]["auto_batch_size"])
+        self.assertEqual(calls["encoder"]["max_batch_size"], 64)
+        self.assertEqual(calls["encoder"]["batch_probe_safety_fraction"], 0.8)
+
+    def test_continuation_config_precedence_parent_then_yaml_then_explicit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "custom.yaml"
+            config.write_text("model: qwen06\nlearning_rate: 0.0002\nbatch_size: 3\n")
+            cfg = pipeline._continuation_config("qwen06",
+                {"learning_rate": 0.0001, "batch_size": 2, "inference_batch_size": 7,
+                 "auto_batch_size": True}, config, {"learning_rate": 0.0003})
+        self.assertEqual(cfg["learning_rate"], 0.0003)
+        self.assertEqual(cfg["batch_size"], 3)
+        self.assertEqual(cfg["inference_batch_size"], 7)
+        self.assertTrue(cfg["auto_batch_size"])
+
+    @unittest.skipUnless(_torch_available(), "PyTorch simulated evaluation OOM")
+    def test_epoch_evaluation_oom_retries_only_eval_batch_size(self):
+        import torch
+        current = {"eval": 8, "train": 6, "accumulation": 3}
+        attempts = []
+        def evaluate():
+            attempts.append(current["eval"])
+            if current["eval"] > 2:
+                raise RuntimeError("CUDA out of memory")
+            return {"eval_balanced_accuracy": .5}
+        metrics, effective, retries = model_factory._evaluate_with_oom_batch_fallback(
+            evaluate, get_batch_size=lambda: current["eval"],
+            set_batch_size=lambda value: current.__setitem__("eval", value),
+            empty_cache=lambda: None)
+        self.assertEqual(attempts, [8, 4, 2])
+        self.assertEqual(metrics["eval_balanced_accuracy"], .5)
+        self.assertEqual((effective, retries), (2, 2))
+        self.assertEqual((current["train"], current["accumulation"]), (6, 3))
+
+    @unittest.skipUnless(_torch_available(), "PyTorch late-pass inference OOM")
+    def test_cached_inference_keeps_completed_chunks_when_late_batch_ooms(self):
+        import torch
+        class Dataset(torch.utils.data.Dataset):
+            lengths = [5, 1, 2, 3, 4, 6]
+            def __len__(self): return len(self.lengths)
+            def __getitem__(self, index):
+                return {"input_ids": torch.tensor([index + 1] * self.lengths[index]),
+                        "attention_mask": torch.ones(self.lengths[index], dtype=torch.long)}
+        class Model(torch.nn.Module):
+            def __init__(self): super().__init__(); self.scored = []
+            def forward(self, input_ids, attention_mask):
+                values = input_ids[:, 0].tolist()
+                if len(values) > 1 and max(values) >= 4:
+                    raise RuntimeError("CUDA out of memory in late batch")
+                self.scored.extend(values)
+                value = input_ids[:, 0].float()
+                return SimpleNamespace(logits=torch.stack((value, -value), dim=1))
+        def collate(rows):
+            ids = torch.nn.utils.rnn.pad_sequence([row["input_ids"] for row in rows], batch_first=True)
+            mask = torch.nn.utils.rnn.pad_sequence([row["attention_mask"] for row in rows], batch_first=True)
+            return {"input_ids": ids, "attention_mask": mask}
+        model = Model()
+        scores, _ = model_factory._predict_cached_dataset(model, Dataset(), batch_size=2,
+            data_collator=collate, device=torch.device("cpu"), return_info=True)
+        np.testing.assert_array_equal(scores[:, 0], np.arange(1, 7))
+        self.assertEqual(sorted(model.scored), list(range(1, 7)))
+        self.assertEqual(len(model.scored), 6)
+
+    def test_selected_epoch_prediction_links_to_existing_selected_checkpoint(self):
+        valid = pd.DataFrame({"id": ["v1", "v2"], "prompt_id": ["p1", "p2"],
+                              "model": ["a", "b"]})
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint = Path(temp) / "selected"
+            checkpoint.mkdir()
+            result = {"validation_predictions_by_epoch": [{"epoch": 1,
+                        "scores": np.asarray([[2., 0.], [0., 2.]])}],
+                      "best_epoch": 1, "selected_checkpoint_path": str(checkpoint)}
+            records = pipeline._save_epoch_validation_predictions(result, valid, ["a", "b"],
+                Path(temp), "experiment")
+            self.assertEqual(records[0]["checkpoint_path"], str(checkpoint))
+            self.assertTrue(Path(records[0]["checkpoint_path"]).is_dir())
+
+    def test_registry_failure_retry_repairs_once_from_validated_artifacts(self):
+        from src.registry import Registry
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prediction = root / "predictions.parquet"
+            prediction.write_bytes(b"validated predictions")
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            manifest = {"experiment_id": "run-1", "model": "svc", "split": "validation",
+                "prediction_path": str(prediction),
+                "prediction_sha256": __import__("hashlib").sha256(prediction.read_bytes()).hexdigest(),
+                "checkpoint_path": str(checkpoint), "config": {"C": 1.},
+                "validation_metrics": {"balanced_accuracy": .5}, "dataset_sha256": "data",
+                "split_sha256": "split", "code_revision": "abc", "config_sha256": "cfg",
+                "fit_seconds": .1, "seed": 1}
+            registry_path = root / "registry.sqlite"
+            with patch.object(pipeline, "Registry", side_effect=RuntimeError("simulated insert failure")):
+                with self.assertRaisesRegex(RuntimeError, "simulated"):
+                    pipeline._register_completed_manifest(manifest, registry_path)
+            pipeline._register_completed_manifest(manifest, registry_path)
+            pipeline._register_completed_manifest(manifest, registry_path)
+            rows = Registry(registry_path).rows()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["experiment_id"], "run-1")
+
+    def test_qwen_large_probe_ceiling_uses_one_configured_checkpointing_probe(self):
+        calls = []
+        def fake_probe(model, dataset, **kwargs):
+            calls.append(kwargs)
+            return 3, {"enabled": True, "max_batch_size": kwargs["max_batch_size"],
+                       "selected_batch_size": 3}
+        with patch.object(model_factory, "_probe_max_batch_size", side_effect=fake_probe):
+            selected, report = model_factory._probe_lora_batch_size(
+                object(), [1] * 64, requested_batch_size=16, max_batch_size=1024,
+                safety_fraction=.9, use_bf16=True, use_fp16=False,
+                optimizer_name="adamw_torch", weight_decay=0.0,
+                gradient_checkpointing_enabled=True)
+        self.assertEqual(selected, 3)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["max_batch_size"], 1024)
+        self.assertTrue(report["gradient_checkpointing_probe_mode"])
 
     def test_standard_training_passes_full_rows_and_balanced_selection(self):
         train_rows = pd.DataFrame({"id": ["t1", "t2", "t3", "t4"],

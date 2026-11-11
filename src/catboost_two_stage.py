@@ -69,6 +69,19 @@ def _require_same_validation(stage1: pd.DataFrame, stage2: pd.DataFrame, classes
         raise ValueError("stage validation labels differ")
 
 
+def _historical_v0_partitions(v0_rows):
+    """Return the fixed historical V0 fit and validation rows."""
+    if "split" not in v0_rows:
+        raise ValueError("default two-stage training requires historical V0 split assignments")
+    train = v0_rows[v0_rows.split.astype(str).eq("train")].drop(
+        columns=["split"], errors="ignore").sort_values("id", kind="stable").reset_index(drop=True)
+    valid = v0_rows[v0_rows.split.astype(str).eq("validation")].drop(
+        columns=["split"], errors="ignore").sort_values("id", kind="stable").reset_index(drop=True)
+    if train.empty or valid.empty:
+        raise ValueError("historical V0 split must contain training and validation rows")
+    return train, valid
+
+
 def _feature_group(name: str) -> str:
     if name.startswith("base_punct_"):
         return "punctuation"
@@ -208,13 +221,20 @@ def _stage_artifact_dir(run_root, experiment, stage):
 def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, valid,
                 classes, recipe, iterations, cfg, seed, checkpoint, parent_checkpoint,
                 parent_sha256, matrices, report_dir, data_profile,
-                registry_path, code_revision, validation_dataset):
+                registry_path, code_revision, validation_dataset,
+                train_matrix_role=None, validation_matrix_role="validation"):
     selected_matrix, feature_names = _select_matrix(matrices["full"], matrices["all_names"], recipe)
     if selected_matrix.shape[1] != len(feature_names):
         raise ValueError("feature matrix width differs from recipe schema")
-    start, end = matrices["offsets"][dataset_name]
+    train_matrix_role = train_matrix_role or dataset_name
+    validation_matrix_role = validation_matrix_role or validation_dataset
+    if train_matrix_role not in matrices["offsets"]:
+        train_matrix_role = "stage1_train" if stage == "stage1" else "stage2_train"
+    if validation_matrix_role not in matrices["offsets"] and "validation" in matrices["offsets"]:
+        validation_matrix_role = "validation"
+    start, end = matrices["offsets"][train_matrix_role]
     x_train = selected_matrix[start:end]
-    valid_start, valid_end = matrices["offsets"][validation_dataset]
+    valid_start, valid_end = matrices["offsets"][validation_matrix_role]
     x_validation = selected_matrix[valid_start:valid_end]
     if len(x_train) != len(train) or len(x_validation) != len(valid):
         raise ValueError("stylometry matrix row count differs from selected data partition")
@@ -288,6 +308,13 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
     manifest_path = stage_artifact_dir / f"{experiment_id}_manifest.json"
     checkpoint_size = sum(path.stat().st_size for path in checkpoint.rglob("*") if path.is_file())
     manifest_export_started = time.perf_counter()
+    trainer_runtime = result.get("runtime_breakdown") or {}
+    calibration_inference_seconds = result.get("calibration_inference_seconds")
+    if calibration_inference_seconds is None:
+        calibration_inference_seconds = trainer_runtime.get("calibration_inference_seconds")
+    temperature_fit_seconds = result.get("temperature_fit_seconds")
+    if temperature_fit_seconds is None:
+        temperature_fit_seconds = trainer_runtime.get("temperature_fit_seconds")
     manifest = {
         "experiment_id": experiment_id, "experiment_name": experiment_name,
         "model": "catboost_stylometry", "dataset": dataset_name,
@@ -304,10 +331,10 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         "code_revision": code_revision, "seed": int(seed), "config": config,
         "config_sha256": config_hash, "fit_seconds": float(result["fit_seconds"]),
         "inference_seconds": float(result["inference_seconds"]),
-        "runtime_breakdown": {**(result.get("runtime_breakdown") or {}),
+        "runtime_breakdown": {**trainer_runtime,
             "best_checkpoint_restoration_seconds": 0.0,
-            "calibration_inference_seconds": result.get("calibration_inference_seconds"),
-            "temperature_fit_seconds": result.get("temperature_fit_seconds"),
+            "calibration_inference_seconds": calibration_inference_seconds,
+            "temperature_fit_seconds": temperature_fit_seconds,
             "final_validation_inference_seconds": float(result["inference_seconds"]),
             "checkpoint_serialization_seconds": (result.get("runtime_breakdown") or {}).get(
                 "checkpoint_serialization_seconds", (result.get("runtime_breakdown") or {}).get("checkpoint_save_seconds", 0.0)),
@@ -315,8 +342,8 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
             "downstream_refresh_seconds": 0.0},
         "checkpoint_size_bytes": checkpoint_size,
         "checkpoint_path": str(checkpoint), "parent_checkpoint": config["parent_checkpoint"],
-        "checkpoint_scoring_method": result.get("checkpoint_scoring_method"),
-        "final_validation_reused_existing_predictions": result.get("final_validation_reused_existing_predictions", True),
+        "final_validation_reused_existing_predictions": False,
+        "checkpoint_scoring_method": "fresh_validation_prediction_after_fit",
         "parent_checkpoint_sha256": parent_sha256,
         "iterations_added": int(iterations), "tree_count": int(result["tree_count"]),
         "feature_count": len(feature_names), "feature_names": feature_names,
@@ -462,7 +489,8 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
         raise FileExistsError(f"two-stage run already exists: {run_id}")
 
     v1_rows = load_dataset("v1_all", data_dir)[0].drop(columns=["split"], errors="ignore")
-    v0_rows = load_dataset("v0", data_dir)[0].drop(columns=["split"], errors="ignore")
+    v0_with_split = load_dataset("v0", data_dir)[0]
+    v0_rows = v0_with_split.drop(columns=["split"], errors="ignore")
     validation_rows = load_dataset(validation_dataset, data_dir)[0].drop(columns=["split"], errors="ignore")
     v1_rows = v1_rows.sort_values("id", kind="stable").reset_index(drop=True)
     v0_rows = v0_rows.sort_values("id", kind="stable").reset_index(drop=True)
@@ -470,8 +498,14 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
     profile_v1 = effective_profile(data_dir, "v1_all", v1_rows)
     profile_v0 = effective_profile(data_dir, "v0", v0_rows)
     profile_validation = effective_profile(data_dir, validation_dataset, validation_rows)
-    stage1_train, stage2_train, stage1_valid = v1_rows, v0_rows, validation_rows
-    stage2_valid = validation_rows
+    stage1_train, stage1_valid = v1_rows, validation_rows
+    if validation_dataset == "v0":
+        stage2_train, stage2_valid = _historical_v0_partitions(v0_with_split)
+        stage1_valid = stage2_valid
+        validation_rows = stage2_valid
+        profile_validation = effective_profile(data_dir, validation_dataset, validation_rows)
+    else:
+        stage2_train, stage2_valid = v0_rows, validation_rows
     classes = sorted(validation_rows.model.astype(str).unique())
     if set(stage1_train.model.astype(str).unique()) != set(classes) or set(stage2_train.model.astype(str).unique()) != set(classes):
         raise ValueError("Stage 1 and Stage 2 must each contain all canonical classes")
@@ -510,9 +544,9 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
     full_matrix, all_feature_names = stylometry(all_texts, all_recipe, return_feature_names=True)
     feature_seconds = time.perf_counter() - feature_started
     feature_data = {"full": full_matrix, "all_names": all_feature_names,
-                    "offsets": {"v1_all": (0, len(stage1_train)),
-                                "v0": (len(stage1_train), len(stage1_train) + len(stage2_train)),
-                                validation_dataset: (len(stage1_train) + len(stage2_train), len(all_texts))}}
+                    "offsets": {"stage1_train": (0, len(stage1_train)),
+                                "stage2_train": (len(stage1_train), len(stage1_train) + len(stage2_train)),
+                                "validation": (len(stage1_train) + len(stage2_train), len(all_texts))}}
     report_dir.mkdir(parents=True)
     run_root.mkdir(parents=True)
 
@@ -563,7 +597,8 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
                 parent_checkpoint=parent, parent_sha256=parent_hash, matrices=feature_data,
                 report_dir=report_dir, data_profile=profile,
                 registry_path=registry_path, code_revision=summary["code_revision"],
-                validation_dataset=validation_dataset)
+                validation_dataset=validation_dataset,
+                train_matrix_role="stage1_train" if stage == "stage1" else "stage2_train")
             stage_result.pop("prediction_frame")
             record[stage] = {**stage_result, "dataset": dataset_name}
         summary["experiments"][experiment] = record
@@ -596,7 +631,8 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
             parent_checkpoint=parent, parent_sha256=parent_hash, matrices=feature_data,
             report_dir=report_dir, data_profile=profile,
             registry_path=registry_path, code_revision=summary["code_revision"],
-            validation_dataset=validation_dataset)
+            validation_dataset=validation_dataset,
+            train_matrix_role="stage1_train" if stage == "stage1" else "stage2_train")
         stage_result.pop("prediction_frame")
         record[stage] = {**stage_result, "dataset": dataset_name}
     summary["experiments"]["C"] = record

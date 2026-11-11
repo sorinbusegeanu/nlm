@@ -133,6 +133,11 @@ def _restore_model_state(model, state):
     model.load_state_dict(state)
 
 
+def _should_restore_selected_epoch(best_epoch, last_evaluated_epoch):
+    """Current weights are selected if the best epoch is the last validation."""
+    return best_epoch != last_evaluated_epoch
+
+
 def _is_oom_error(exc):
     message = str(exc).lower()
     return any(marker in message for marker in (
@@ -157,12 +162,13 @@ def _predict_cached_dataset(model, dataset, *, batch_size, data_collator, device
     fallback_count = 0
     started = time.perf_counter()
     model.eval()
-    while True:
-        chunks = []
-        batch = output = logits = None
+    chunks = []
+    offset = 0
+    while offset < len(ordered):
+        remaining = Subset(ordered, range(offset, len(ordered)))
+        loader = DataLoader(remaining, batch_size=effective_batch_size, shuffle=False,
+                            collate_fn=data_collator, num_workers=int(num_workers))
         try:
-            loader = DataLoader(ordered, batch_size=effective_batch_size, shuffle=False,
-                                collate_fn=data_collator, num_workers=int(num_workers))
             with torch.inference_mode():
                 for batch in loader:
                     batch = {key: value.to(device) for key, value in batch.items()}
@@ -172,25 +178,45 @@ def _predict_cached_dataset(model, dataset, *, batch_size, data_collator, device
                     with amp:
                         output = model(**batch)
                     logits = output.logits if hasattr(output, "logits") else output
-                    chunks.append(logits.float().cpu().numpy())
-            sorted_predictions = (np.concatenate(chunks, axis=0) if chunks
-                                  else np.empty((0, 0), dtype=np.float32))
-            predictions = _restore_prediction_order(sorted_predictions, order)
-            elapsed = time.perf_counter() - started
-            info = {"effective_inference_batch_size": effective_batch_size,
-                    "inference_oom_fallbacks": fallback_count,
-                    "inference_rows_per_second": (len(predictions) / elapsed if elapsed else None),
-                    "inference_seconds": elapsed}
-            return (predictions, info) if return_info else predictions
+                    values = logits.float().cpu().numpy()
+                    chunks.append(values)
+                    offset += len(values)
+            continue
         except (RuntimeError, getattr(torch.cuda, "OutOfMemoryError", RuntimeError)) as exc:
             if not _is_oom_error(exc) or effective_batch_size <= 1:
                 raise
             effective_batch_size = max(1, effective_batch_size // 2)
             fallback_count += 1
-            del chunks
-            batch = output = logits = None
+            output = logits = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+    sorted_predictions = (np.concatenate(chunks, axis=0) if chunks
+                          else np.empty((0, 0), dtype=np.float32))
+    predictions = _restore_prediction_order(sorted_predictions, order)
+    elapsed = time.perf_counter() - started
+    info = {"effective_inference_batch_size": effective_batch_size,
+            "inference_oom_fallbacks": fallback_count,
+            "inference_rows_per_second": (len(predictions) / elapsed if elapsed else None),
+            "inference_seconds": elapsed}
+    return (predictions, info) if return_info else predictions
+
+
+def _evaluate_with_oom_batch_fallback(evaluate, *, get_batch_size, set_batch_size,
+                                      empty_cache=None):
+    """Retry a failed evaluation at a smaller eval batch without touching train settings."""
+    size = max(1, int(get_batch_size()))
+    fallbacks = 0
+    while True:
+        try:
+            return evaluate(), size, fallbacks
+        except RuntimeError as exc:
+            if not _is_oom_error(exc) or size <= 1:
+                raise
+            size = max(1, size // 2)
+            set_batch_size(size)
+            fallbacks += 1
+            if empty_cache is not None:
+                empty_cache()
 
 
 def _validation_losses(y_true, raw_scores, calibrated_probabilities, classes):
@@ -204,6 +230,55 @@ def _validation_losses(y_true, raw_scores, calibrated_probabilities, classes):
         "validation_loss_calibrated": float(log_loss(
             y_true, calibrated_probabilities, labels=list(classes))),
     }
+
+
+def _write_ragged_token_cache(path, cache_key, rows):
+    """Persist processor tokens as numeric ragged arrays without pickle."""
+    keys = sorted(set().union(*(row.keys() for row in rows))) if rows else []
+    payload = {"cache_key": np.asarray(cache_key), "rows": np.asarray(len(rows)),
+               "keys": np.asarray(json.dumps(keys, separators=(",", ":")))}
+    for key in keys:
+        offsets = [0]
+        values = []
+        for row in rows:
+            value = np.asarray(row.get(key, []), dtype=np.int64).reshape(-1)
+            values.extend(value.tolist())
+            offsets.append(len(values))
+        payload[f"{key}_values"] = np.asarray(values, dtype=np.int32)
+        payload[f"{key}_offsets"] = np.asarray(offsets, dtype=np.int64)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **payload)
+
+
+def _read_ragged_token_cache(path, cache_key, row_count):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as cache:
+            if str(cache["cache_key"].item()) != cache_key or int(cache["rows"].item()) != row_count:
+                return None
+            result = {}
+            for key in json.loads(str(cache["keys"].item())):
+                values = cache[f"{key}_values"]
+                offsets = cache[f"{key}_offsets"]
+                if len(offsets) != row_count + 1 or offsets[-1] != len(values):
+                    return None
+                result[key] = [values[offsets[index]:offsets[index + 1]].astype(np.int64, copy=False)
+                               for index in range(row_count)]
+            return result
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def _ragged_token_cache_valid(path, cache_key, row_count):
+    try:
+        with np.load(path, allow_pickle=False) as cache:
+            return (str(cache["cache_key"].item()) == cache_key
+                    and int(cache["rows"].item()) == row_count)
+    except (OSError, ValueError, KeyError):
+        return False
 
 
 def train_svc(train_text, y_train, validation_text, classes, *, c=.5, calibration_cv=3, seed=2026, feature_config=None, cache_dir=None, fold_token="", validation_labels=None):
@@ -237,7 +312,7 @@ def train_svc(train_text, y_train, validation_text, classes, *, c=.5, calibratio
             "features": features, "cache_key": cache_key, "fit_seconds": elapsed, "classes": list(classes),
             "inference_seconds": inference_seconds, "peak_gpu_memory_bytes": None,
             "checkpoint_scoring_method": "in_memory_fitted_model_validation_predictions",
-            "final_validation_reused_existing_predictions": True,
+            "final_validation_reused_existing_predictions": False,
             "runtime_breakdown": {"training_and_calibration_seconds": float(pred_start - start),
                 "calibration_fitting_seconds": float(calibration_fitting_seconds),
                 "final_validation_inference_seconds": float(inference_seconds),
@@ -437,7 +512,7 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         "checkpoint_selection_metric": f"validation_{checkpoint_selection_metric}" if validation_labels is not None else None,
         "checkpoint": str(output_dir), "tree_count": int(model.tree_count_),
         "checkpoint_scoring_method": "in_memory_selected_iteration_validation_predictions",
-        "final_validation_reused_existing_predictions": validation_labels is not None,
+        "final_validation_reused_existing_predictions": False,
         "added_iterations": int(iterations), "parent_checkpoint": str(init_model) if init_model is not None else None,
         "peak_gpu_memory_bytes": None}
 
@@ -495,7 +570,9 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
         "texts_sha256": hashlib.sha256("\0".join(all_texts).encode("utf-8")).hexdigest(),
         "rows": len(all_texts)}, sort_keys=True)
     cache_key = hashlib.sha256(cache_payload.encode()).hexdigest()
-    cache_path = Path(os.environ.get("NLM_TOKEN_LENGTH_CACHE", "artifacts/cache/token_lengths")) / f"{cache_key}.json"
+    cache_root = Path(os.environ.get("NLM_TOKEN_LENGTH_CACHE", "artifacts/cache/token_lengths"))
+    cache_path = cache_root / f"{cache_key}.json"
+    tokenized_cache_path = cache_root / f"tokenized_{cache_key}.npz"
     if cache_path.is_file():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -503,13 +580,16 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
         except (OSError, ValueError, KeyError, json.JSONDecodeError):
             # Ignore malformed/stale cache files and recompute from the tokenizer.
             cached, maximum = None, None
-        if (cached is not None and cached.get("cache_key") == cache_key
+        token_cache_valid = (not use_processor or
+            _ragged_token_cache_valid(tokenized_cache_path, cache_key, len(all_texts)))
+        if (cached is not None and cached.get("cache_key") == cache_key and token_cache_valid
                 and int(cached.get("rows", -1)) == len(all_texts)):
             if maximum > context_window:
                 raise ValueError(f"{model_name} dataset requires {maximum} tokens (including special tokens and task prefix), "
                                  f"exceeding the model context window of {context_window}")
             return maximum
     maximum = 0
+    token_rows = []
     for start in range(0, len(all_texts), max(1, int(batch_size))):
         batch_texts = all_texts[start:start + max(1, int(batch_size))]
         encoded = (tokenizer(text=batch_texts, truncation=False, padding=False,
@@ -519,12 +599,19 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
         lengths = [len(ids) for ids in encoded["input_ids"]]
         if lengths:
             maximum = max(maximum, max(lengths))
+        if use_processor:
+            for index in range(len(batch_texts)):
+                token_rows.append({key: encoded[key][index]
+                    for key in ("input_ids", "attention_mask", "mm_token_type_ids")
+                    if key in encoded})
     if maximum > context_window:
         raise ValueError(f"{model_name} dataset requires {maximum} tokens (including special tokens and task prefix), "
                          f"exceeding the model context window of {context_window}")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps({"cache_key": cache_key, "maximum_tokens": maximum,
         "rows": len(all_texts), "context_window": context_window}, indent=2) + "\n", encoding="utf-8")
+    if use_processor:
+        _write_ragged_token_cache(tokenized_cache_path, cache_key, token_rows)
     return maximum
 
 
@@ -589,7 +676,8 @@ def _restore_qwen_selected_state(backbone, classifier, adapter_state, classifier
 
 def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *, max_length=384,
                                      batch_size=8, model_dir=None, fix_mistral_regex=False,
-                                     row_ids=None, cache_dir="artifacts/cache/frozen_embeddings"):
+                                     row_ids=None, cache_dir="artifacts/cache/frozen_embeddings",
+                                     inference_stats=None, trust_remote_code=False):
     """Extract deterministic, text-only mean-pooled features without gradient updates."""
     import torch
     texts = [str(text) for text in texts]
@@ -598,6 +686,18 @@ def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *,
                     for index, text in enumerate(texts)])
     if len(aligned_ids) != len(texts) or len(set(aligned_ids)) != len(aligned_ids):
         raise ValueError("frozen embedding row IDs must be unique and aligned to texts")
+    prefix = EMBEDDINGGEMMA2_TASK_PREFIX if model_name == "embeddinggemma2" else ""
+    prepared = [prefix + text for text in texts]
+    token_payload = json.dumps({"model": model_name, "checkpoint": str(checkpoint),
+        "revision": revision, "prefix": prefix, "processor": True,
+        "trust_remote_code": bool(trust_remote_code),
+        "fix_mistral_regex": bool(fix_mistral_regex),
+        "texts_sha256": hashlib.sha256("\0".join(prepared).encode("utf-8")).hexdigest(),
+        "rows": len(prepared)}, sort_keys=True)
+    token_key = hashlib.sha256(token_payload.encode()).hexdigest()
+    token_root = Path(os.environ.get("NLM_TOKEN_LENGTH_CACHE", "artifacts/cache/token_lengths"))
+    tokenized_rows = _read_ragged_token_cache(
+        token_root / f"tokenized_{token_key}.npz", token_key, len(prepared))
     cache_config = {"model": model_name, "checkpoint": str(checkpoint), "revision": revision,
         "tokenizer_config": {"processor": True, "fix_mistral_regex": bool(fix_mistral_regex)},
         "max_length": int(max_length), "pooling": "attention-mask mean",
@@ -614,8 +714,6 @@ def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *,
         fix_mistral_regex=fix_mistral_regex)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    prefix = EMBEDDINGGEMMA2_TASK_PREFIX if model_name == "embeddinggemma2" else ""
-    prepared = [prefix + str(text) for text in texts]
     outputs = []
     started = time.perf_counter()
     inference_batch_size = max(1, int(batch_size))
@@ -623,8 +721,10 @@ def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *,
     with torch.inference_mode():
         for start in range(0, len(prepared), tokenization_chunk_size):
             stop = min(len(prepared), start + tokenization_chunk_size)
-            encoded = processor(text=prepared[start:stop], truncation=True,
-                                max_length=max_length, padding=False)
+            encoded = ({key: values[start:stop] for key, values in tokenized_rows.items()}
+                       if tokenized_rows is not None else
+                       processor(text=prepared[start:stop], truncation=True,
+                                 max_length=max_length, padding=False))
             # These three text models need token IDs and masks; Gemma 4 also
             # consumes its text modality markers. Ignore processor-only extras.
             keys = {"input_ids", "attention_mask"}
@@ -640,31 +740,48 @@ def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *,
             if pad_id is None:
                 pad_id = 0
             chunk_outputs = []
-            for offset in range(0, row_count, inference_batch_size):
+            offset = 0
+            while offset < row_count:
                 indexes = order[offset:offset + inference_batch_size].tolist()
-                padded = {}
-                for key in keys:
-                    if key not in encoded:
-                        if key == "attention_mask":
-                            seqs = [torch.ones(len(encoded["input_ids"][index]), dtype=torch.long)
-                                    for index in indexes]
+                try:
+                    padded = {}
+                    for key in keys:
+                        if key not in encoded:
+                            if key == "attention_mask":
+                                seqs = [torch.ones(len(encoded["input_ids"][index]), dtype=torch.long)
+                                        for index in indexes]
+                            else:
+                                continue
                         else:
-                            continue
-                    else:
-                        seqs = [torch.as_tensor(encoded[key][index], dtype=torch.long)
-                                for index in indexes]
-                    padding_value = int(pad_id) if key == "input_ids" else 0
-                    padded[key] = torch.nn.utils.rnn.pad_sequence(
-                        seqs, batch_first=True, padding_value=padding_value).to(device)
-                result = text_model(**padded, use_cache=False, return_dict=True)
-                hidden = result.last_hidden_state.float()
-                mask = padded["attention_mask"].unsqueeze(-1).to(hidden.dtype)
-                pooled = (hidden * mask).sum(1) / mask.sum(1).clamp_min(1)
-                if model_name == "embeddinggemma2":
-                    pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
-                chunk_outputs.append(pooled.cpu().numpy())
+                            seqs = [torch.as_tensor(encoded[key][index], dtype=torch.long)
+                                    for index in indexes]
+                        padding_value = int(pad_id) if key == "input_ids" else 0
+                        padded[key] = torch.nn.utils.rnn.pad_sequence(
+                            seqs, batch_first=True, padding_value=padding_value).to(device)
+                    result = text_model(**padded, use_cache=False, return_dict=True)
+                    hidden = result.last_hidden_state.float()
+                    mask = padded["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+                    pooled = (hidden * mask).sum(1) / mask.sum(1).clamp_min(1)
+                    if model_name == "embeddinggemma2":
+                        pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
+                    values = pooled.cpu().numpy()
+                    chunk_outputs.append(values)
+                    offset += len(values)
+                except RuntimeError as exc:
+                    if not _is_oom_error(exc) or inference_batch_size <= 1:
+                        raise
+                    inference_batch_size = max(1, inference_batch_size // 2)
+                    if inference_stats is not None:
+                        inference_stats["oom_fallbacks"] = inference_stats.get("oom_fallbacks", 0) + 1
+                    del padded
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             outputs.append(_restore_prediction_order(np.concatenate(chunk_outputs, axis=0), order))
     elapsed = time.perf_counter() - started
+    if inference_stats is not None:
+        inference_stats["effective_inference_batch_size"] = inference_batch_size
+        inference_stats["inference_rows_per_second"] = len(texts) / elapsed if elapsed else None
+        inference_stats["inference_seconds"] = elapsed
     features = np.concatenate(outputs, axis=0) if outputs else np.empty((0, 0), dtype=np.float32)
     del model, text_model, processor
     if torch.cuda.is_available():
@@ -681,9 +798,11 @@ def extract_frozen_backbone_features(model_name, checkpoint, revision, texts, *,
 
 def train_frozen_backbone_fold(model_name, train_text, y_train, validation_text, classes, *,
                                checkpoint, revision, output_dir, max_length=384, batch_size=8,
+                               inference_batch_size=None,
                                c=.5, calibration_cv=3, seed=2026, fix_mistral_regex=False,
                                validation_labels=None, train_row_ids=None, validation_row_ids=None,
-                               embedding_cache_dir="artifacts/cache/frozen_embeddings"):
+                               embedding_cache_dir="artifacts/cache/frozen_embeddings",
+                               trust_remote_code=False):
     """Fit a train-only LinearSVC readout over frozen model-specific text features."""
     if model_name not in FROZEN_BACKBONE_MODELS:
         raise ValueError(f"unsupported frozen backbone: {model_name}")
@@ -695,10 +814,12 @@ def train_frozen_backbone_fold(model_name, train_text, y_train, validation_text,
     if not same_rows:
         all_ids += (list(validation_row_ids) if validation_row_ids is not None else
                     [f"validation:{i}:{hashlib.sha256(str(text).encode()).hexdigest()}" for i, text in enumerate(validation_text)])
+    extraction_stats = {}
     all_features, extraction_seconds = extract_frozen_backbone_features(
         model_name, checkpoint, revision, all_text, max_length=max_length,
-        batch_size=batch_size, fix_mistral_regex=fix_mistral_regex, row_ids=all_ids,
-        cache_dir=embedding_cache_dir)
+        batch_size=inference_batch_size or batch_size, fix_mistral_regex=fix_mistral_regex, row_ids=all_ids,
+        cache_dir=embedding_cache_dir, inference_stats=extraction_stats,
+        trust_remote_code=trust_remote_code)
     train_features = all_features[:len(train_text)]
     validation_features = all_features if same_rows else all_features[len(train_text):]
     base = LinearSVC(C=float(c), class_weight="balanced", random_state=seed)
@@ -747,6 +868,10 @@ def train_frozen_backbone_fold(model_name, train_text, y_train, validation_text,
                 "calibration_fit_seconds": float(calibration_fit_seconds),
                 "final_validation_inference_seconds": float(validation_inference_seconds),
                 "checkpoint_serialization_seconds": float(checkpoint_serialization_seconds),
+                "effective_inference_batch_size": extraction_stats.get("effective_inference_batch_size",
+                    inference_batch_size or batch_size),
+                "inference_oom_fallbacks": extraction_stats.get("oom_fallbacks", 0),
+                "frozen_feature_extraction_rows_per_second": extraction_stats.get("inference_rows_per_second"),
                 "best_checkpoint_restoration_seconds": 0.0,
                 "calibration_inference_seconds": 0.0, "temperature_fit_seconds": 0.0},
             **validation_losses}
@@ -982,6 +1107,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
 
     class OrderedValidationTrainer(tr.Trainer):
         validation_seconds = 0.0
+        eval_oom_fallbacks = 0
         def _get_eval_sampler(self, eval_dataset):
             # Keep each epoch's saved validation outputs aligned to input rows.
             # Training still uses its configured length-grouped sampler.
@@ -991,7 +1117,14 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         def evaluate(self, *args, **kwargs):
             started = time.perf_counter()
             try:
-                return super().evaluate(*args, **kwargs)
+                metrics, effective, fallbacks = _evaluate_with_oom_batch_fallback(
+                    lambda: super(OrderedValidationTrainer, self).evaluate(*args, **kwargs),
+                    get_batch_size=lambda: self.args.per_device_eval_batch_size,
+                    set_batch_size=lambda value: setattr(self.args, "per_device_eval_batch_size", value),
+                    empty_cache=torch.cuda.empty_cache if torch.cuda.is_available() else None)
+                self.effective_eval_batch_size = effective
+                self.eval_oom_fallbacks += fallbacks
+                return metrics
             finally:
                 self.validation_seconds += time.perf_counter() - started
 
@@ -1005,12 +1138,14 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     if checkpoint_selection_metric not in {"accuracy", "balanced_accuracy"}:
         raise ValueError("checkpoint_selection_metric must be accuracy or balanced_accuracy")
     best_state = {"metric": -1.0, "accuracy": None, "balanced_accuracy": None,
-                  "epoch": None, "model_state": None, "snapshot_seconds": 0.0}
+                  "epoch": None, "model_state": None, "snapshot_seconds": 0.0,
+                  "last_evaluated_epoch": None}
 
     class BestCheckpointCallback(TrainerCallback):
         save_seconds = 0.0
         epoch_checkpoints = []
         def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            best_state["last_evaluated_epoch"] = int(round(float(state.epoch or 0)))
             metric_value = (metrics or {}).get(f"eval_{checkpoint_selection_metric}")
             if select_best_checkpoint and metric_value is not None and float(metric_value) > best_state["metric"]:
                 best_state["metric"] = float(metric_value)
@@ -1115,9 +1250,10 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     if select_best_checkpoint:
         if best_state["epoch"] is None:
             raise RuntimeError("best checkpoint selection requested but no epoch validation metric was recorded")
-        restore_started = time.perf_counter()
-        _restore_model_state(model, best_state["model_state"])
-        best_checkpoint_restoration_seconds = time.perf_counter() - restore_started
+        if _should_restore_selected_epoch(best_state["epoch"], best_state["last_evaluated_epoch"]):
+            restore_started = time.perf_counter()
+            _restore_model_state(model, best_state["model_state"])
+            best_checkpoint_restoration_seconds = time.perf_counter() - restore_started
         (out / "checkpoint_selection.json").write_text(json.dumps({
             "metric": f"validation_{checkpoint_selection_metric}", "selected_epoch": best_state["epoch"],
             "selected_validation_accuracy": best_state["accuracy"],
@@ -1216,6 +1352,9 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 "baseline_validation_seconds": baseline_validation_seconds,
                 "training_including_validation_seconds": training_seconds,
                 "validation_seconds": float(getattr(trainer, "validation_seconds", 0.0)),
+                "epoch_validation_oom_fallbacks": int(getattr(trainer, "eval_oom_fallbacks", 0)),
+                "effective_epoch_eval_batch_size": int(getattr(trainer, "effective_eval_batch_size",
+                    trainer.args.per_device_eval_batch_size)),
                 "best_checkpoint_restoration_seconds": float(best_checkpoint_restoration_seconds),
                 "calibration_inference_seconds": float(calibration_inference_seconds),
                 "calibration_rows_per_second": (calibration_stats or {}).get("inference_rows_per_second"),
@@ -1234,6 +1373,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                                if early_stopping_callback is not None else None),
             "checkpoint_selection_metric": f"validation_{checkpoint_selection_metric}" if select_best_checkpoint else None,
             "best_checkpoint_path": str(out) if best_state["epoch"] is not None else None,
+            "selected_checkpoint_path": str(out),
             "epoch_checkpoints": list(best_checkpoint_callback.epoch_checkpoints),
             "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None}
 
@@ -1273,7 +1413,11 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
     base_allocated = torch.cuda.memory_allocated(device)
     if runtime_overhead_reserve_bytes is None:
-        runtime_overhead_reserve_bytes = min(2 * 1024**3, max(256 * 1024**2, int(free_bytes * 0.12)))
+        # Leave room for Trainer/runtime allocations not represented by the
+        # isolated probe. A near-limit probe can understate the eventual
+        # training peak (optimizer/allocator state and CUDA runtime overhead).
+        runtime_overhead_reserve_bytes = min(4 * 1024**3,
+                                             max(512 * 1024**2, int(free_bytes * 0.20)))
     runtime_overhead_reserve_bytes = max(0, int(runtime_overhead_reserve_bytes))
     max_allowed = max(base_allocated, base_allocated + int(free_bytes * float(safety_fraction))
                       - runtime_overhead_reserve_bytes)
@@ -1440,6 +1584,19 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
         torch.cuda.empty_cache()
 
 
+def _probe_lora_batch_size(model, dataset, *, requested_batch_size, max_batch_size,
+                           safety_fraction, use_bf16, use_fp16, optimizer_name,
+                           weight_decay, gradient_checkpointing_enabled):
+    """Probe once in the already configured LoRA checkpointing/optimizer mode."""
+    selected, report = _probe_max_batch_size(model, dataset,
+        requested_batch_size=requested_batch_size, max_batch_size=max_batch_size,
+        safety_fraction=safety_fraction, use_bf16=use_bf16, use_fp16=use_fp16,
+        optimizer_name=optimizer_name, weight_decay=weight_decay)
+    report["gradient_checkpointing_probe_mode"] = bool(gradient_checkpointing_enabled)
+    report["selected_batch_size"] = int(selected)
+    return int(selected), report
+
+
 def load_text_only_backbone(transformers_module, checkpoint, revision, *, torch_dtype,
                             local_files_only=True, trust_remote_code=False, **model_kwargs):
     """Load a multimodal checkpoint and retain its text tower only."""
@@ -1521,10 +1678,10 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         raise ValueError("quantization must be 'none' or 'qlora4'")
     if attention_backend not in {None, "sdpa", "flash_attention_2"}:
         raise ValueError("attention_backend must be 'sdpa', 'flash_attention_2', or None")
-    checkpointing_limit = (int(max_batch_size or batch_size) if auto_batch_size else int(batch_size))
-    checkpointing_disabled_for_batch = bool(gradient_checkpointing and checkpointing_limit > 8)
-    if checkpointing_disabled_for_batch:
-        gradient_checkpointing = False
+    checkpointing_requested = bool(gradient_checkpointing)
+    # Probe in the configured mode. A batch size measured with checkpointing
+    # disabled is not valid for the configured training recipe.
+    checkpointing_disabled_for_batch = False
     load_kwargs = {"attn_implementation": attention_backend} if attention_backend else {}
     quantization_config = None
     if attention_backend == "flash_attention_2":
@@ -1705,23 +1862,19 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     requested_inference_batch_size=max(1,int(inference_batch_size or batch_size))
     batch_probe={"enabled": False, "selected_batch_size": effective_batch_size}
     if auto_batch_size:
-        effective_batch_size, batch_probe = _probe_max_batch_size(
+        effective_batch_size, batch_probe = _probe_lora_batch_size(
             model, train_dataset, requested_batch_size=batch_size,
             max_batch_size=max_batch_size or batch_size,
             safety_fraction=batch_probe_safety_fraction, use_bf16=use_bf16, use_fp16=use_fp16,
-            optimizer_name=optimizer, weight_decay=weight_decay)
+            optimizer_name=optimizer, weight_decay=weight_decay,
+            gradient_checkpointing_enabled=gradient_checkpointing)
     checkpointing_probe_batch_size = int(effective_batch_size)
-    if checkpointing_disabled_for_batch:
-        disable_checkpointing = getattr(backbone, "gradient_checkpointing_disable", None)
-        if disable_checkpointing is None and quantization != "qlora4":
-            raise RuntimeError("batch size threshold requires the model to disable gradient checkpointing")
-        if disable_checkpointing is not None:
-            disable_checkpointing()
     out.mkdir(parents=True,exist_ok=True)
     batch_probe.update({"requested_batch_size":int(batch_size),
                         "effective_batch_size":effective_batch_size,
                         "gradient_accumulation_steps":int(gradient_accumulation_steps),
                         "gradient_checkpointing_enabled":bool(gradient_checkpointing),
+                        "gradient_checkpointing_probe_mode":bool(checkpointing_requested),
                         "gradient_checkpointing_disabled_for_batch_threshold":checkpointing_disabled_for_batch,
                         "checkpointing_probe_batch_size":checkpointing_probe_batch_size,
                         "padding_strategy":"dynamic",
@@ -1744,6 +1897,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         **_length_grouping_args(tr))
     class OrderedValidationTrainer(tr.Trainer):
         validation_seconds = 0.0
+        eval_oom_fallbacks = 0
         def _get_eval_sampler(self, eval_dataset):
             if hasattr(eval_dataset, "lengths"):
                 return LengthOrderedSampler(eval_dataset)
@@ -1751,7 +1905,14 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         def evaluate(self, *args, **kwargs):
             started = time.perf_counter()
             try:
-                return super().evaluate(*args, **kwargs)
+                metrics, effective, fallbacks = _evaluate_with_oom_batch_fallback(
+                    lambda: super(OrderedValidationTrainer, self).evaluate(*args, **kwargs),
+                    get_batch_size=lambda: self.args.per_device_eval_batch_size,
+                    set_batch_size=lambda value: setattr(self.args, "per_device_eval_batch_size", value),
+                    empty_cache=torch.cuda.empty_cache if torch.cuda.is_available() else None)
+                self.effective_eval_batch_size = effective
+                self.eval_oom_fallbacks += fallbacks
+                return metrics
             finally:
                 self.validation_seconds += time.perf_counter() - started
 
@@ -1809,10 +1970,13 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         selected_state = snapshot_callback.best_state
         if selected_state is None or selected_state["epoch"] != best_epoch:
             raise RuntimeError("selected Qwen epoch has no captured adapter and classifier state")
-        restore_started = time.perf_counter()
-        _restore_qwen_selected_state(backbone, model.classifier,
-            selected_state["adapter"], selected_state["classifier"])
-        best_checkpoint_restoration_seconds = time.perf_counter() - restore_started
+        last_evaluated_epoch = max((int(item["epoch"]) for item in snapshot_callback.validation_predictions),
+                                   default=None)
+        if best_epoch != last_evaluated_epoch:
+            restore_started = time.perf_counter()
+            _restore_qwen_selected_state(backbone, model.classifier,
+                selected_state["adapter"], selected_state["classifier"])
+            best_checkpoint_restoration_seconds = time.perf_counter() - restore_started
     selection = {"metric": f"validation_{checkpoint_selection_metric}" if eval_each_epoch else None,
                  "best_epoch": best_epoch,
                  "best_validation_accuracy": best_validation_accuracy,
@@ -1910,6 +2074,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                                                     metric=checkpoint_selection_metric)
                            if early_stopping_callback is not None else None),
         "epoch_checkpoints":snapshot_callback.checkpoints,
+        "selected_checkpoint_path":str(out),
+        "best_checkpoint_path":str(out),
         "best_epoch":best_epoch,"best_validation_accuracy":best_validation_accuracy,
         "best_validation_balanced_accuracy":best_validation_balanced_accuracy,
         "checkpoint_selection_metric":f"validation_{checkpoint_selection_metric}" if eval_each_epoch else None,
@@ -1918,6 +2084,9 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "runtime_breakdown":{"startup_seconds":startup_seconds,
             "training_including_validation_seconds":training_seconds,
             "validation_seconds":float(getattr(trainer,"validation_seconds",0.0)),
+            "epoch_validation_oom_fallbacks":int(getattr(trainer,"eval_oom_fallbacks",0)),
+            "effective_epoch_eval_batch_size":int(getattr(trainer,"effective_eval_batch_size",
+                trainer.args.per_device_eval_batch_size)),
             "best_checkpoint_restoration_seconds":float(best_checkpoint_restoration_seconds),
             "calibration_inference_seconds":float(calibration_inference_seconds),
             "calibration_rows_per_second":(calibration_stats or {}).get("inference_rows_per_second"),

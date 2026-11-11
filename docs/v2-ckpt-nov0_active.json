@@ -1,0 +1,22 @@
+{
+  "version": "trust-v2",
+  "generated_at_utc": "2026-11-11T05:28:53+00:00",
+  "source_roster": "docs/v2-ckpt-nov0.csv",
+  "initial_runs": [
+    "ultrabert380_v2.0_valv0_datad12bb8be_split870e47f9_seed2026_cfgfe74ea98_codeab9f6d2",
+    "ultrabert380_v2.1_valv0_datac59bc6ca_split6330072d_seed2026_cfgaf9f028b_codeab9f6d2"
+  ],
+  "rows": 36,
+  "checkpoints": 2,
+  "validation_scope": "full_v0",
+  "validation_rows": 2699,
+  "minimum_support": 10,
+  "smoothing": "Beta(1,1): (true_positive + 1) / (prediction_count + 2)",
+  "ordering": [
+    "precision descending",
+    "recall descending",
+    "checkpoint sequence ascending",
+    "label ascending"
+  ],
+  "future_updates": "training pipeline appends saved full-V0 metrics; dashboard does not discover runs or score checkpoints"
+}
