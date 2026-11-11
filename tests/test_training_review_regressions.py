@@ -29,7 +29,7 @@ class TrainingReviewRegressionTests(unittest.TestCase):
                 "train_path: data/train.csv\noutput_dir: data/processed\n"
                 "validation_fraction: 0.2\nsplit_candidates: 50\nexpected_classes: 2\n")
             (root / "configs/models/svc.yaml").write_text(
-                "model: svc\nC: 1.0\ncalibration_cv: 2\nepochs: 1\n")
+                "model: svc\nC: 1.0\nepochs: 1\n")
             (root / "configs/features/default.yaml").write_text("views: [char]\n")
             (root / "data/processed").mkdir(parents=True)
             (root / "data/processed/old.txt").write_text("old generated state")

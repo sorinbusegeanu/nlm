@@ -24,6 +24,15 @@ from .feature_factory import (DEFAULT_STYLOMETRY_RECIPE, STYLOMETRY_VERSION,
 
 
 def _aligned(values, fitted_classes, classes):
+    values = np.asarray(values)
+    fitted_classes = list(fitted_classes)
+    if values.ndim == 1:
+        if len(fitted_classes) != 2:
+            raise ValueError("one-dimensional decision scores require exactly two fitted classes")
+        # LinearSVC's positive binary margin belongs to classes_[1].
+        values = np.column_stack([-values, values])
+    if values.ndim != 2 or values.shape[1] != len(fitted_classes):
+        raise ValueError("decision score columns do not match fitted classes")
     result = np.zeros((len(values), len(classes)), dtype=float)
     indices = {label: i for i, label in enumerate(classes)}
     for j, label in enumerate(fitted_classes):
@@ -73,6 +82,84 @@ def _restore_model_state(model, state):
 def _should_restore_selected_epoch(best_epoch, last_evaluated_epoch):
     """Current weights are selected if the best epoch is the last validation."""
     return best_epoch != last_evaluated_epoch
+
+
+def _largest_safe_batch_size(maximum, fits):
+    """Find the greatest safe positive integer using exponential then binary search."""
+    maximum = max(1, int(maximum))
+    successful, failed, candidate = 0, None, 1
+    while candidate <= maximum:
+        if not fits(candidate):
+            failed = candidate
+            break
+        successful = candidate
+        if candidate == maximum:
+            break
+        candidate = min(candidate * 2, maximum)
+    if successful == 0:
+        raise MemoryError("GPU batch-size probe could not fit batch size 1; reduce max_length or use a smaller model")
+    if failed is not None:
+        low, high = successful + 1, failed - 1
+        while low <= high:
+            middle = (low + high) // 2
+            if fits(middle):
+                successful = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+    return successful
+
+
+def _batch_probe_memory_limit(base_reserved_bytes, free_bytes, usable_fraction,
+                              explicit_reserve_bytes=0):
+    """Return a memory ceiling while retaining the configured fraction of free VRAM."""
+    usable_fraction = float(usable_fraction)
+    if not 0 < usable_fraction <= 1:
+        raise ValueError("batch_probe_safety_fraction must be in (0, 1]")
+    free_bytes = max(0, int(free_bytes))
+    reserve = max(max(0, int(explicit_reserve_bytes)),
+                  int(round(free_bytes * (1.0 - usable_fraction))))
+    return int(base_reserved_bytes) + max(0, free_bytes - reserve), reserve
+
+
+def _nearby_batch_candidates(maximum_safe, *, count=4):
+    """Small set of nearby integer microbatches for throughput comparison."""
+    maximum_safe = max(1, int(maximum_safe))
+    offsets = (0, 1, 2, 4, 8)
+    return list(dict.fromkeys(max(1, maximum_safe - offset) for offset in offsets))[:max(1, int(count))]
+
+
+def _select_throughput_batch_size(results):
+    """Choose the fastest safe measured physical batch, preferring larger ties."""
+    valid = [item for item in results if item.get("fits") and
+             item.get("examples_per_second") is not None and
+             math.isfinite(float(item["examples_per_second"]))]
+    if not valid:
+        raise ValueError("no safe batch-size candidate has a throughput measurement")
+    return int(max(valid, key=lambda item: (float(item["examples_per_second"]),
+                                             int(item["batch_size"]))) ["batch_size"])
+
+
+def _resolve_batch_accumulation(physical_batch_size, configured_accumulation=1,
+                                target_effective_batch_size=None):
+    """Honor explicit effective-batch targets with the largest exact-fit microbatch."""
+    physical = max(1, int(physical_batch_size))
+    accumulation = max(1, int(configured_accumulation))
+    if target_effective_batch_size is None:
+        return physical, accumulation
+    target = int(target_effective_batch_size)
+    if target < 1:
+        raise ValueError("target_effective_batch_size must be positive")
+    physical = min(physical, target)
+    while target % physical:
+        physical -= 1
+    return physical, target // physical
+
+
+def _optimizer_steps_per_epoch(example_count, physical_batch_size, gradient_accumulation_steps):
+    """Count optimizer updates for padded/dynamic batches and configured accumulation."""
+    denominator = max(1, int(physical_batch_size)) * max(1, int(gradient_accumulation_steps))
+    return max(1, math.ceil(max(0, int(example_count)) / denominator))
 
 
 def select_epoch_view_indices(view_counts, *, seed=2026, epoch=0, view_ids=None):
@@ -275,7 +362,8 @@ def _with_cuda_oom_recovery(function):
                     raise
 
                 recovered_batch = max(1, failed_batch // 2)
-                recovered_accumulation = max(1, int(round(old_effective / recovered_batch)))
+                recovered_batch, recovered_accumulation = _resolve_batch_accumulation(
+                    recovered_batch, 1, old_effective)
                 event.update({
                     "recovered_microbatch": recovered_batch,
                     "recovered_gradient_accumulation_steps": recovered_accumulation,
@@ -295,8 +383,8 @@ def _with_cuda_oom_recovery(function):
                 recovery_checkpoint = (_latest_complete_trainer_checkpoint(archived_attempt)
                                        if archived_attempt is not None else None)
                 training_rows = len(bound.arguments.get("train_text", []))
-                steps_per_epoch = max(1, math.ceil(
-                    training_rows / (recovered_batch * recovered_accumulation)))
+                steps_per_epoch = _optimizer_steps_per_epoch(
+                    training_rows, recovered_batch, recovered_accumulation)
                 epochs = int(bound.arguments.get("epochs", 1))
                 warmup_epochs = bound.arguments.get("warmup_epochs")
                 warmup_basis_epochs = min(epochs, int(warmup_epochs)) if warmup_epochs is not None else epochs
@@ -477,6 +565,25 @@ def _evaluate_with_oom_batch_fallback(evaluate, *, get_batch_size, set_batch_siz
             fallbacks += 1
             if empty_cache is not None:
                 empty_cache()
+
+
+def _set_gradient_checkpointing(model, enabled):
+    """Set Hugging Face model activation checkpointing when the architecture supports it."""
+    enabled = bool(enabled)
+    currently_enabled = bool(getattr(model, "is_gradient_checkpointing", False))
+    if enabled == currently_enabled:
+        return
+    if enabled:
+        method = getattr(model, "gradient_checkpointing_enable", None)
+    else:
+        method = getattr(model, "gradient_checkpointing_disable", None)
+    if method is None:
+        if enabled:
+            raise RuntimeError(f"{type(model).__name__} does not support gradient checkpointing")
+        return
+    method()
+    if enabled and hasattr(getattr(model, "config", None), "use_cache"):
+        model.config.use_cache = False
 
 
 def _validation_loss_raw(y_true, raw_scores, classes):
@@ -1096,7 +1203,9 @@ def _force_huggingface_offline():
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 
-def _live_training_progress_callback(TrainerCallback, output_dir, *, steps_per_epoch=None, epochs=None):
+def _live_training_progress_callback(TrainerCallback, output_dir, *, steps_per_epoch=None, epochs=None,
+                                    physical_batch_size=None, gradient_accumulation_steps=1,
+                                    mean_tokens_per_example=None, torch_module=None):
     """Write epoch metrics and lightweight live step/ETA state for the dashboard."""
     progress_path = Path(output_dir) / "training_progress.json"
     class LiveTrainingProgressCallback(TrainerCallback):
@@ -1145,10 +1254,28 @@ def _live_training_progress_callback(TrainerCallback, output_dir, *, steps_per_e
                     row["validation_loss"] = float(logs["eval_loss"])
             per_epoch = int(steps_per_epoch or max(
                 1, math.ceil(state.max_steps / max(1, int(epochs or args.num_train_epochs or 1)))))
-            self.live = {"global_step": int(state.global_step),
+            global_step = int(state.global_step)
+            self.live = {"global_step": global_step,
                          "total_steps": int(state.max_steps),
+                         "epoch": (min((global_step - 1) // per_epoch + 1,
+                                       max(1, int(epochs or args.num_train_epochs or 1)))
+                                   if global_step else 1),
+                         "epoch_step": (((global_step - 1) % per_epoch) + 1
+                                        if global_step else 0),
                          "steps_per_epoch": per_epoch,
+                         "epoch_eta_seconds": None,
                          "updated_at": time.time()}
+            if torch_module is not None and torch_module.cuda.is_available():
+                try:
+                    device = torch_module.cuda.current_device()
+                    free_bytes, total_bytes = torch_module.cuda.mem_get_info(device)
+                    self.live["training_peak_allocated_bytes"] = int(
+                        torch_module.cuda.max_memory_allocated(device))
+                    self.live["training_peak_reserved_bytes"] = int(
+                        torch_module.cuda.max_memory_reserved(device))
+                    self.live["gpu_vram_utilization"] = 1.0 - free_bytes / max(1, total_bytes)
+                except (RuntimeError, AttributeError):
+                    pass
             self.last_step_at = time.monotonic()
             self._write_progress()
             return control
@@ -1175,9 +1302,29 @@ def _live_training_progress_callback(TrainerCallback, output_dir, *, steps_per_e
                          "epoch_eta_seconds": (max(0, per_epoch - epoch_step) * step_seconds
                                                if step_seconds is not None else None),
                          "updated_at": time.time()}
+            if step_seconds:
+                examples_per_step = (max(1, int(physical_batch_size or args.per_device_train_batch_size))
+                                     * max(1, int(gradient_accumulation_steps)))
+                self.live["training_examples_per_second"] = examples_per_step / step_seconds
+                if mean_tokens_per_example is not None:
+                    self.live["training_tokens_per_second"] = (
+                        examples_per_step * float(mean_tokens_per_example) / step_seconds)
+                self.live["training_step_seconds"] = step_seconds
+            should_write = now - self.last_live_write >= 5 or epoch_step >= per_epoch
+            if should_write and torch_module is not None and torch_module.cuda.is_available():
+                try:
+                    device = torch_module.cuda.current_device()
+                    free_bytes, total_bytes = torch_module.cuda.mem_get_info(device)
+                    self.live["training_peak_allocated_bytes"] = int(
+                        torch_module.cuda.max_memory_allocated(device))
+                    self.live["training_peak_reserved_bytes"] = int(
+                        torch_module.cuda.max_memory_reserved(device))
+                    self.live["gpu_vram_utilization"] = 1.0 - free_bytes / max(1, total_bytes)
+                except (RuntimeError, AttributeError):
+                    pass
             # The dashboard refreshes every ten seconds; avoid a disk replace
             # on every optimizer update while keeping the displayed ETA current.
-            if now - self.last_live_write >= 5 or epoch_step >= per_epoch:
+            if should_write:
                 self._write_progress()
                 self.last_live_write = now
             return control
@@ -1187,6 +1334,9 @@ def _live_training_progress_callback(TrainerCallback, output_dir, *, steps_per_e
             # epoch's step-time estimate.
             self.step_durations.clear()
             self.last_step_at = time.monotonic()
+            if self.live is not None:
+                self.live["updated_at"] = time.time()
+                self._write_progress()
             return control
 
         def on_log(self, args, state, control, logs=None, **kwargs):
@@ -1348,7 +1498,8 @@ def _epoch_decay_lambda(*, decay, steps_per_epoch, warmup_steps=0):
 @_with_cuda_oom_recovery
 def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpoint, revision, output_dir,
                        epochs=20, batch_size=16, inference_batch_size=None, max_length=384, learning_rate=2e-5, seed=2026,
-                       gradient_accumulation_steps=1, local_files_only=True, validation_labels=None,
+                       gradient_accumulation_steps=1, target_effective_batch_size=None,
+                       local_files_only=True, validation_labels=None,
                        resume_checkpoint=None, learning_rate_decay=None,
                        trainer_resume_checkpoint=None,
                        select_best_checkpoint=False,
@@ -1357,7 +1508,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        auto_batch_size=False, max_batch_size=1024,
                        batch_probe_safety_fraction=0.95,
                        checkpoint_selection_metric="balanced_accuracy", save_epoch_checkpoints=False,
-                       training_views=None, training_view_ids=None,
+                       gradient_checkpointing=False, training_views=None, training_view_ids=None,
                        _oom_recovery_context=None, _trainer_resume_checkpoint=None):
     """Fine-tune or continue an encoder after recording its validation baseline."""
     _force_huggingface_offline()
@@ -1381,6 +1532,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         model_source, revision=model_revision, num_labels=len(classes),
         id2label=dict(enumerate(classes)), label2id=label_map, trust_remote_code=True,
         local_files_only=local_files_only)
+    if gradient_checkpointing:
+        _set_gradient_checkpointing(model, True)
     train = _TextDataset(train_text, y_indices, tokenizer, max_length,
                          training_views=training_views, training_view_ids=training_view_ids, seed=seed)
     val_indices = ([label_map[label] for label in validation_labels]
@@ -1401,15 +1554,28 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         recovery_context["phase"] = "batch_probe"
         effective_batch_size, batch_probe = _probe_max_batch_size(
             model, train, requested_batch_size=requested_batch_size,
-            max_batch_size=max_batch_size, safety_fraction=batch_probe_safety_fraction,
+            max_batch_size=(min(int(max_batch_size), int(target_effective_batch_size))
+                            if target_effective_batch_size is not None else max_batch_size),
+            safety_fraction=batch_probe_safety_fraction,
             use_bf16=use_bf16, use_fp16=use_fp16, optimizer_name=optimizer,
             weight_decay=weight_decay)
         recovery_context["phase"] = "initialization"
         if training_views is not None:
             train.restore_epoch_views(0)
+    effective_batch_size, gradient_accumulation_steps = _resolve_batch_accumulation(
+        effective_batch_size, gradient_accumulation_steps, target_effective_batch_size)
+    checkpointing_enabled = bool(gradient_checkpointing and effective_batch_size <= 8)
+    if gradient_checkpointing:
+        _set_gradient_checkpointing(model, checkpointing_enabled)
     batch_probe.update({"requested_batch_size": requested_batch_size,
                         "effective_batch_size": effective_batch_size,
+                        "selected_physical_batch_size": effective_batch_size,
+                        "target_effective_batch_size": target_effective_batch_size,
+                        "effective_optimizer_batch_size": effective_batch_size * gradient_accumulation_steps,
                         "gradient_accumulation_steps": int(gradient_accumulation_steps),
+                        "gradient_checkpointing_enabled": checkpointing_enabled,
+                        "gradient_checkpointing_disabled_for_batch_threshold":
+                            bool(gradient_checkpointing and effective_batch_size > 8),
                         "padding_strategy": "dynamic", "pad_to_multiple_of": 8})
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     (Path(output_dir) / "batch_size_probe.json").write_text(json.dumps(batch_probe, indent=2) + "\n")
@@ -1538,9 +1704,14 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 self.save_seconds += time.perf_counter() - save_started
             return control
 
-    encoder_steps_per_epoch = max(1, math.ceil(len(train) / (effective_batch_size * gradient_accumulation_steps)))
+    encoder_steps_per_epoch = _optimizer_steps_per_epoch(
+        len(train), effective_batch_size, gradient_accumulation_steps)
     live_callback = _live_training_progress_callback(
-        TrainerCallback, out, steps_per_epoch=encoder_steps_per_epoch, epochs=epochs)
+        TrainerCallback, out, steps_per_epoch=encoder_steps_per_epoch, epochs=epochs,
+        physical_batch_size=effective_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        mean_tokens_per_example=(float(np.mean(train.lengths)) if train.lengths else None),
+        torch_module=torch)
     warmup_basis_epochs = min(int(epochs), int(warmup_epochs)) if warmup_epochs is not None else int(epochs)
     encoder_warmup_steps = math.ceil(float(warmup_ratio) * warmup_basis_epochs * encoder_steps_per_epoch)
     args = tr.TrainingArguments(output_dir=str(output_dir), num_train_epochs=epochs,
@@ -1623,6 +1794,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     startup_seconds = max(0.0, time.perf_counter() - start - baseline_validation_seconds)
     recovery_context["phase"] = "training"
     training_started = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     trainer.train(resume_from_checkpoint=_trainer_resume_checkpoint)
     recovery_context["phase"] = "inference"
     training_seconds = time.perf_counter() - training_started
@@ -1642,33 +1815,6 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "metric": f"validation_{checkpoint_selection_metric}", "selected_epoch": best_state["epoch"],
             "selected_validation_accuracy": best_state["accuracy"],
             "selected_validation_balanced_accuracy": best_state["balanced_accuracy"]}, indent=2) + "\n")
-    calibration_metrics = {"calibration_enabled": bool(calibration_enabled),
-                           "calibration_full_dataset": bool(calibration_full_dataset),
-                           "calibration_seed": int(calibration_seed)}
-    calibration_inference_seconds = 0.0
-    temperature_fit_seconds = 0.0
-    calibration_stats = None
-    temperature = 1.0
-    if calibration_enabled:
-        calibration_indices = _calibration_indices(y_train, max_samples=calibration_max_samples,
-            seed=calibration_seed, full_dataset=calibration_full_dataset)
-        from torch.utils.data import Subset
-        calibration_dataset = Subset(train, calibration_indices.tolist())
-        calibration_labels = np.asarray(y_train, dtype=object)[calibration_indices].tolist()
-        calibration_inference_started = time.perf_counter()
-        train_logits, calibration_stats = predict_cached(calibration_dataset)
-        calibration_inference_seconds = time.perf_counter() - calibration_inference_started
-        temperature_fit_started = time.perf_counter()
-        temperature, fitted_metrics = _temperature_if_enabled(train_logits, calibration_labels, classes,
-            enabled=True, seed=calibration_seed)
-        temperature_fit_seconds = time.perf_counter() - temperature_fit_started
-        calibration_metrics.update(fitted_metrics)
-        calibration_metrics.update({"calibration_enabled": True,
-            "calibration_sample_size": int(len(calibration_indices)),
-            "calibration_full_dataset": bool(len(calibration_indices) == len(y_train)),
-            "calibration_seed": int(calibration_seed)})
-    calibration_metrics["calibration_inference_seconds"] = calibration_inference_seconds
-    calibration_metrics["temperature_fit_seconds"] = temperature_fit_seconds
     selected_prediction_epoch = (best_state["epoch"] if select_best_checkpoint else
         max((int(item["epoch"]) for item in epoch_prediction_callback.predictions), default=None))
     selected_prediction = _selected_epoch_scores(epoch_prediction_callback.predictions,
@@ -1687,7 +1833,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     tokenizer.save_pretrained(output_dir)
     checkpoint_save_seconds = time.perf_counter() - checkpoint_started
     if not np.isfinite(logits).all(): raise ValueError("encoder produced non-finite scores")
-    probs = softmax(logits / temperature, axis=1)
+    probs = softmax(logits, axis=1)
     epoch_history = [dict(entry) for entry in trainer.state.log_history if "eval_accuracy" in entry]
     for entry in epoch_history:
         if entry.get("eval_loss") is not None:
@@ -1699,10 +1845,6 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     validation_loss_raw = selected_epoch_metrics.get("eval_loss")
     if validation_loss_raw is None:
         validation_loss_raw = log_loss(validation_labels, softmax(logits, axis=1), labels=classes)
-    validation_loss_calibrated = log_loss(validation_labels, probs, labels=classes)
-    if selected_epoch_metrics:
-        selected_epoch_metrics["validation_loss_calibrated"] = float(validation_loss_calibrated)
-        selected_epoch_metrics["calibration_temperature"] = float(temperature)
     if learning_rate_decay is not None:
         for entry in epoch_history:
             epoch = int(round(float(entry.get("epoch", 1))))
@@ -1713,21 +1855,19 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     return {"scores": logits, "probabilities": probs, "model": model, "tokenizer": tokenizer,
             "requested_batch_size": requested_batch_size,
             "effective_batch_size": effective_batch_size,
+            "selected_physical_batch_size": effective_batch_size,
+            "effective_optimizer_batch_size": effective_batch_size * int(gradient_accumulation_steps),
             "gradient_accumulation_steps": int(gradient_accumulation_steps),
+            "gradient_checkpointing_enabled": checkpointing_enabled,
             "requested_inference_batch_size": requested_inference_batch_size,
             "effective_inference_batch_size": effective_post_inference_batch_size,
             "batch_size_probe": batch_probe,
             "fit_seconds": time.perf_counter() - start, "inference_seconds": inference_seconds,
-            "classes": list(classes), "calibration_temperature": temperature,
-            "calibration_enabled": bool(calibration_enabled),
-            "calibration_method": "train-only scalar temperature" if calibration_enabled else "disabled",
-            **calibration_metrics,
+            "classes": list(classes),
             "baseline_validation_metrics": baseline_metrics,
             "validation_metrics_by_epoch": epoch_history,
             "validation_predictions_by_epoch": epoch_prediction_callback.predictions,
             "validation_loss_raw": float(validation_loss_raw),
-            "validation_loss_calibrated": float(validation_loss_calibrated),
-            "calibration_temperature": float(temperature),
             "best_epoch": best_state["epoch"],
             "best_validation_accuracy": best_state["accuracy"] if best_state["epoch"] is not None else None,
             "best_validation_balanced_accuracy": best_state["balanced_accuracy"] if best_state["epoch"] is not None else None,
@@ -1741,9 +1881,6 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 "effective_epoch_eval_batch_size": int(getattr(trainer, "effective_eval_batch_size",
                     trainer.args.per_device_eval_batch_size)),
                 "best_checkpoint_restoration_seconds": float(best_checkpoint_restoration_seconds),
-                "calibration_inference_seconds": float(calibration_inference_seconds),
-                "calibration_rows_per_second": (calibration_stats or {}).get("inference_rows_per_second"),
-                "temperature_fit_seconds": float(temperature_fit_seconds),
                 "final_validation_inference_seconds": float(inference_seconds),
                 "final_validation_rows_per_second": (final_inference_stats or {}).get("inference_rows_per_second"),
                 "effective_inference_batch_size": effective_post_inference_batch_size,
@@ -1761,7 +1898,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "selected_checkpoint_path": str(out),
             "training_view_sampling": (train.sampling_summary() if training_views is not None else None),
             "epoch_checkpoints": list(best_checkpoint_callback.epoch_checkpoints),
-            "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None}
+            "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None,
+            "peak_gpu_memory_reserved_bytes": int(torch.cuda.max_memory_reserved()) if torch.cuda.is_available() else None}
 
 
 class _TextDataset:
@@ -1825,10 +1963,10 @@ class _TextDataset:
 
 
 def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_size,
-                         safety_fraction=0.95, use_bf16=False, use_fp16=False,
+                         safety_fraction=0.92, use_bf16=False, use_fp16=False,
                          optimizer_name="adamw_torch", weight_decay=0.0,
-                         runtime_overhead_reserve_bytes=None):
-    """Find the largest batch that survives a forward/backward and optimizer step."""
+                         runtime_overhead_reserve_bytes=0):
+    """Find a safe integer batch and select the fastest of nearby batch sizes."""
     torch, _ = _require_neural()
     requested = int(requested_batch_size)
     maximum = max(1, min(int(max_batch_size or requested), len(dataset)))
@@ -1836,34 +1974,31 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
     if not torch.cuda.is_available():
         report.update({"status": "gpu_unavailable", "selected_batch_size": requested})
         return requested, report
-    if not 0 < float(safety_fraction) <= 1:
-        raise ValueError("batch_probe_safety_fraction must be in (0, 1]")
-
     device = torch.device("cuda", torch.cuda.current_device())
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-    base_allocated = torch.cuda.memory_allocated(device)
-    if runtime_overhead_reserve_bytes is None:
-        # Leave room for Trainer/runtime allocations not represented by the
-        # isolated probe. A near-limit probe can understate the eventual
-        # training peak (optimizer/allocator state and CUDA runtime overhead).
-        runtime_overhead_reserve_bytes = min(4 * 1024**3,
-                                             max(512 * 1024**2, int(free_bytes * 0.20)))
-    runtime_overhead_reserve_bytes = max(0, int(runtime_overhead_reserve_bytes))
-    max_allowed = max(base_allocated, base_allocated + int(free_bytes * float(safety_fraction))
-                      - runtime_overhead_reserve_bytes)
+    base_reserved = int(torch.cuda.memory_reserved(device))
+    runtime_overhead_reserve_bytes = max(0, int(runtime_overhead_reserve_bytes or 0))
+    max_allowed, reserve_bytes = _batch_probe_memory_limit(
+        base_reserved, free_bytes, safety_fraction, runtime_overhead_reserve_bytes)
     report.update({"status": "probing", "device": str(device),
                    "free_memory_bytes_before_probe": int(free_bytes),
                    "total_memory_bytes": int(total_bytes),
-                   "safety_fraction": float(safety_fraction),
+                   "usable_free_vram_fraction": float(safety_fraction),
+                   "reserved_free_vram_fraction": 1.0 - float(safety_fraction),
+                   "memory_reserve_bytes": reserve_bytes,
                    "runtime_overhead_reserve_bytes": runtime_overhead_reserve_bytes,
-                   "memory_limit_bytes": max_allowed})
+                   "memory_limit_reserved_bytes": max_allowed,
+                   "baseline_reserved_bytes": base_reserved})
     cpu_rng = torch.get_rng_state()
     cuda_rng = torch.cuda.get_rng_state_all()
     dataset_lengths = getattr(dataset, "lengths", None)
     probe_order = (sorted(range(len(dataset)), key=lambda idx: dataset_lengths[idx], reverse=True)
                    if dataset_lengths is not None else list(range(len(dataset))))
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    saved_trainable = [parameter.detach().clone() for parameter in trainable]
+    checkpointing_requested = bool(getattr(model, "is_gradient_checkpointing", False))
+    # Keep recovery copies on CPU so the probe does not consume VRAM with a
+    # second copy of every trainable parameter before measuring batch capacity.
+    saved_trainable = [parameter.detach().to(device="cpu", copy=True) for parameter in trainable]
     # Trainer initializes AdamW moments lazily on its first update. Simulate a
     # full-precision AdamW update during probing so the selected batch includes
     # that persistent memory. This is conservative for lower-memory optimizers.
@@ -1887,12 +2022,15 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
             return torch.optim.SGD(trainable, lr=1e-4, weight_decay=float(weight_decay))
         raise ValueError(f"unsupported optimizer for batch-size probe: {optimizer_name}")
 
-    def attempt(size):
+    def attempt(size, *, run_steps=1):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
         model.zero_grad(set_to_none=True)
         batch = None
         probe_optimizer = None
+        checkpointing_enabled = checkpointing_requested and int(size) <= 8
+        if checkpointing_requested:
+            _set_gradient_checkpointing(model, checkpointing_enabled)
         try:
             # Probe the longest examples first so the chosen batch also fits
             # length-grouped batches at the truncation limit.
@@ -1903,27 +2041,60 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
             else:
                 batch = {key: torch.stack([example[key] for example in examples]).to(device)
                          for key in examples[0]}
-            autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
-            with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=use_bf16 or use_fp16):
-                loss = model(**batch).loss
-            if loss is None:
-                raise RuntimeError("batch size probe needs labeled training examples")
-            loss.backward()
             probe_optimizer = make_probe_optimizer()
-            probe_optimizer.step()
-            torch.cuda.synchronize(device)
-            peak = int(torch.cuda.max_memory_allocated(device))
-            fits_headroom = peak <= max_allowed
-            report["attempts"].append({"batch_size": size, "fits": fits_headroom,
-                                       "peak_allocated_bytes": peak,
-                                       "reason": None if fits_headroom else "safety_margin"})
+            autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
+            durations = []
+            actual_tokens = int(batch.get("attention_mask", batch["input_ids"]).sum().item())
+            padded_tokens = int(batch["input_ids"].numel())
+            for _ in range(max(1, int(run_steps))):
+                torch.cuda.synchronize(device)
+                step_started = time.perf_counter()
+                model.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=use_bf16 or use_fp16):
+                    loss = model(**batch).loss
+                if loss is None:
+                    raise RuntimeError("batch size probe needs labeled training examples")
+                loss.backward()
+                probe_optimizer.step()
+                torch.cuda.synchronize(device)
+                durations.append(time.perf_counter() - step_started)
+            peak_allocated = int(torch.cuda.max_memory_allocated(device))
+            peak_reserved = int(torch.cuda.max_memory_reserved(device))
+            fits_headroom = peak_reserved <= max_allowed
+            measured_durations = durations[1:] if len(durations) > 1 else durations
+            measured_seconds = max(sum(measured_durations), 1e-9)
+            measured_steps = len(measured_durations)
+            baseline_used = int(total_bytes) - int(free_bytes)
+            estimated_peak_used = baseline_used + max(0, peak_reserved - base_reserved)
+            record = {"batch_size": size, "fits": fits_headroom,
+                      "gradient_checkpointing": checkpointing_enabled,
+                      "peak_allocated_bytes": peak_allocated,
+                      "peak_reserved_bytes": peak_reserved,
+                      "estimated_peak_gpu_used_bytes": estimated_peak_used,
+                      "peak_vram_utilization": min(1.0, estimated_peak_used / max(1, int(total_bytes))),
+                      "padded_tokens_per_batch": padded_tokens,
+                      "tokens_per_batch": actual_tokens,
+                      "benchmark_steps": measured_steps,
+                      "gpu_processing_seconds": measured_seconds,
+                      "examples_per_second": size * measured_steps / measured_seconds,
+                      "tokens_per_second": actual_tokens * measured_steps / measured_seconds,
+                      "reason": None if fits_headroom else "memory_reserve"}
+            report["attempts"].append(record)
             return fits_headroom
         except RuntimeError as exc:
             oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
             is_oom = (oom_type is not None and isinstance(exc, oom_type)) or "out of memory" in str(exc).lower()
             if not is_oom:
                 raise
-            report["attempts"].append({"batch_size": size, "fits": False, "reason": "cuda_oom"})
+            try:
+                peak_allocated = int(torch.cuda.max_memory_allocated(device))
+                peak_reserved = int(torch.cuda.max_memory_reserved(device))
+            except RuntimeError:
+                peak_allocated = peak_reserved = None
+            report["attempts"].append({"batch_size": size, "fits": False,
+                "gradient_checkpointing": checkpointing_enabled,
+                "peak_allocated_bytes": peak_allocated, "peak_reserved_bytes": peak_reserved,
+                "reason": "cuda_oom"})
             return False
         finally:
             model.zero_grad(set_to_none=True)
@@ -1946,66 +2117,77 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
                     getattr(config, "_name_or_path", None) or model.__class__.__qualname__)
         cache_payload = {"model": identity, "model_class": model.__class__.__qualname__,
             "gpu": torch.cuda.get_device_name(device), "device": str(device),
+            "total_memory_bytes": int(total_bytes),
+            "free_memory_bucket_bytes": int(free_bytes // (256 * 1024**2) * (256 * 1024**2)),
             "precision": "bf16" if use_bf16 else "fp16" if use_fp16 else "fp32",
             "sequence_length": max(dataset_lengths) if dataset_lengths else None,
             "optimizer": str(optimizer_name), "gradient_checkpointing": bool(
                 getattr(getattr(model, "backbone", model), "is_gradient_checkpointing", False)),
             "weight_decay": float(weight_decay),
-            "safety_fraction": float(safety_fraction),
+            "usable_free_vram_fraction": float(safety_fraction),
+            "runtime_overhead_reserve_bytes": runtime_overhead_reserve_bytes,
+            "throughput_benchmark_steps": 3,
             "max_batch_size": maximum}
         cache_key = hashlib.sha256(json.dumps(cache_payload, sort_keys=True).encode()).hexdigest()
         cache_path = Path(os.environ.get("NLM_BATCH_SIZE_CACHE", "artifacts/cache/batch_sizes")) / f"{cache_key}.json"
         cached_size = None
+        cached_max_safe = None
         if cache_path.is_file():
             try:
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
                 candidate_size = int(cached.get("selected_batch_size", 0))
                 if cached.get("cache_key") == cache_key and 0 < candidate_size <= maximum:
                     cached_size = candidate_size
+                    candidate_max = int(cached.get("max_safe_batch_size", 0))
+                    if candidate_size <= candidate_max <= maximum:
+                        cached_max_safe = candidate_max
             except (OSError, ValueError, json.JSONDecodeError):
                 cached_size = None
-        if cached_size is not None and attempt(cached_size):
-            report.update({"status": "cached_validated", "selected_batch_size": cached_size,
-                           "cache_key": cache_key, "cache_validation_passes": 1,
-                           "configured_optimizer": str(optimizer_name),
-                           "probe_optimizer": optimizer_probe,
-                           "optimizer_state_included": True})
-            return cached_size, report
-        if cached_size is not None:
+        cache_validated = (cached_size is not None and cached_max_safe is not None
+                           and attempt(cached_max_safe))
+        if cache_validated:
+            maximum_safe = cached_max_safe
+            report["cache_validation_passes"] = 1
+        else:
+            maximum_safe = None
+        if cached_size is not None and maximum_safe is None:
             cache_path.unlink(missing_ok=True)
-        successful = 0
-        failed = None
-        candidate = 1
-        while candidate <= maximum:
-            if not attempt(candidate):
-                failed = candidate
-                break
-            successful = candidate
-            if candidate == maximum:
-                break
-            candidate = min(candidate * 2, maximum)
-        if successful == 0:
-            raise MemoryError("GPU batch-size probe could not fit batch size 1; reduce max_length or use a smaller model")
-        if failed is not None:
-            low, high = successful + 1, failed - 1
-            while low <= high:
-                mid = (low + high) // 2
-                if attempt(mid):
-                    successful = mid
-                    low = mid + 1
-                else:
-                    high = mid - 1
-        report.update({"status": "selected", "selected_batch_size": successful,
+        if maximum_safe is None:
+            maximum_safe = _largest_safe_batch_size(maximum, attempt)
+        benchmark_results = []
+        for candidate in _nearby_batch_candidates(maximum_safe):
+            before = len(report["attempts"])
+            if attempt(candidate, run_steps=3):
+                benchmark_results.append(report["attempts"][-1])
+            elif len(report["attempts"]) == before:
+                continue
+        if not benchmark_results:
+            raise MemoryError("GPU batch-size throughput probes failed for all safe candidates")
+        selected = _select_throughput_batch_size(benchmark_results)
+        selected_metrics = next(item for item in benchmark_results if int(item["batch_size"]) == selected)
+        report.update({"status": "cached_validated" if cache_validated else "selected",
+                       "max_safe_batch_size": maximum_safe,
+                       "selected_batch_size": selected,
+                       "selected_physical_batch_size": selected,
+                       "effective_optimizer_batch_size": None,
+                       "throughput_candidates": benchmark_results,
+                       "peak_probe_allocated_bytes": max(
+                           (x.get("peak_allocated_bytes") or 0 for x in report["attempts"]), default=0),
+                       "peak_probe_reserved_bytes": max(
+                           (x.get("peak_reserved_bytes") or 0 for x in report["attempts"]), default=0),
+                       "selected_examples_per_second": selected_metrics["examples_per_second"],
+                       "selected_tokens_per_second": selected_metrics["tokens_per_second"],
+                       "selected_padded_tokens_per_batch": selected_metrics["padded_tokens_per_batch"],
+                       "selected_peak_vram_utilization": selected_metrics["peak_vram_utilization"],
                        "cache_key": cache_key,
                        "configured_optimizer": str(optimizer_name),
                        "probe_optimizer": optimizer_probe,
-                       "optimizer_state_included": True,
-                       "peak_probe_allocated_bytes": max(
-                           (x.get("peak_allocated_bytes", 0) for x in report["attempts"]), default=0)})
+                       "optimizer_state_included": True})
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps({"cache_key": cache_key,
-            "selected_batch_size": successful, "config": cache_payload}, indent=2) + "\n")
-        return successful, report
+            "selected_batch_size": selected, "max_safe_batch_size": maximum_safe,
+            "throughput_candidates": benchmark_results, "config": cache_payload}, indent=2) + "\n")
+        return selected, report
     finally:
         model.zero_grad(set_to_none=True)
         model.train()
@@ -2066,6 +2248,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          revision, output_dir="artifacts/checkpoints/qwen", epochs=20, batch_size=4,
                          inference_batch_size=None,
                          max_length=384, learning_rate=1e-4, seed=2026, gradient_accumulation_steps=1,
+                         target_effective_batch_size=None,
                          lora_rank=16, lora_alpha=32,
                          lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
                          resume_checkpoint=None, validation_labels=None, gradient_checkpointing=False,
@@ -2078,8 +2261,6 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          early_stopping_patience=2, trust_remote_code=False,
                          quantization="none", attention_backend=None,
                          checkpoint_selection_metric="balanced_accuracy", save_epoch_checkpoints=False,
-                         calibration_max_samples=5000, calibration_seed=2026,
-                         calibration_full_dataset=False, calibration_enabled=True,
                          training_views=None, training_view_ids=None,
                          _oom_recovery_context=None, _trainer_resume_checkpoint=None):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
@@ -2379,17 +2560,23 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         recovery_context["phase"] = "batch_probe"
         effective_batch_size, batch_probe = _probe_lora_batch_size(
             model, train_dataset, requested_batch_size=batch_size,
-            max_batch_size=max_batch_size or batch_size,
+            max_batch_size=min(int(max_batch_size or batch_size), int(target_effective_batch_size))
+                if target_effective_batch_size is not None else max_batch_size or batch_size,
             safety_fraction=batch_probe_safety_fraction, use_bf16=use_bf16, use_fp16=use_fp16,
             optimizer_name=optimizer, weight_decay=weight_decay,
             gradient_checkpointing_enabled=gradient_checkpointing)
         recovery_context["phase"] = "initialization"
         if training_views is not None:
             train_dataset.set_epoch(0, force=True)
+    effective_batch_size, gradient_accumulation_steps = _resolve_batch_accumulation(
+        effective_batch_size, gradient_accumulation_steps, target_effective_batch_size)
     checkpointing_probe_batch_size = int(effective_batch_size)
     out.mkdir(parents=True,exist_ok=True)
     batch_probe.update({"requested_batch_size":int(batch_size),
                         "effective_batch_size":effective_batch_size,
+                        "selected_physical_batch_size":effective_batch_size,
+                        "target_effective_batch_size":target_effective_batch_size,
+                        "effective_optimizer_batch_size":effective_batch_size*gradient_accumulation_steps,
                         "gradient_accumulation_steps":int(gradient_accumulation_steps),
                         "gradient_checkpointing_enabled":bool(gradient_checkpointing),
                         "gradient_checkpointing_probe_mode":bool(checkpointing_requested),
@@ -2399,9 +2586,15 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                         "pad_to_multiple_of":8})
     (out/"batch_size_probe.json").write_text(json.dumps(batch_probe,indent=2)+"\n")
     print(f"LoRA batch-size selection: {json.dumps(batch_probe,sort_keys=True)}",flush=True)
-    steps_per_epoch=max(1,math.ceil(len(train_dataset)/(effective_batch_size*gradient_accumulation_steps)))
+    steps_per_epoch=_optimizer_steps_per_epoch(
+        len(train_dataset),effective_batch_size,gradient_accumulation_steps)
     progress_callback=_live_training_progress_callback(
-        TrainerCallback, out, steps_per_epoch=steps_per_epoch, epochs=epochs)
+        TrainerCallback, out, steps_per_epoch=steps_per_epoch, epochs=epochs,
+        physical_batch_size=effective_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        mean_tokens_per_example=(float(np.mean(train_dataset.lengths))
+                                 if train_dataset.lengths else None),
+        torch_module=torch)
     warmup_basis_epochs=min(int(epochs),int(warmup_epochs)) if warmup_epochs is not None else int(epochs)
     warmup_steps=math.ceil(float(warmup_ratio)*steps_per_epoch*warmup_basis_epochs)
     args=tr.TrainingArguments(output_dir=str(output_dir),num_train_epochs=epochs,
@@ -2509,6 +2702,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     startup_seconds = time.perf_counter() - start
     recovery_context["phase"] = "training"
     training_started = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     trainer.train(resume_from_checkpoint=_trainer_resume_checkpoint)
     recovery_context["phase"] = "inference"
     training_seconds = time.perf_counter() - training_started
@@ -2573,29 +2768,6 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         inference_stats.append(stats)
         return scores, stats
 
-    calibration_metrics={"calibration_enabled":bool(calibration_enabled),
-        "calibration_full_dataset":bool(calibration_full_dataset),"calibration_seed":int(calibration_seed)}
-    calibration_inference_seconds=0.0;temperature_fit_seconds=0.0
-    calibration_stats=None;temperature=1.0
-    if calibration_enabled:
-        calibration_indices = _calibration_indices(y_train, max_samples=calibration_max_samples,
-            seed=calibration_seed, full_dataset=calibration_full_dataset)
-        calibration_labels = np.asarray(y_train, dtype=object)[calibration_indices].tolist()
-        calibration_dataset = torch.utils.data.Subset(train_dataset, calibration_indices.tolist())
-        calibration_inference_started = time.perf_counter()
-        train_logits, calibration_stats = predict_cached(calibration_dataset)
-        calibration_inference_seconds = time.perf_counter() - calibration_inference_started
-        temperature_fit_started = time.perf_counter()
-        temperature, fitted_metrics = _temperature_if_enabled(train_logits, calibration_labels, classes,
-            enabled=True, seed=calibration_seed)
-        temperature_fit_seconds = time.perf_counter() - temperature_fit_started
-        calibration_metrics.update(fitted_metrics)
-        calibration_metrics.update({"calibration_enabled":True,
-            "calibration_sample_size":int(len(calibration_indices)),
-            "calibration_full_dataset":bool(len(calibration_indices)==len(y_train)),
-            "calibration_seed":int(calibration_seed)})
-    calibration_metrics["calibration_inference_seconds"]=calibration_inference_seconds
-    calibration_metrics["temperature_fit_seconds"]=temperature_fit_seconds
     selected_prediction = _selected_epoch_scores(snapshot_callback.validation_predictions,
         best_epoch, (len(validation_dataset_rows), len(classes)))
     final_validation_reused_epoch_predictions = selected_prediction is not None
@@ -2614,38 +2786,27 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     (out/"checkpoint_manifest.json").write_text(json.dumps(checkpoint_metadata,indent=2)+"\n")
     checkpoint_save_seconds = time.perf_counter() - checkpoint_started
     if not np.isfinite(logits).all(): raise ValueError("Qwen adapter produced non-finite scores")
-    probs=softmax(logits/temperature,axis=1)
+    probs=softmax(logits,axis=1)
     validation_loss_raw = (selected.get("eval_loss") if eval_each_epoch else None)
     if validation_loss_raw is None and validation_labels is not None:
         from sklearn.metrics import log_loss
         validation_loss_raw = float(log_loss(
             validation_labels, softmax(logits, axis=1), labels=list(classes)))
-    validation_loss_calibrated = None
-    if validation_labels is not None:
-        from sklearn.metrics import log_loss
-        validation_loss_calibrated = float(log_loss(
-            validation_labels, probs, labels=list(classes)))
-        if eval_each_epoch:
-            selected["validation_loss_raw"] = float(validation_loss_raw)
-            selected["validation_loss_calibrated"] = validation_loss_calibrated
-            selected["calibration_temperature"] = float(temperature)
-        for entry in validation_metrics_by_epoch:
-            if entry.get("eval_loss") is not None:
-                entry["validation_loss_raw"] = float(entry["eval_loss"])
+    if eval_each_epoch:
+        selected["validation_loss_raw"] = float(validation_loss_raw)
+    for entry in validation_metrics_by_epoch:
+        if entry.get("eval_loss") is not None:
+            entry["validation_loss_raw"] = float(entry["eval_loss"])
     trainable=sum(p.numel() for p in model.parameters() if p.requires_grad)
     effective_post_inference_batch_size = min(
         (item["effective_inference_batch_size"] for item in inference_stats),
         default=requested_inference_batch_size)
     return {"scores":logits,"probabilities":probs,"model":model,"tokenizer":tokenizer,
         "fit_seconds":time.perf_counter()-start,"inference_seconds":inference_seconds,
-        "classes":list(classes),"trainable_parameters":trainable,"calibration_temperature":temperature,
-        "calibration_enabled":bool(calibration_enabled),
-        "calibration_method":"train-only scalar temperature" if calibration_enabled else "disabled",
-        **calibration_metrics,
+        "classes":list(classes),"trainable_parameters":trainable,
         "validation_metrics_by_epoch":validation_metrics_by_epoch,
         "validation_loss_raw": (float(validation_loss_raw)
                                 if validation_loss_raw is not None else None),
-        "validation_loss_calibrated": validation_loss_calibrated,
         "validation_predictions_by_epoch":snapshot_callback.validation_predictions,
         "early_stopping": (_early_stopping_summary(early_stopping_callback, early_stopping_patience, epochs,
                                                     metric=checkpoint_selection_metric)
@@ -2666,9 +2827,6 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             "effective_epoch_eval_batch_size":int(getattr(trainer,"effective_eval_batch_size",
                 trainer.args.per_device_eval_batch_size)),
             "best_checkpoint_restoration_seconds":float(best_checkpoint_restoration_seconds),
-            "calibration_inference_seconds":float(calibration_inference_seconds),
-            "calibration_rows_per_second":(calibration_stats or {}).get("inference_rows_per_second"),
-            "temperature_fit_seconds":float(temperature_fit_seconds),
             "final_validation_inference_seconds":float(inference_seconds),
             "final_validation_rows_per_second":(final_inference_stats or {}).get("inference_rows_per_second"),
             "effective_inference_batch_size":effective_post_inference_batch_size,
@@ -2679,10 +2837,13 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                 float(getattr(trainer,"validation_seconds",0.0))),
             "model_post_training_seconds":float(time.perf_counter()-post_training_started)},
         "requested_batch_size":int(batch_size),"effective_batch_size":effective_batch_size,
+        "selected_physical_batch_size":effective_batch_size,
+        "effective_optimizer_batch_size":effective_batch_size*int(gradient_accumulation_steps),
         "gradient_accumulation_steps":int(gradient_accumulation_steps),
         "requested_inference_batch_size":requested_inference_batch_size,
         "lr_scheduler_type":scheduler,"warmup_ratio":float(warmup_ratio),
         "batch_size_probe":batch_probe,
         "quantization":quantization,"quantization_config":quantization_config,
         "attention_backend":attention_backend,
-        "peak_gpu_memory_bytes":int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None}
+        "peak_gpu_memory_bytes":int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None,
+        "peak_gpu_memory_reserved_bytes":int(torch.cuda.max_memory_reserved()) if torch.cuda.is_available() else None}

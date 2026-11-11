@@ -1,4 +1,4 @@
-"""Focused tests for deterministic training cache/calibration helpers (no model training)."""
+"""Focused tests for training optimization helpers (no model training)."""
 import json
 import inspect
 import os
@@ -32,28 +32,40 @@ def _torch_available():
 
 
 class TrainingOptimizationHelperTests(unittest.TestCase):
-    def test_calibration_subset_is_deterministic_stratified_and_train_only(self):
-        labels = ["a"] * 80 + ["b"] * 15 + ["c"] * 5
-        logits = np.random.default_rng(9).normal(size=(len(labels), 3))
-        first, report = model_factory._fit_temperature(logits, labels, ["a", "b", "c"],
-            max_samples=30, seed=17, return_metrics=True)
-        second, _ = model_factory._fit_temperature(logits, labels, ["a", "b", "c"],
-            max_samples=30, seed=17, return_metrics=True)
-        self.assertEqual(first, second)
-        self.assertEqual(report["calibration_sample_size"], 30)
-        self.assertTrue(all(np.count_nonzero(np.asarray(labels)[
-            model_factory._calibration_indices(labels, max_samples=30, seed=17)] == label) > 0
-            for label in ("a", "b", "c")))
-        self.assertTrue(np.isfinite([report["calibration_raw_loss"],
-                                     report["calibration_calibrated_loss"]]).all())
+    def test_batch_search_selects_arbitrary_integer_maximum(self):
+        attempts = []
+        selected = model_factory._largest_safe_batch_size(
+            37, lambda size: attempts.append(size) or size <= 11)
+        self.assertEqual(selected, 11)
+        self.assertIn(11, attempts)
+        self.assertIn(12, attempts)
 
-    def test_default_calibration_sample_is_capped_at_five_thousand(self):
-        labels = np.repeat(np.asarray(["a", "b", "c", "d"]), 1500)
-        first = model_factory._calibration_indices(labels)
-        second = model_factory._calibration_indices(labels)
-        np.testing.assert_array_equal(first, second)
-        self.assertEqual(len(first), 5000)
-        self.assertEqual(set(labels[first]), {"a", "b", "c", "d"})
+    def test_configurable_vram_reserve_uses_five_to_ten_percent(self):
+        limit_5, reserve_5 = model_factory._batch_probe_memory_limit(100, 1000, .95)
+        limit_8, reserve_8 = model_factory._batch_probe_memory_limit(100, 1000, .92)
+        self.assertEqual((limit_5, reserve_5), (1050, 50))
+        self.assertEqual((limit_8, reserve_8), (1020, 80))
+        limit_explicit, reserve_explicit = model_factory._batch_probe_memory_limit(
+            100, 1000, .95, explicit_reserve_bytes=120)
+        self.assertEqual((limit_explicit, reserve_explicit), (980, 120))
+
+    def test_effective_batch_target_uses_largest_exact_fit_physical_batch(self):
+        self.assertEqual(model_factory._resolve_batch_accumulation(16, 1), (16, 1))
+        self.assertEqual(model_factory._resolve_batch_accumulation(16, 8, 16), (16, 1))
+        self.assertEqual(model_factory._resolve_batch_accumulation(11, 1, 32), (8, 4))
+
+    def test_throughput_selection_prefers_fastest_safe_candidate(self):
+        selected = model_factory._select_throughput_batch_size([
+            {"batch_size": 16, "fits": True, "examples_per_second": 90.0},
+            {"batch_size": 12, "fits": True, "examples_per_second": 105.0},
+            {"batch_size": 8, "fits": False, "examples_per_second": 200.0},
+        ])
+        self.assertEqual(selected, 12)
+        self.assertEqual(model_factory._nearby_batch_candidates(13), [13, 12, 11, 9])
+
+    def test_optimizer_step_count_uses_physical_batch_and_accumulation(self):
+        self.assertEqual(model_factory._optimizer_steps_per_epoch(101, 16, 1), 7)
+        self.assertEqual(model_factory._optimizer_steps_per_epoch(101, 8, 2), 7)
 
     def test_ragged_tokenization_cache_preserves_row_order_and_invalidates_mismatches(self):
         rows = [{"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]},
@@ -123,15 +135,6 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertEqual(info["inference_oom_fallbacks"], 2)
         self.assertGreater(info["inference_rows_per_second"], 0)
 
-    def test_temperature_calibration_can_be_disabled_without_fitting(self):
-        with patch.object(model_factory, "_fit_temperature") as fit:
-            temperature, record = model_factory._temperature_if_enabled(
-                np.ones((3, 2)), ["a", "b", "a"], ["a", "b"], enabled=False)
-        fit.assert_not_called()
-        self.assertEqual(temperature, 1.0)
-        self.assertFalse(record["calibration_enabled"])
-        self.assertIsNone(record["calibration_sample_size"])
-
     @unittest.skipUnless(_torch_available(), "PyTorch selected checkpoint restore check")
     def test_ultrabert_cpu_snapshot_restores_exact_weights(self):
         import torch
@@ -175,7 +178,7 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertTrue(encoder_calls["save_epoch_checkpoints"])
         self.assertEqual(frozen_calls["inference_batch_size"], 11)
 
-    def test_catboost_disabled_temperature_skips_calibration_prediction(self):
+    def test_catboost_uses_standard_softmax_without_extra_training_inference(self):
         import sys
         class FakeCatBoost:
             calls = []
@@ -197,14 +200,14 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
             result = model_factory.train_catboost_stylometry(
                 ["train a", "train b"], ["a", "b"], ["valid a", "valid b"], ["a", "b"],
                 output_dir=Path(temp), iterations=2, validation_labels=["a", "b"],
-                calibration_enabled=False,
                 feature_matrices=(np.zeros((2, 1)), np.zeros((2, 1)), ["f"]))
+            checkpoint_metadata = json.loads((Path(temp) / "stylometry.json").read_text())
         self.assertEqual([entry for entry in FakeCatBoost.calls if entry[0] == "predict"],
                          [("predict", 2)])
-        self.assertEqual(result["calibration_temperature"], 1.0)
-        self.assertFalse(result["calibration_enabled"])
-        self.assertIsNone(result.get("calibration_sample_size"))
-        self.assertTrue(np.allclose(result["probabilities"], result["probabilities"][0]))
+        expected = __import__("scipy.special", fromlist=["softmax"]).softmax(result["scores"], axis=1)
+        np.testing.assert_allclose(result["probabilities"], expected)
+        self.assertFalse(any("calibrat" in key for key in result))
+        self.assertFalse(any("calibrat" in key for key in checkpoint_metadata))
         fit_kwargs = next(entry[1] for entry in FakeCatBoost.calls if entry[0] == "fit")
         self.assertIsInstance(result["model"].kwargs["eval_metric"], model_factory._BalancedAccuracyMetric)
         self.assertEqual(fit_kwargs["early_stopping_rounds"], 100)
@@ -231,36 +234,36 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                 patch.object(pipeline, "train_catboost_stylometry", side_effect=fake_train):
             pipeline._train_fold("catboost_stylometry", train, valid, ["a", "b"],
                 {"feature_recipe": {"baseline": [], "groups": []}, "iterations": 3,
-                 "early_stopping_rounds": 7, "calibration_enabled": False},
+                 "early_stopping_rounds": 7},
                 Path(temp), 2026, "validation", Path(temp) / "features")
         self.assertNotIn("save_epoch_checkpoints", calls)
         self.assertEqual(calls["checkpoint_selection_metric"], "balanced_accuracy")
         self.assertEqual(calls["early_stopping_rounds"], 7)
-        self.assertFalse(calls["calibration_enabled"])
 
-    def test_post_training_runtime_has_stable_stage_keys(self):
+    def test_post_training_runtime_has_stable_noncalibration_stage_keys(self):
         runtime = pipeline._post_training_runtime({"inference_seconds": 1.25,
-            "runtime_breakdown": {"temperature_fit_seconds": 0.04}})
-        self.assertEqual(runtime["temperature_fit_seconds"], 0.04)
+            "runtime_breakdown": {"final_validation_inference_seconds": 1.25}})
+        self.assertNotIn("temperature_fit_seconds", runtime)
+        self.assertNotIn("calibration_inference_seconds", runtime)
         self.assertEqual(runtime["final_validation_inference_seconds"], 1.25)
         self.assertEqual(runtime["best_checkpoint_restoration_seconds"], 0.0)
         self.assertEqual(runtime["manifest_prediction_export_seconds"], 0.0)
         self.assertEqual(runtime["total_post_training_seconds"], 0.0)
         self.assertEqual(runtime["inference_oom_fallbacks"], 0)
 
-    def test_lora_qlora_and_continuation_paths_expose_inference_controls(self):
+    def test_lora_qlora_and_continuation_paths_expose_inference_controls_without_calibration(self):
         parameters = inspect.signature(model_factory.train_qwen_lora_fold).parameters
         self.assertIn("inference_batch_size", parameters)
-        self.assertIn("calibration_enabled", parameters)
+        self.assertFalse(any("calibrat" in name for name in parameters))
         self.assertIn("quantization", parameters)
         qwen_cfg = pipeline._model_cfg("qwen06")
         self.assertEqual(qwen_cfg["inference_batch_size"], 8)
-        self.assertTrue(qwen_cfg["calibration_enabled"])
+        self.assertFalse(any("calibrat" in key for key in qwen_cfg))
         catboost_cfg = pipeline._model_cfg("catboost_stylometry")
-        self.assertTrue(catboost_cfg["calibration_enabled"])
+        self.assertFalse(any("calibrat" in key for key in catboost_cfg))
         encoder_parameters = inspect.signature(model_factory.train_encoder_fold).parameters
         self.assertIn("inference_batch_size", encoder_parameters)
-        self.assertIn("calibration_enabled", encoder_parameters)
+        self.assertFalse(any("calibrat" in name for name in encoder_parameters))
 
     def test_epoch_predictions_are_reused_only_for_matching_selected_checkpoint(self):
         epoch_predictions = [{"epoch": 1, "scores": np.ones((2, 3))},
@@ -383,8 +386,7 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
             def fake_result(**extra):
                 return {"scores": scores, "probabilities": probabilities,
                     "fit_seconds": .1, "inference_seconds": 0.,
-                    "calibration_temperature": 1., "calibration_enabled": False,
-                    "calibration_sample_size": None, "validation_metrics_by_epoch": [],
+                    "validation_metrics_by_epoch": [],
                     "validation_predictions_by_epoch": [], "best_epoch": 1,
                     "best_validation_accuracy": 1., "best_validation_balanced_accuracy": 1.,
                     "checkpoint_selection_metric": "validation_balanced_accuracy",
@@ -442,12 +444,12 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                                                 "calibration_enabled": True})
         self.assertEqual(calls["qwen"]["inference_batch_size"], 5)
         self.assertEqual(calls["qwen"]["batch_size"], 3)
-        self.assertTrue(calls["qwen"]["calibration_enabled"])
+        self.assertNotIn("calibration_enabled", calls["qwen"])
         self.assertTrue(calls["qwen"]["auto_batch_size"])
         self.assertTrue(calls["qwen"]["gradient_checkpointing"])
         self.assertEqual(calls["encoder"]["inference_batch_size"], 8)
         self.assertEqual(calls["encoder"]["batch_size"], 4)
-        self.assertTrue(calls["encoder"]["calibration_enabled"])
+        self.assertNotIn("calibration_enabled", calls["encoder"])
         self.assertTrue(calls["encoder"]["auto_batch_size"])
         self.assertEqual(calls["encoder"]["max_batch_size"], 64)
         self.assertEqual(calls["encoder"]["batch_probe_safety_fraction"], 0.8)

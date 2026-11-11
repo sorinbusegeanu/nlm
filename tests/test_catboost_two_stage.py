@@ -55,8 +55,7 @@ class CatBoostTwoStageTests(unittest.TestCase):
                 stylometry(stage1_text, recipe), prediction_type="RawFormulaVal", ntree_end=3)
             np.testing.assert_allclose(prefix2, prefix1, atol=1e-8, rtol=1e-8)
             reloaded, _ = predict_catboost_stylometry(
-                root / "stage2", valid_text, classes,
-                temperature=second["calibration_temperature"])
+                root / "stage2", valid_text, classes)
             np.testing.assert_allclose(reloaded, second["probabilities"], atol=1e-7, rtol=1e-6)
 
     def test_stage_recipes_have_matching_feature_schemas(self):
@@ -132,9 +131,7 @@ class CatBoostTwoStageTests(unittest.TestCase):
         result = {"scores": np.array([[2., 0.], [0., 2.]]),
                   "probabilities": np.array([[.9, .1], [.1, .9]]),
                   "model": None, "fit_seconds": 0.1, "inference_seconds": 0.01,
-                  "calibration_temperature": 1.0, "calibration_method": "train-only scalar temperature",
-                  "runtime_breakdown": {"calibration_inference_seconds": 0.0,
-                      "temperature_fit_seconds": 0.0},
+                  "runtime_breakdown": {},
                   "final_validation_reused_existing_predictions": True,
                   "feature_names": _select_matrix(full, names, recipe)[1], "tree_count": 1}
 
@@ -158,7 +155,7 @@ class CatBoostTwoStageTests(unittest.TestCase):
                     dataset_name="v1_all", train=train, valid=valid, classes=classes,
                     recipe=recipe, iterations=1,
                     cfg={"depth": 2, "learning_rate": .05, "l2_leaf_reg": 5,
-                         "thread_count": 1, "temperature_calibration": True}, seed=2026,
+                         "thread_count": 1}, seed=2026,
                     checkpoint=checkpoint, parent_checkpoint=None, parent_sha256=None,
                     matrices={"full": full, "all_names": names,
                               "offsets": {"stage1_train": (0, len(train)),
@@ -168,8 +165,8 @@ class CatBoostTwoStageTests(unittest.TestCase):
                     registry_path=root / "registry.sqlite", code_revision="test",
                     validation_dataset="v0", train_matrix_role="stage1_train")
             manifest = json.loads(Path(saved["manifest_path"]).read_text())
-            self.assertEqual(manifest["runtime_breakdown"]["calibration_inference_seconds"], 0.0)
-            self.assertEqual(manifest["runtime_breakdown"]["temperature_fit_seconds"], 0.0)
+            self.assertFalse(any("calibrat" in key for key in manifest))
+            self.assertFalse(any("calibrat" in key for key in manifest["runtime_breakdown"]))
             self.assertFalse(manifest["final_validation_reused_existing_predictions"])
             self.assertEqual(manifest["checkpoint_scoring_method"], "fresh_validation_prediction_after_fit")
 

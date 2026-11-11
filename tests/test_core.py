@@ -111,13 +111,15 @@ class FeatureAndModelTests(unittest.TestCase):
             _,_,_,key_b=load_or_fit(["train text alpha", "train text beta"],["different valid text"],config={"views":["word"]},cache_dir=td,fold_token="f0")
             self.assertNotEqual(key_a,key_b)
 
-    def test_svc_returns_aligned_raw_and_calibrated_outputs(self):
+    def test_svc_returns_aligned_raw_and_softmax_probabilities(self):
         train_text=[];labels=[]
         for label,token in [("a","aardvark"),("b","bananas"),("c","copper")]:
             for i in range(12):train_text.append(f"{token} common language sample number {i}");labels.append(label)
-        result=train_svc(train_text,labels,["aardvark common validation","bananas common validation"],["a","b","c"],calibration_cv=2)
+        result=train_svc(train_text,labels,["aardvark common validation","bananas common validation"],["a","b","c"])
         self.assertEqual(result["scores"].shape,(2,3));self.assertEqual(result["probabilities"].shape,(2,3))
         self.assertTrue(np.isfinite(result["scores"]).all());self.assertTrue(np.allclose(result["probabilities"].sum(1),1))
+        np.testing.assert_allclose(result["probabilities"], __import__("scipy.special", fromlist=["softmax"]).softmax(result["scores"], axis=1))
+        self.assertFalse(any("calibrat" in key for key in result))
 
     def test_cross_fitted_weights_and_registry(self):
         y=np.array(["a","b"]*10);p1=np.eye(2)[np.arange(20)%2]*.8+.1;p2=np.eye(2)[np.arange(20)%2]*.6+.2
@@ -164,7 +166,7 @@ class FeatureAndModelTests(unittest.TestCase):
         train_text=[];labels=[]
         for label,token in [("a","aardvark"),("b","bananas"),("c","copper")]:
             for i in range(8):train_text.append(f"{token} common language sample number {i}");labels.append(label)
-        result=train_svc(train_text,labels,["aardvark common"],["a","b","c"],calibration_cv=2)
+        result=train_svc(train_text,labels,["aardvark common"],["a","b","c"])
         with tempfile.TemporaryDirectory() as td:
             checkpoint=Path(td)/"model.joblib"
             joblib.dump({"model":result["model"],"features":result["features"],"classes":["a","b","c"]},checkpoint)

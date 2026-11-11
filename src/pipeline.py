@@ -96,6 +96,18 @@ def _read_yaml(path):
     with open(path, encoding="utf-8") as stream: return yaml.safe_load(stream) or {}
 
 
+_OBSOLETE_TRAINING_CONFIG_FIELDS = {
+    "calibration", "calibration_cv", "calibration_enabled", "calibration_full_dataset",
+    "calibration_max_samples", "calibration_seed", "temperature_calibration",
+}
+
+
+def _strip_obsolete_calibration_config(config):
+    for key in _OBSOLETE_TRAINING_CONFIG_FIELDS:
+        config.pop(key, None)
+    return config
+
+
 def _sha(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -637,8 +649,6 @@ def _post_training_runtime(result):
     """Normalize post-fit stage durations across model families."""
     runtime = dict(result.get("runtime_breakdown") or {})
     runtime.setdefault("best_checkpoint_restoration_seconds", 0.0)
-    runtime.setdefault("calibration_inference_seconds", None)
-    runtime.setdefault("temperature_fit_seconds", None)
     runtime.setdefault("final_validation_inference_seconds", result.get("inference_seconds"))
     runtime.setdefault("checkpoint_serialization_seconds", runtime.get("checkpoint_save_seconds", 0.0))
     runtime.setdefault("manifest_prediction_export_seconds", 0.0)
@@ -646,7 +656,6 @@ def _post_training_runtime(result):
     runtime.setdefault("checkpoint_snapshot_seconds", runtime.get("best_checkpoint_state_snapshot_seconds", 0.0))
     runtime.setdefault("best_checkpoint_state_snapshot_seconds", runtime.get("checkpoint_snapshot_seconds", 0.0))
     runtime.setdefault("effective_inference_batch_size", result.get("effective_inference_batch_size"))
-    runtime.setdefault("calibration_rows_per_second", result.get("calibration_rows_per_second"))
     runtime.setdefault("final_validation_rows_per_second", result.get("final_validation_rows_per_second"))
     runtime.setdefault("inference_oom_fallbacks", result.get("inference_oom_fallbacks", 0))
     runtime.setdefault("prediction_export_seconds", 0.0)
@@ -687,20 +696,18 @@ def _model_cfg(model, config_path=None):
     path = Path(config_path or MODEL_CONFIGS[model])
     if not path.exists(): raise FileNotFoundError(f"model config not found: {path}")
     cfg = _read_yaml(path)
+    _strip_obsolete_calibration_config(cfg)
     cfg.setdefault("model", model)
     if cfg["model"] != model: raise ValueError(f"model config {path} declares {cfg['model']!r}, expected {model!r}")
     cfg["_config_path"] = str(path)
-    if model == "catboost_stylometry" or (model != "svc" and
-            (model not in FROZEN_BACKBONE_MODELS or cfg.get("training_mode", "frozen") != "frozen")):
-        cfg.setdefault("calibration_enabled", cfg.get("temperature_calibration", True))
     if model not in {"svc", "catboost_stylometry"}:
         cfg.setdefault("inference_batch_size", max(8, int(cfg.get("batch_size", 1))))
     if model not in {"svc", "catboost_stylometry"} and (not cfg.get("checkpoint") or not cfg.get("revision")):
         raise ValueError(f"{model} needs an explicit checkpoint and immutable revision in {path}")
     if model not in {"svc", "catboost_stylometry"} and not re.fullmatch(r"[0-9a-fA-F]{40}", str(cfg["revision"])):
         raise ValueError(f"{model} revision in {path} must be a full 40-character commit hash, not a branch or tag")
-    if model == "svc" and (float(cfg.get("C", .5)) <= 0 or int(cfg.get("calibration_cv", 3)) < 2):
-        raise ValueError(f"SVC config {path} needs C > 0 and calibration_cv >= 2")
+    if model == "svc" and float(cfg.get("C", .5)) <= 0:
+        raise ValueError(f"SVC config {path} needs C > 0")
     if model == "catboost_stylometry" and (int(cfg.get("iterations", 0)) < 1
             or not 1 <= int(cfg.get("depth", 0)) <= 16 or int(cfg.get("thread_count", 0)) < 1):
         raise ValueError(f"CatBoost config {path} needs positive iterations/thread_count and depth in [1, 16]")
@@ -732,7 +739,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
                            "selected_view_counts": counts}
     if model == "svc":
         result = train_svc(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
-                           c=cfg.get("C", .5), calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
+                           c=cfg.get("C", .5), seed=seed,
                            feature_config=cfg.get("features", {"views": ["char", "word"]}),
                            cache_dir=cache_dir, fold_token=cache_fold or f"fold-{fold}",
                            validation_labels=valid.model.tolist())
@@ -759,17 +766,12 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             iterations=cfg.get("iterations", 800), depth=cfg.get("depth", 7),
             learning_rate=cfg.get("learning_rate", .05), l2_leaf_reg=cfg.get("l2_leaf_reg", 5),
             thread_count=cfg.get("thread_count", 8), seed=seed,
-            temperature_calibration=cfg.get("temperature_calibration", True),
-            calibration_enabled=cfg.get("calibration_enabled", cfg.get("temperature_calibration", True)),
             validation_labels=valid.model.tolist(),
             early_stopping_rounds=cfg.get("early_stopping_rounds", 100),
             feature_recipe=feature_config.get("stylometry_recipe"),
             feature_matrices=(x_train.toarray(), x_valid.toarray(),
                               feature_transform.stylometry_feature_names),
-            checkpoint_selection_metric=checkpoint_selection_metric,
-            calibration_max_samples=cfg.get("calibration_max_samples", 5000),
-            calibration_seed=cfg.get("calibration_seed", seed),
-            calibration_full_dataset=cfg.get("calibration_full_dataset", False))
+            checkpoint_selection_metric=checkpoint_selection_metric)
         result["cache_key"] = cache_key
         result["checkpoint"] = str(checkpoint)
     elif model == "ultrabert380":
@@ -780,6 +782,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             inference_batch_size=cfg.get("inference_batch_size"), max_length=cfg["max_length"],
             learning_rate=cfg.get("learning_rate", 2e-5), seed=seed,
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
+            target_effective_batch_size=cfg.get("target_effective_batch_size"),
             local_files_only=cfg.get("local_files_only", True),
             validation_labels=valid.model.tolist(),
             learning_rate_decay=cfg.get("learning_rate_decay"),
@@ -792,13 +795,10 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             auto_batch_size=cfg.get("auto_batch_size", False),
             max_batch_size=cfg.get("max_batch_size", 1024),
             batch_probe_safety_fraction=cfg.get("batch_probe_safety_fraction", 0.95),
+            gradient_checkpointing=cfg.get("gradient_checkpointing", False),
             select_best_checkpoint=(checkpoint_selection_metric == "balanced_accuracy"
                 or cfg.get("checkpoint_selection") == "highest_validation_accuracy"),
             checkpoint_selection_metric=checkpoint_selection_metric,
-            calibration_max_samples=cfg.get("calibration_max_samples", 5000),
-            calibration_seed=cfg.get("calibration_seed", seed),
-            calibration_full_dataset=cfg.get("calibration_full_dataset", False),
-            calibration_enabled=cfg.get("calibration_enabled", True),
             save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False),
             trainer_resume_checkpoint=cfg.get("trainer_resume_checkpoint"),
             training_views=training_views, training_view_ids=training_view_ids)
@@ -810,8 +810,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             output_dir=checkpoint, max_length=cfg["max_length"],
             batch_size=cfg.get("batch_size", 8),
             inference_batch_size=cfg.get("inference_batch_size", cfg.get("batch_size", 8)),
-            c=cfg.get("C", .5),
-            calibration_cv=cfg.get("calibration_cv", 3), seed=seed,
+            c=cfg.get("C", .5), seed=seed,
             fix_mistral_regex=cfg.get("fix_mistral_regex", False),
             validation_labels=valid.model.tolist(),
             train_row_ids=train.id.astype(str).tolist(),
@@ -827,6 +826,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             epochs=cfg.get("epochs", 20), batch_size=cfg.get("batch_size", 4), max_length=cfg["max_length"],
             learning_rate=cfg.get("learning_rate", 1e-4), seed=seed,
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
+            target_effective_batch_size=cfg.get("target_effective_batch_size"),
             lora_rank=cfg.get("lora_rank", 16), lora_alpha=cfg.get("lora_alpha", 32),
             lora_target_modules=cfg.get("lora_target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]),
             learning_rate_decay=cfg.get("learning_rate_decay", 1.0),
@@ -854,10 +854,6 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             checkpoint_selection_metric=checkpoint_selection_metric,
             save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False),
             inference_batch_size=cfg.get("inference_batch_size"),
-            calibration_max_samples=cfg.get("calibration_max_samples", 5000),
-            calibration_seed=cfg.get("calibration_seed", seed),
-            calibration_full_dataset=cfg.get("calibration_full_dataset", False),
-            calibration_enabled=cfg.get("calibration_enabled", True),
             training_views=training_views, training_view_ids=training_view_ids)
         result["checkpoint"] = str(checkpoint)
     else: raise ValueError(f"unknown model: {model}")
@@ -885,6 +881,25 @@ def _dataset_max_length(model, cfg, rows, *, checkpoint=None, revision=None):
         trust_remote_code=cfg.get("trust_remote_code", model == "ultrabert380"),
         fix_mistral_regex=cfg.get("fix_mistral_regex", False),
         local_files_only=cfg.get("local_files_only", True))
+
+
+def _profile_max_length_override(model, cfg, profile):
+    """Use the pinned token-window limit for datasets built with that tokenizer."""
+    if not profile.get("chunking_strategy"):
+        return None
+    if model != "ultrabert380":
+        return None
+    tokenizer_id = profile.get("tokenizer_id")
+    tokenizer_revision = profile.get("tokenizer_revision")
+    if cfg.get("checkpoint") and cfg["checkpoint"] != tokenizer_id:
+        raise ValueError("training checkpoint differs from the token-chunk tokenizer")
+    if cfg.get("revision") and cfg["revision"] != tokenizer_revision:
+        raise ValueError("training tokenizer revision differs from the token-chunk tokenizer")
+    maximum = int(profile["max_encoded_length"])
+    observed = int(profile.get("maximum_observed_encoded_length", maximum))
+    if observed > maximum:
+        raise ValueError(f"chunk profile has encoded length {observed} over its limit {maximum}")
+    return maximum
 
 
 def _resolve_checkpoint_path(path, artifact_dir):
@@ -938,8 +953,7 @@ def _save_epoch_validation_predictions(result, valid, classes, prediction_dir, e
         records.append({"epoch": epoch, "path": str(path), "rows": len(frame),
                         "sha256": hashlib.sha256(payload).hexdigest(),
                         "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
-                        "class_order": list(classes),
-                        "probability_calibration": "uncalibrated_softmax_from_validation_logits"})
+                        "class_order": list(classes)})
     return records
 
 
@@ -966,6 +980,7 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
     cfg = _model_cfg(model, config_path)
     if config_overrides:
         cfg.update(config_overrides)
+        _strip_obsolete_calibration_config(cfg)
         _validate_training_overrides(model, cfg)
     if model in {"svc", "catboost_stylometry"} and feature_config_path:
         cfg["features"] = _read_yaml(feature_config_path)
@@ -973,8 +988,9 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
     classes = sorted(train.model.astype(str).unique().tolist())
     train_profile = json.loads(_profile_path(Path(data_dir), dataset).read_text())
     if model not in {"svc", "catboost_stylometry"}:
-        if model == "ultrabert380" and train_profile.get("chunking_strategy"):
-            cfg["max_length"] = int(train_profile["max_encoded_length"])
+        profile_max_length = _profile_max_length_override(model, cfg, train_profile)
+        if profile_max_length is not None:
+            cfg["max_length"] = profile_max_length
         else:
             cfg["max_length"] = _dataset_max_length(model, cfg, pd.concat([train, valid], ignore_index=True))
     train_hash = _partition_sha256(train)
@@ -1027,14 +1043,10 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
             or not np.allclose(probabilities.sum(axis=1), 1, atol=1e-5)):
         raise RuntimeError("V0 validation output is incomplete or non-finite")
     metrics = evaluate(valid.model.astype(str), scores, classes, probabilities)
-    for name in ("validation_loss_raw", "validation_loss_calibrated"):
-        if result.get(name) is not None:
-            metrics[name] = float(result[name])
-    metrics["calibration_temperature"] = result.get("calibration_temperature")
-    for key in ("calibration_sample_size", "calibration_full_dataset", "calibration_seed",
-                "calibration_raw_loss", "calibration_calibrated_loss"):
-        if result.get(key) is not None:
-            metrics[key] = result[key]
+    if result.get("validation_loss_raw") is not None:
+        metrics["validation_loss_raw"] = float(result["validation_loss_raw"])
+    for key in [name for name in metrics if str(name).startswith("calibrated_")]:
+        metrics.pop(key, None)
     pred = valid[["id", "prompt_id", "model"]].rename(columns={"model": "y_true"}).copy()
     for i, label in enumerate(classes):
         pred[f"score::{label}"] = scores[:, i]
@@ -1080,19 +1092,16 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
                                              if training_view_sampling is not None else None),
         "inference_rows_per_second": (len(valid) / result["inference_seconds"]
             if result.get("inference_seconds") else None),
-        "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"), "checkpoint_size_bytes": artifact_size,
-        "calibration_method": result.get("calibration_method", "sigmoid train-only CV" if model == "svc" else "train-only scalar temperature"),
-        "calibration_enabled": result.get("calibration_enabled", cfg.get("calibration_enabled")),
-        "calibration_temperature": result.get("calibration_temperature"),
-        "calibration_sample_size": result.get("calibration_sample_size"),
-        "calibration_full_dataset": result.get("calibration_full_dataset"),
-        "calibration_seed": result.get("calibration_seed"),
-        "calibration_raw_loss": result.get("calibration_raw_loss"),
-        "calibration_calibrated_loss": result.get("calibration_calibrated_loss"),
+        "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"),
+        "peak_gpu_memory_reserved_bytes": result.get("peak_gpu_memory_reserved_bytes"),
+        "checkpoint_size_bytes": artifact_size,
         "validation_loss_raw": result.get("validation_loss_raw"),
-        "validation_loss_calibrated": result.get("validation_loss_calibrated"),
         "requested_batch_size": result.get("requested_batch_size"),
         "effective_batch_size": result.get("effective_batch_size"),
+        "selected_physical_batch_size": result.get("selected_physical_batch_size",
+            result.get("effective_batch_size")),
+        "effective_optimizer_batch_size": result.get("effective_optimizer_batch_size"),
+        "target_effective_batch_size": cfg.get("target_effective_batch_size"),
         "gradient_accumulation_steps": result.get("gradient_accumulation_steps",
             cfg.get("gradient_accumulation_steps", 1)),
         "oom_recovery": result.get("oom_recovery"),
@@ -1179,15 +1188,16 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
 TRAINING_OVERRIDE_FIELDS = (
     "epochs", "early_stopping_patience", "learning_rate", "learning_rate_decay", "lr_scheduler_type", "warmup_ratio",
     "optimizer", "weight_decay", "batch_size", "gradient_accumulation_steps",
-    "lora_rank", "lora_alpha", "lora_target_modules", "quantization", "attention_backend", "C", "calibration_cv",
-    "iterations", "depth", "l2_leaf_reg", "early_stopping_rounds", "calibration_max_samples",
-    "calibration_full_dataset", "calibration_enabled", "inference_batch_size", "save_epoch_checkpoints",
+    "target_effective_batch_size",
+    "lora_rank", "lora_alpha", "lora_target_modules", "quantization", "attention_backend", "C",
+    "iterations", "depth", "l2_leaf_reg", "early_stopping_rounds", "inference_batch_size", "save_epoch_checkpoints",
     "auto_batch_size", "max_batch_size", "batch_probe_safety_fraction", "gradient_checkpointing",
     "trainer_resume_checkpoint",
 )
 
 CONTINUATION_CONFIG_FIELDS = set(TRAINING_OVERRIDE_FIELDS) | {
     "auto_batch_size", "max_batch_size", "batch_probe_safety_fraction",
+    "target_effective_batch_size",
     "gradient_checkpointing", "task_prefix", "text_only_backbone",
     "trust_remote_code", "fix_mistral_regex", "readout_hidden_size",
     "lora_exclude_modules", "resume_checkpoint", "trainer_resume_checkpoint",
@@ -1206,6 +1216,7 @@ def _continuation_config(model, parent_config=None, custom_config_path=None, exp
         cfg.update({key: value for key, value in custom.items() if not key.startswith("_")})
         cfg["_config_path"] = str(custom_config_path)
     cfg.update(explicit_overrides or {})
+    _strip_obsolete_calibration_config(cfg)
     cfg["model"] = model
     _validate_training_overrides(model, cfg)
     return cfg
@@ -1240,12 +1251,12 @@ def _validate_training_overrides(model, cfg):
     for name in ("inference_batch_size",):
         if name in cfg and int(cfg[name]) < 1:
             raise ValueError(f"{name} must be positive")
+    if cfg.get("target_effective_batch_size") is not None and int(cfg["target_effective_batch_size"]) < 1:
+        raise ValueError("target_effective_batch_size must be positive")
     if "max_batch_size" in cfg and int(cfg["max_batch_size"]) < 1:
         raise ValueError("max_batch_size must be positive")
     if "batch_probe_safety_fraction" in cfg and not 0 < float(cfg["batch_probe_safety_fraction"]) <= 1:
         raise ValueError("batch_probe_safety_fraction must be in (0, 1]")
-    if "calibration_max_samples" in cfg and int(cfg["calibration_max_samples"]) < 1:
-        raise ValueError("calibration_max_samples must be positive")
     if cfg.get("lr_scheduler_type") not in {None, "linear", "cosine", "constant", "epoch_decay"}:
         raise ValueError("lr_scheduler_type must be linear, cosine, constant, or epoch_decay")
     if cfg.get("quantization", "none") not in {"none", "qlora4"}:
@@ -1254,8 +1265,8 @@ def _validate_training_overrides(model, cfg):
         raise ValueError("attention_backend must be 'sdpa', 'flash_attention_2', or unset")
     if cfg.get("optimizer") == "paged_adamw_8bit" and cfg.get("quantization", "none") != "qlora4":
         raise ValueError("paged_adamw_8bit is reserved for qlora4 configurations")
-    if model == "svc" and (float(cfg.get("C", 0.5)) <= 0 or int(cfg.get("calibration_cv", 3)) < 2):
-        raise ValueError("SVC overrides need C > 0 and calibration_cv >= 2")
+    if model == "svc" and float(cfg.get("C", 0.5)) <= 0:
+        raise ValueError("SVC overrides need C > 0")
     if model == "catboost_stylometry" and (int(cfg.get("iterations", 0)) < 1
             or not 1 <= int(cfg.get("depth", 0)) <= 16
             or int(cfg.get("early_stopping_rounds", 1)) < 1):
@@ -1347,6 +1358,7 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         inference_batch_size=cfg.get("inference_batch_size"),
         learning_rate=cfg.get("learning_rate",1e-4),seed=seed,
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps",1),
+        target_effective_batch_size=cfg.get("target_effective_batch_size"),
         lora_rank=cfg.get("lora_rank",16),lora_alpha=cfg.get("lora_alpha",32),
         lora_target_modules=cfg.get("lora_target_modules",["q_proj","k_proj","v_proj","o_proj"]),
         auto_batch_size=cfg.get("auto_batch_size",False),
@@ -1365,10 +1377,6 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         attention_backend=cfg.get("attention_backend"),
         checkpoint_selection_metric="balanced_accuracy",
         save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False),
-        calibration_max_samples=cfg.get("calibration_max_samples", 5000),
-        calibration_seed=cfg.get("calibration_seed", seed),
-        calibration_full_dataset=cfg.get("calibration_full_dataset", False),
-        calibration_enabled=cfg.get("calibration_enabled", cfg.get("temperature_calibration", True)),
         training_views=training_views, training_view_ids=training_view_ids)
     training_view_sampling = result.get("training_view_sampling")
     sampling_path = None
@@ -1378,14 +1386,10 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
             "training_dataset_sha256": train_hash, "sampling": training_view_sampling}, indent=2) + "\n")
     classes=sorted(rows.model.astype(str).unique())
     metrics=evaluate(valid.model.astype(str),result["scores"],classes,result["probabilities"])
-    for name in ("validation_loss_raw", "validation_loss_calibrated"):
-        if result.get(name) is not None:
-            metrics[name] = float(result[name])
-    metrics["calibration_temperature"] = result.get("calibration_temperature")
-    for key in ("calibration_sample_size", "calibration_full_dataset", "calibration_seed",
-                "calibration_raw_loss", "calibration_calibrated_loss"):
-        if result.get(key) is not None:
-            metrics[key] = result[key]
+    if result.get("validation_loss_raw") is not None:
+        metrics["validation_loss_raw"] = float(result["validation_loss_raw"])
+    for key in [name for name in metrics if str(name).startswith("calibrated_")]:
+        metrics.pop(key, None)
     metrics["validation_metrics_by_epoch"]=result["validation_metrics_by_epoch"]
     export_started = time.perf_counter()
     post_training_started = export_started
@@ -1422,18 +1426,16 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         "checkpoint_scoring_method":result.get("checkpoint_scoring_method"),
         "final_validation_reused_existing_predictions":result.get("final_validation_reused_epoch_predictions"),
         "early_stopping":result.get("early_stopping"),
-        "calibration_temperature":result["calibration_temperature"],"validation_metrics_by_epoch":result["validation_metrics_by_epoch"],
-        "calibration_enabled":result.get("calibration_enabled",cfg.get("calibration_enabled")),
-        "calibration_sample_size":result.get("calibration_sample_size"),
-        "calibration_full_dataset":result.get("calibration_full_dataset"),
-        "calibration_seed":result.get("calibration_seed"),
-        "calibration_raw_loss":result.get("calibration_raw_loss"),
-        "calibration_calibrated_loss":result.get("calibration_calibrated_loss"),
+        "validation_metrics_by_epoch":result["validation_metrics_by_epoch"],
         "validation_loss_raw": result.get("validation_loss_raw"),
-        "validation_loss_calibrated": result.get("validation_loss_calibrated"),
         "validation_predictions_by_epoch":epoch_prediction_records,
         "requested_batch_size":result.get("requested_batch_size"),
         "effective_batch_size":result.get("effective_batch_size"),
+        "selected_physical_batch_size":result.get("selected_physical_batch_size",result.get("effective_batch_size")),
+        "effective_optimizer_batch_size":result.get("effective_optimizer_batch_size"),
+        "target_effective_batch_size":cfg.get("target_effective_batch_size"),
+        "peak_gpu_memory_bytes":result.get("peak_gpu_memory_bytes"),
+        "peak_gpu_memory_reserved_bytes":result.get("peak_gpu_memory_reserved_bytes"),
         "gradient_accumulation_steps":result.get("gradient_accumulation_steps",
             snapshot.get("gradient_accumulation_steps", 1)),
         "oom_recovery":result.get("oom_recovery"),
@@ -1559,7 +1561,7 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "max_batch_size": int(cfg.get("max_batch_size", 1024)),
         "batch_probe_safety_fraction": float(cfg.get("batch_probe_safety_fraction", 0.95)),
         "gradient_accumulation_steps": int(cfg.get("gradient_accumulation_steps", 1)),
-        "max_length": (int(training_profile["max_encoded_length"])
+        "max_length": (_profile_max_length_override(model, cfg, training_profile)
             if training_profile.get("chunking_strategy") else _dataset_max_length(model, {
                 **cfg, "checkpoint": str(source_checkpoint), "revision": None,
                 "task_prefix": "", "training_mode": "full", "trust_remote_code": True,
@@ -1571,10 +1573,6 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "validation_dataset": validation_dataset,
         "checkpoint_selection": "highest_validation_balanced_accuracy",
         "save_epoch_checkpoints": bool(cfg.get("save_epoch_checkpoints", False)),
-        "calibration_max_samples": int(cfg.get("calibration_max_samples", 5000)),
-        "calibration_full_dataset": bool(cfg.get("calibration_full_dataset", False)),
-        "calibration_seed": int(cfg.get("calibration_seed", seed)),
-        "calibration_enabled": bool(cfg.get("calibration_enabled", cfg.get("temperature_calibration", True))),
         "inference_batch_size": int(cfg.get("inference_batch_size", max(8, int(cfg.get("batch_size", 8))))),
     }
     if training_views is not None:
@@ -1604,6 +1602,7 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         learning_rate_decay=learning_rate_decay, seed=seed,
         optimizer=optimizer, weight_decay=weight_decay,
         gradient_accumulation_steps=config_snapshot["gradient_accumulation_steps"],
+        target_effective_batch_size=config_snapshot.get("target_effective_batch_size"),
         auto_batch_size=config_snapshot["auto_batch_size"],
         max_batch_size=config_snapshot["max_batch_size"],
         batch_probe_safety_fraction=config_snapshot["batch_probe_safety_fraction"],
@@ -1611,10 +1610,6 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         select_best_checkpoint=True, local_files_only=True,
         early_stopping_patience=cfg.get("early_stopping_patience", 2),
         checkpoint_selection_metric="balanced_accuracy",
-        calibration_max_samples=config_snapshot["calibration_max_samples"],
-        calibration_seed=config_snapshot["calibration_seed"],
-        calibration_full_dataset=config_snapshot["calibration_full_dataset"],
-        calibration_enabled=config_snapshot["calibration_enabled"],
         save_epoch_checkpoints=config_snapshot["save_epoch_checkpoints"],
         training_views=training_views, training_view_ids=training_view_ids)
     training_view_sampling = result.get("training_view_sampling")
@@ -1624,14 +1619,10 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         sampling_path.write_text(json.dumps({"training_dataset": dataset,
             "training_dataset_sha256": train_hash, "sampling": training_view_sampling}, indent=2) + "\n")
     metrics = evaluate(valid.model.astype(str), result["scores"], classes, result["probabilities"])
-    for name in ("validation_loss_raw", "validation_loss_calibrated"):
-        if result.get(name) is not None:
-            metrics[name] = float(result[name])
-    metrics["calibration_temperature"] = result.get("calibration_temperature")
-    for key in ("calibration_sample_size", "calibration_full_dataset", "calibration_seed",
-                "calibration_raw_loss", "calibration_calibrated_loss"):
-        if result.get(key) is not None:
-            metrics[key] = result[key]
+    if result.get("validation_loss_raw") is not None:
+        metrics["validation_loss_raw"] = float(result["validation_loss_raw"])
+    for key in [name for name in metrics if str(name).startswith("calibrated_")]:
+        metrics.pop(key, None)
     export_started = time.perf_counter()
     post_training_started = export_started
     runtime_breakdown = _post_training_runtime(result)
@@ -1678,22 +1669,21 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "training_view_sampling_artifact": str(sampling_path) if sampling_path else None,
         "training_rows_per_second": (len(train) / float(runtime_breakdown.get(
             "training_excluding_validation_seconds") or result.get("fit_seconds") or 1.0)),
-        "calibration_temperature": result["calibration_temperature"],
-        "calibration_enabled": result.get("calibration_enabled", config_snapshot["calibration_enabled"]),
-        "calibration_sample_size": result.get("calibration_sample_size"),
-        "calibration_full_dataset": result.get("calibration_full_dataset"),
-        "calibration_seed": result.get("calibration_seed"),
-        "calibration_raw_loss": result.get("calibration_raw_loss"),
-        "calibration_calibrated_loss": result.get("calibration_calibrated_loss"),
         "requested_batch_size": result.get("requested_batch_size"),
         "effective_batch_size": result.get("effective_batch_size"),
+        "selected_physical_batch_size": result.get("selected_physical_batch_size",
+            result.get("effective_batch_size")),
+        "effective_optimizer_batch_size": result.get("effective_optimizer_batch_size"),
+        "target_effective_batch_size": config_snapshot.get("target_effective_batch_size"),
+        "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"),
+        "peak_gpu_memory_reserved_bytes": result.get("peak_gpu_memory_reserved_bytes"),
         "gradient_accumulation_steps": result.get("gradient_accumulation_steps",
             config_snapshot.get("gradient_accumulation_steps", 1)),
         "oom_recovery": result.get("oom_recovery"),
         "requested_inference_batch_size": result.get("requested_inference_batch_size", config_snapshot["inference_batch_size"]),
         "effective_inference_batch_size": result.get("effective_inference_batch_size"),
+        "batch_size_probe": result.get("batch_size_probe"),
         "validation_loss_raw": result.get("validation_loss_raw"),
-        "validation_loss_calibrated": result.get("validation_loss_calibrated"),
         "checkpoint_path": str(checkpoint), "best_checkpoint_path": result["best_checkpoint_path"],
         "selected_checkpoint_path": result.get("selected_checkpoint_path") or result["best_checkpoint_path"],
         "prediction_path": str(prediction_path), "metrics": metrics,

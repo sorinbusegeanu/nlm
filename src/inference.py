@@ -15,16 +15,35 @@ from .data_factory import REQUIRED_TEST
 from .feature_factory import stylometry
 
 
+def _readout_probabilities(model, features, classes):
+    """Load legacy calibrated readouts and new raw LinearSVC readouts alike."""
+    classes = list(classes)
+    model_classes = list(model.classes_)
+    if hasattr(model, "predict_proba"):
+        values = np.asarray(model.predict_proba(features), dtype=float)
+        is_probability = True
+    else:
+        values = np.asarray(model.decision_function(features), dtype=float)
+        if values.ndim == 1:
+            values = np.column_stack([-values, values])
+        is_probability = False
+    aligned = np.zeros((features.shape[0], len(classes)), dtype=float)
+    indexes = {label: index for index, label in enumerate(classes)}
+    for column, label in enumerate(model_classes):
+        aligned[:, indexes[label]] = values[:, column]
+    if not is_probability:
+        from scipy.special import softmax
+        aligned = softmax(aligned, axis=1)
+    if (not np.isfinite(aligned).all() or np.any(aligned < 0)
+            or not np.allclose(aligned.sum(axis=1), 1, atol=1e-5)):
+        raise ValueError("readout model returned invalid probabilities")
+    return aligned
+
+
 def predict_svc_bundle(bundle, texts):
     features, model, classes = bundle["features"], bundle["model"], list(bundle["classes"])
     matrix = features.transform([str(t) for t in texts])
-    predicted = model.predict_proba(matrix)
-    aligned = np.zeros((len(texts), len(classes)), dtype=float)
-    indexes = {label: i for i, label in enumerate(classes)}
-    for col, label in enumerate(model.classes_): aligned[:, indexes[label]] = predicted[:, col]
-    if not np.isfinite(aligned).all() or not np.allclose(aligned.sum(1), 1, atol=1e-5):
-        raise ValueError("model returned invalid probabilities")
-    return aligned, classes
+    return _readout_probabilities(model, matrix, classes), classes
 
 
 def predict_catboost_stylometry(checkpoint, texts, classes, *, temperature=1.0):
@@ -88,14 +107,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
             model_name, base_checkpoint, revision, texts, max_length=max_length,
             batch_size=batch_size, model_dir=local_backbone if local_backbone.is_dir() else None,
             fix_mistral_regex=bundle.get("fix_mistral_regex", False))
-        class_order = list(bundle["classes"])
-        probabilities = bundle["model"].predict_proba(features)
-        aligned = np.zeros((len(texts), len(classes)), dtype=float)
-        class_indexes = {label: i for i, label in enumerate(classes)}
-        for column, label in enumerate(class_order):
-            aligned[:, class_indexes[label]] = probabilities[:, column]
-        if not np.isfinite(aligned).all() or not np.allclose(aligned.sum(1), 1, atol=1e-5):
-            raise ValueError(f"{model_name} returned invalid probabilities")
+        aligned = _readout_probabilities(bundle["model"], features, classes)
         return aligned, list(classes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # EmbeddingGemma's activations can overflow fp16. Use bf16 where available

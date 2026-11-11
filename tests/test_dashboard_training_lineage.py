@@ -7,6 +7,13 @@ from dashboard.training_lineage import training_lineage, trainer_completion
 
 
 class TrainingLineageTests(unittest.TestCase):
+    def test_training_tables_show_raw_loss_without_calibration_columns(self):
+        dashboard = Path(__file__).resolve().parents[1] / "dashboard" / "app.py"
+        source = dashboard.read_text()
+        self.assertIn('"Validation loss (raw)"', source)
+        self.assertNotIn("Validation loss (calibrated)", source)
+        self.assertNotIn("Calibration temperature", source)
+
     def test_continuation_shows_source_then_target_dataset(self):
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "source_manifest_manifest.json").write_text(json.dumps({

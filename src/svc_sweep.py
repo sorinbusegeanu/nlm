@@ -229,8 +229,6 @@ def evaluate_svc_sweep(artifact_dir="artifacts", *, registry_path="docs/ensemble
         "seed": 2026,
         "features": {"views": ["char", "word"]},
         "class_weight": "balanced",
-        "calibration": "sigmoid",
-        "calibration_cv": 3,
         "champion_experiment_id": champion.get("prediction_experiment_id"),
         "champion_strategy": strategy,
         "champion_members": members,
@@ -272,9 +270,7 @@ def run_svc_sweep(*, dataset="v1.1", data_dir="data/processed", artifact_dir="ar
                 and manifest.get("seed") == seed and manifest.get("split") == "validation"
                 and manifest.get("validation_dataset", manifest.get("validation_dataset_version", "v0")) == validation_dataset
                 and float(config.get("C", -1)) == 0.5
-                and config.get("features", {}).get("views") == ["char", "word"]
-                and config.get("calibration") == "sigmoid"
-                and int(config.get("calibration_cv", 0)) == 3):
+                and config.get("features", {}).get("views") == ["char", "word"]):
             baseline.append(str(manifest.get(
                 "experiment_id", manifest_path.stem.removesuffix("_manifest"))))
     if len(baseline) != 1:

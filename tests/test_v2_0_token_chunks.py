@@ -12,6 +12,7 @@ from src.v2_0_token_chunks import (
     build_dataset,
     chunk_response,
 )
+from src.pipeline import _profile_max_length_override
 
 
 class CharacterTokenizer:
@@ -30,6 +31,11 @@ class CharacterTokenizer:
 
     def decode(self, ids, **kwargs):
         return "".join(chr(token) for token in ids)
+
+
+class ExpandingDecodeTokenizer(CharacterTokenizer):
+    def decode(self, ids, **kwargs):
+        return super().decode(ids, **kwargs) + "!"
 
 
 class V20TokenChunksTests(unittest.TestCase):
@@ -82,6 +88,10 @@ class V20TokenChunksTests(unittest.TestCase):
 
             dataset = "v2.0.chunks.300TokBalanced"
             rows, profile = build_dataset(dataset, root=root, tokenizer=CharacterTokenizer(), batch_size=1)
+            repeated_rows, repeated_profile = build_dataset(
+                dataset, root=root, tokenizer=CharacterTokenizer(), batch_size=2)
+            pd.testing.assert_frame_equal(rows, repeated_rows)
+            self.assertEqual(profile, repeated_profile)
             self.assertEqual(len(rows), 5)
             self.assertNotIn("view_type", rows.columns)
             self.assertEqual(rows.id.nunique(), len(rows))
@@ -100,6 +110,27 @@ class V20TokenChunksTests(unittest.TestCase):
                          {"max_encoded_length": 300, "stride": 150})
         self.assertEqual(DATASET_SPECS["v2.0.chunks.200TokBalanced"],
                          {"max_encoded_length": 200, "stride": 100})
+
+    def test_training_limit_uses_matching_chunk_profile_and_rejects_mismatch(self):
+        profile = {"chunking_strategy": "ultrabert_token_windows_v1",
+                   "tokenizer_id": "dmis-lab/UltraBERT-380M",
+                   "tokenizer_revision": "671a38c087233c0cc72c5bfceea6fffa2822f1db",
+                   "max_encoded_length": 300,
+                   "maximum_observed_encoded_length": 300}
+        cfg = {"checkpoint": profile["tokenizer_id"], "revision": profile["tokenizer_revision"]}
+        self.assertEqual(_profile_max_length_override("ultrabert380", cfg, profile), 300)
+        with self.assertRaisesRegex(ValueError, "checkpoint differs"):
+            _profile_max_length_override("ultrabert380", {**cfg, "checkpoint": "other"}, profile)
+        self.assertIsNone(_profile_max_length_override("ultrabert380", cfg, {}))
+        self.assertIsNone(_profile_max_length_override("qwen4", cfg, profile))
+
+    def test_round_trip_expansion_shrinks_windows_without_gaps(self):
+        chunks, original_count, _ = chunk_response(
+            ExpandingDecodeTokenizer(), "x" * 60,
+            max_encoded_length=12, stride=5)
+        self.assertEqual(_coverages(original_count, [
+            (row["token_start"], row["token_end"]) for row in chunks]), original_count)
+        self.assertTrue(all(row["token_end"] - row["token_start"] <= 9 for row in chunks))
 
 
 if __name__ == "__main__":

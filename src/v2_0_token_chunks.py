@@ -108,21 +108,36 @@ def _chunks_from_ids(tokenizer, ids: list[int], *, max_encoded_length: int,
     capacity = int(max_encoded_length) - special_count
     if capacity <= 0:
         raise ValueError("maximum encoded length leaves no room for content tokens")
-    windows = _window_starts(len(ids), capacity, int(stride))
-    _coverages(len(ids), windows)
+    if stride < 1 or stride > capacity:
+        raise ValueError("token window capacity and stride must be positive, with stride <= capacity")
     chunks = []
-    seen_ranges = set()
-    for index, (start, end) in enumerate(windows):
-        if (start, end) in seen_ranges:
-            continue
-        seen_ranges.add((start, end))
+    start = 0
+    while start < len(ids) or not chunks:
+        end = min(start + capacity, len(ids))
         window_ids = ids[start:end]
         decoded = _decode_window(tokenizer, window_ids)
+        # Decoding can change tokenizer segmentation (for example around
+        # whitespace). Shrink the end until the actual encoded text fits.
+        while decoded and _encoded_length(tokenizer, decoded) > max_encoded_length:
+            end -= 1
+            if end <= start:
+                raise ValueError(f"cannot fit token at offset {start} in encoded limit {max_encoded_length}")
+            window_ids = ids[start:end]
+            decoded = _decode_window(tokenizer, window_ids)
         if not decoded:
             raise ValueError(f"tokenizer decoded an empty chunk at offsets {start}:{end}")
-        chunks.append({"chunk_index": index, "token_start": start,
+        chunks.append({"chunk_index": len(chunks), "token_start": start,
                        "token_end": end, "token_count": end-start,
                        "text": decoded})
+        if end == len(ids):
+            break
+        next_start = start + int(stride)
+        if next_start > end:
+            next_start = end
+        if next_start <= start:
+            raise RuntimeError("token window generator failed to advance")
+        start = next_start
+    _coverages(len(ids), [(item["token_start"], item["token_end"]) for item in chunks])
     return chunks, capacity
 
 

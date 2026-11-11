@@ -246,11 +246,6 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         output_dir=checkpoint, iterations=iterations, depth=cfg["depth"],
         learning_rate=cfg["learning_rate"], l2_leaf_reg=cfg["l2_leaf_reg"],
         thread_count=cfg["thread_count"], seed=seed,
-        temperature_calibration=cfg.get("temperature_calibration", True),
-        calibration_enabled=cfg.get("calibration_enabled", cfg.get("temperature_calibration", True)),
-        calibration_max_samples=cfg.get("calibration_max_samples", 5000),
-        calibration_seed=cfg.get("calibration_seed", seed),
-        calibration_full_dataset=cfg.get("calibration_full_dataset", False),
         validation_labels=valid.model.astype(str).tolist(),
         early_stopping_rounds=cfg.get("early_stopping_rounds", 100),
         checkpoint_selection_metric="balanced_accuracy", feature_recipe=recipe,
@@ -294,12 +289,6 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
               "feature_names": feature_names,
               "parent_checkpoint": str(parent_checkpoint) if parent_checkpoint else None,
               "parent_checkpoint_sha256": parent_sha256,
-              "calibration_method": result["calibration_method"],
-              "calibration_temperature": result["calibration_temperature"],
-              "calibration_enabled": result.get("calibration_enabled", cfg.get("calibration_enabled", True)),
-              "calibration_max_samples": int(cfg.get("calibration_max_samples", 5000)),
-              "calibration_full_dataset": bool(cfg.get("calibration_full_dataset", False)),
-              "calibration_seed": int(cfg.get("calibration_seed", seed)),
               "validation_fitting": False,
               "validation_dataset": validation_dataset,
               "early_stopping_metric": "balanced_accuracy"}
@@ -309,12 +298,6 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
     checkpoint_size = sum(path.stat().st_size for path in checkpoint.rglob("*") if path.is_file())
     manifest_export_started = time.perf_counter()
     trainer_runtime = result.get("runtime_breakdown") or {}
-    calibration_inference_seconds = result.get("calibration_inference_seconds")
-    if calibration_inference_seconds is None:
-        calibration_inference_seconds = trainer_runtime.get("calibration_inference_seconds")
-    temperature_fit_seconds = result.get("temperature_fit_seconds")
-    if temperature_fit_seconds is None:
-        temperature_fit_seconds = trainer_runtime.get("temperature_fit_seconds")
     manifest = {
         "experiment_id": experiment_id, "experiment_name": experiment_name,
         "model": "catboost_stylometry", "dataset": dataset_name,
@@ -333,8 +316,6 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         "inference_seconds": float(result["inference_seconds"]),
         "runtime_breakdown": {**trainer_runtime,
             "best_checkpoint_restoration_seconds": 0.0,
-            "calibration_inference_seconds": calibration_inference_seconds,
-            "temperature_fit_seconds": temperature_fit_seconds,
             "final_validation_inference_seconds": float(result["inference_seconds"]),
             "checkpoint_serialization_seconds": (result.get("runtime_breakdown") or {}).get(
                 "checkpoint_serialization_seconds", (result.get("runtime_breakdown") or {}).get("checkpoint_save_seconds", 0.0)),
@@ -347,11 +328,7 @@ def _save_stage(*, experiment, experiment_name, stage, dataset_name, train, vali
         "parent_checkpoint_sha256": parent_sha256,
         "iterations_added": int(iterations), "tree_count": int(result["tree_count"]),
         "feature_count": len(feature_names), "feature_names": feature_names,
-        "feature_recipe": recipe, "calibration_method": result["calibration_method"],
-        "calibration_enabled": result.get("calibration_enabled", cfg.get("calibration_enabled", True)),
-        "calibration_temperature": float(result["calibration_temperature"]),
-        "calibration_sample_size": result.get("calibration_sample_size"),
-        "calibration_full_dataset": result.get("calibration_full_dataset"),
+        "feature_recipe": recipe,
         "validation_metrics_by_epoch": [], "early_stopping": None,
         "validation_labels_used_for_checkpoint_selection": True,
         "prediction_path": str(prediction_path),
@@ -401,7 +378,7 @@ def _render_report(path, summary):
     lines = ["# CatBoost two-stage feature experiments", "",
              f"Run: `{summary['run_id']}`", "",
              f"Validation uses all {summary['validation_rows']} rows from `{summary['validation_dataset']}`. "
-             "Balanced accuracy selects the best boosting iteration; calibration uses training rows only. "
+             "Balanced accuracy selects the best boosting iteration. "
              "The scores remain development results because this set has been used for prior model selection.", "",
              f"Exact response-text overlap between Stage 1 V1-all training and Stage 2 V0 training: "
              f"**{summary['training_overlap']['exact_rows']}**; normalized overlap: "
@@ -475,7 +452,7 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
     if stage1_iterations < 1 or stage2_iterations < 1:
         raise ValueError("stage iteration budgets must be positive")
     cfg = {"depth": 7, "learning_rate": .05, "l2_leaf_reg": 5.0,
-           "thread_count": 8, "temperature_calibration": True, **(config or {})}
+           "thread_count": 8, **(config or {})}
     if run_id is None:
         run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
@@ -567,7 +544,7 @@ def run_catboost_two_stage(*, load_dataset, effective_profile, data_dir="data/pr
                    "stage2_iterations": int(stage2_iterations), "depth": int(cfg["depth"]),
                    "learning_rate": float(cfg["learning_rate"]), "l2_leaf_reg": float(cfg["l2_leaf_reg"]),
                    "class_weights": "Balanced", "seed": int(seed), "thread_count": int(cfg["thread_count"]),
-                   "calibration": "train-only scalar temperature", "validation_fitting": False,
+                   "validation_fitting": False,
                    "early_stopping_rounds": int(cfg.get("early_stopping_rounds", 100)),
                    "checkpoint_selection_metric": "balanced_accuracy"}}
 
