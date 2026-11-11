@@ -4,9 +4,13 @@ from __future__ import annotations
 import time
 import json
 import math
+import datetime
 import os
 import inspect
 import hashlib
+import gc
+import shutil
+from functools import wraps
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -142,6 +146,185 @@ def _is_oom_error(exc):
     message = str(exc).lower()
     return any(marker in message for marker in (
         "out of memory", "cuda oom", "cublas_status_alloc_failed", "mps backend out of memory"))
+
+
+def _write_json_atomic(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _release_cuda_after_oom():
+    """Drop Python references and release cached CUDA allocations after a failed attempt."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except (ImportError, RuntimeError, AttributeError):
+        pass
+
+
+def _with_cuda_oom_recovery(function):
+    """Retry neural training with a smaller microbatch and fresh training objects.
+
+    Each attempt starts from the originally configured base/continuation
+    checkpoint, so the optimizer and scheduler are recreated and their step
+    counts and warmup are recalculated for the recovered effective batch.
+    Validation and prediction OOMs retain their dedicated fallback behavior.
+    """
+    signature = inspect.signature(function)
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        output_dir = Path(bound.arguments["output_dir"])
+        configured_batch = max(1, int(bound.arguments.get("batch_size", 1)))
+        configured_accumulation = max(1, int(bound.arguments.get("gradient_accumulation_steps", 1)))
+        original_effective_batch = configured_batch * configured_accumulation
+        events = []
+        attempt_number = 0
+        fixed_batch_after_recovery = False
+        recovery_file = output_dir.parent / f"oom_recovery_{output_dir.name}.json"
+        archive_root = output_dir.parent / f"oom_attempts_{output_dir.name}"
+
+        def save_recovery(status="retrying"):
+            _write_json_atomic(recovery_file, {
+                "status": status,
+                "training_entry_point": function.__name__,
+                "configured_microbatch": configured_batch,
+                "configured_gradient_accumulation_steps": configured_accumulation,
+                "configured_effective_batch_size": original_effective_batch,
+                "events": events,
+            })
+
+        while True:
+            attempt_number += 1
+            attempt_output = output_dir
+            if events:
+                attempt_output = output_dir.parent / f".{output_dir.name}.oom_try_{attempt_number:02d}"
+                if attempt_output.exists():
+                    raise FileExistsError(f"stale CUDA OOM attempt directory exists: {attempt_output}")
+            bound.arguments["output_dir"] = attempt_output
+            context = {"phase": "initialization"}
+            bound.arguments["_oom_recovery_context"] = context
+            try:
+                result = function(*bound.args, **bound.kwargs)
+            except Exception as exc:
+                recoverable_phase = context.get("phase") in {"initialization", "training"}
+                if not _is_oom_error(exc) or not recoverable_phase:
+                    raise
+                try:
+                    probe_path = attempt_output / "batch_size_probe.json"
+                    probe = json.loads(probe_path.read_text()) if probe_path.is_file() else {}
+                except (OSError, ValueError):
+                    probe = {}
+                failed_batch = max(1, int(probe.get("effective_batch_size", bound.arguments.get("batch_size", 1))))
+                accumulation = max(1, int(bound.arguments.get("gradient_accumulation_steps", 1)))
+                old_effective = failed_batch * accumulation
+                event = {
+                    "attempt": attempt_number,
+                    "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "phase": context.get("phase"),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "original_microbatch": failed_batch,
+                    "original_gradient_accumulation_steps": accumulation,
+                    "original_effective_batch_size": old_effective,
+                    "batch_probe": probe or None,
+                    "scheduler_action": "recomputed_from_start_for_recovered_steps",
+                }
+                if failed_batch <= 1:
+                    event.update({"recovered_microbatch": None,
+                                  "recovered_gradient_accumulation_steps": None,
+                                  "action": "propagated_cuda_oom_at_microbatch_1"})
+                    events.append(event)
+                    if attempt_output.exists():
+                        archive_root.mkdir(parents=True, exist_ok=True)
+                        archive_path = archive_root / f"attempt_{attempt_number:02d}"
+                        shutil.move(str(attempt_output), str(archive_path))
+                        event["archived_attempt"] = str(archive_path)
+                    save_recovery("failed_at_minimum_batch")
+                    _release_cuda_after_oom()
+                    raise
+
+                recovered_batch = max(1, failed_batch // 2)
+                recovered_accumulation = max(1, int(round(old_effective / recovered_batch)))
+                event.update({
+                    "recovered_microbatch": recovered_batch,
+                    "recovered_gradient_accumulation_steps": recovered_accumulation,
+                    "recovered_effective_batch_size": recovered_batch * recovered_accumulation,
+                    "effective_batch_size_preserved_exactly": recovered_batch * recovered_accumulation == old_effective,
+                    "action": "archive_partial_attempt_and_restart_with_fresh_training_objects",
+                })
+                events.append(event)
+                if attempt_output.exists():
+                    archive_root.mkdir(parents=True, exist_ok=True)
+                    archive_path = archive_root / f"attempt_{attempt_number:02d}"
+                    shutil.move(str(attempt_output), str(archive_path))
+                    event["archived_attempt"] = str(archive_path)
+                bound.arguments["batch_size"] = recovered_batch
+                bound.arguments["gradient_accumulation_steps"] = recovered_accumulation
+                if "auto_batch_size" in bound.arguments:
+                    # The original probe is recorded above. Fix the recovered
+                    # batch to ensure the retry cannot choose the same failure.
+                    bound.arguments["auto_batch_size"] = False
+                fixed_batch_after_recovery = True
+                save_recovery()
+                # The exception traceback otherwise keeps the failed Trainer,
+                # model and optimizer frames alive during cache cleanup.
+                exc.__traceback__ = None
+                exc.__cause__ = None
+                exc.__context__ = None
+                del exc
+                _release_cuda_after_oom()
+                continue
+
+            if attempt_output != output_dir:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                for child in attempt_output.iterdir():
+                    target = output_dir / child.name
+                    if target.exists():
+                        if target.is_dir():
+                            shutil.rmtree(target)
+                        else:
+                            target.unlink()
+                    shutil.move(str(child), str(target))
+                attempt_output.rmdir()
+            if events:
+                final_batch = max(1, int(result.get("effective_batch_size", bound.arguments.get("batch_size", 1))))
+                final_accumulation = int(bound.arguments.get("gradient_accumulation_steps", 1))
+                result["requested_batch_size"] = configured_batch
+                result["gradient_accumulation_steps"] = final_accumulation
+                result["oom_recovery"] = {
+                    "recovered": True,
+                    "configured_microbatch": configured_batch,
+                    "configured_gradient_accumulation_steps": configured_accumulation,
+                    "configured_effective_batch_size": original_effective_batch,
+                    "effective_batch_size_preserved_exactly": final_batch * final_accumulation == original_effective_batch,
+                    "events": events,
+                    "recovery_artifact": str(recovery_file),
+                    "attempt_archive": str(archive_root),
+                    "batch_size_probe_disabled_after_recovery": fixed_batch_after_recovery,
+                }
+                if isinstance(result.get("batch_size_probe"), dict):
+                    result["batch_size_probe"]["oom_recovery"] = result["oom_recovery"]
+                for key in ("best_checkpoint_path", "selected_checkpoint_path"):
+                    path = result.get(key)
+                    if path and str(path).startswith(str(attempt_output)):
+                        result[key] = str(output_dir) + str(path)[len(str(attempt_output)):]
+                result["epoch_checkpoints"] = [
+                    str(output_dir) + str(path)[len(str(attempt_output)):]
+                    if str(path).startswith(str(attempt_output) + os.sep) else path
+                    for path in result.get("epoch_checkpoints", [])]
+                save_recovery("completed_after_retry")
+            return result
+
+    return wrapped
 
 
 def _predict_cached_dataset(model, dataset, *, batch_size, data_collator, device,
@@ -1027,6 +1210,7 @@ def _epoch_decay_lambda(*, decay, steps_per_epoch, warmup_steps=0):
     return scale
 
 
+@_with_cuda_oom_recovery
 def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpoint, revision, output_dir,
                        epochs=3, batch_size=16, inference_batch_size=None, max_length=384, learning_rate=2e-5, seed=2026,
                        gradient_accumulation_steps=1, local_files_only=True, validation_labels=None,
@@ -1038,9 +1222,12 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        batch_probe_safety_fraction=0.95,
                        checkpoint_selection_metric="balanced_accuracy", calibration_max_samples=5000,
                        calibration_seed=2026, calibration_full_dataset=False,
-                       calibration_enabled=True, save_epoch_checkpoints=False):
+                       calibration_enabled=True, save_epoch_checkpoints=False,
+                       _oom_recovery_context=None):
     """Fine-tune or continue an encoder after recording its validation baseline."""
     _force_huggingface_offline()
+    recovery_context = _oom_recovery_context if _oom_recovery_context is not None else {"phase": "initialization"}
+    recovery_context["phase"] = "initialization"
     local_files_only = True
     torch, tr = _require_neural()
     start = time.perf_counter()
@@ -1071,11 +1258,13 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     use_fp16 = torch.cuda.is_available() and not use_bf16
     if auto_batch_size:
+        recovery_context["phase"] = "batch_probe"
         effective_batch_size, batch_probe = _probe_max_batch_size(
             model, train, requested_batch_size=requested_batch_size,
             max_batch_size=max_batch_size, safety_fraction=batch_probe_safety_fraction,
             use_bf16=use_bf16, use_fp16=use_fp16, optimizer_name=optimizer,
             weight_decay=weight_decay)
+        recovery_context["phase"] = "initialization"
     batch_probe.update({"requested_batch_size": requested_batch_size,
                         "effective_batch_size": effective_batch_size,
                         "gradient_accumulation_steps": int(gradient_accumulation_steps),
@@ -1116,6 +1305,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             return LengthOrderedSampler(val)
         def evaluate(self, *args, **kwargs):
             started = time.perf_counter()
+            previous_phase = recovery_context.get("phase", "training")
+            recovery_context["phase"] = "validation"
             try:
                 metrics, effective, fallbacks = _evaluate_with_oom_batch_fallback(
                     lambda: super(OrderedValidationTrainer, self).evaluate(*args, **kwargs),
@@ -1125,8 +1316,14 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 self.effective_eval_batch_size = effective
                 self.eval_oom_fallbacks += fallbacks
                 return metrics
+            except Exception as exc:
+                if _is_oom_error(exc):
+                    recovery_context["phase"] = "validation_oom"
+                raise
             finally:
                 self.validation_seconds += time.perf_counter() - started
+                if recovery_context.get("phase") == "validation":
+                    recovery_context["phase"] = previous_phase
 
     live_callback = _live_training_progress_callback(TrainerCallback, out)
     epoch_prediction_callback = _epoch_prediction_capture_callback(
@@ -1226,6 +1423,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         inference_stats.append(stats)
         return scores, stats
 
+    recovery_context["phase"] = "inference"
     baseline_validation_started = time.perf_counter()
     baseline_logits, baseline_inference_stats = predict_cached(val)
     baseline_validation_seconds = time.perf_counter() - baseline_validation_started
@@ -1240,8 +1438,10 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     (out / "baseline_validation.json").write_text(json.dumps(baseline_metrics, indent=2) + "\n")
     live_callback.set_baseline(baseline_metrics)
     startup_seconds = max(0.0, time.perf_counter() - start - baseline_validation_seconds)
+    recovery_context["phase"] = "training"
     training_started = time.perf_counter()
     trainer.train()
+    recovery_context["phase"] = "inference"
     training_seconds = time.perf_counter() - training_started
     post_training_started = time.perf_counter()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -1329,6 +1529,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     return {"scores": logits, "probabilities": probs, "model": model, "tokenizer": tokenizer,
             "requested_batch_size": requested_batch_size,
             "effective_batch_size": effective_batch_size,
+            "gradient_accumulation_steps": int(gradient_accumulation_steps),
             "requested_inference_batch_size": requested_inference_batch_size,
             "effective_inference_batch_size": effective_post_inference_batch_size,
             "batch_size_probe": batch_probe,
@@ -1631,6 +1832,7 @@ def _require_flash_attention_2_runtime(torch):
         ) from exc
 
 
+@_with_cuda_oom_recovery
 def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, checkpoint="Qwen/Qwen3-0.6B",
                          revision, output_dir="artifacts/checkpoints/qwen", epochs=3, batch_size=4,
                          inference_batch_size=None,
@@ -1648,9 +1850,12 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          quantization="none", attention_backend=None,
                          checkpoint_selection_metric="balanced_accuracy", save_epoch_checkpoints=False,
                          calibration_max_samples=5000, calibration_seed=2026,
-                         calibration_full_dataset=False, calibration_enabled=True):
+                         calibration_full_dataset=False, calibration_enabled=True,
+                         _oom_recovery_context=None):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
     _force_huggingface_offline()
+    recovery_context = _oom_recovery_context if _oom_recovery_context is not None else {"phase": "initialization"}
+    recovery_context["phase"] = "initialization"
     torch, tr = _require_neural()
     try:
         from peft import LoraConfig, TaskType, PeftModel, get_peft_model
@@ -1862,12 +2067,14 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     requested_inference_batch_size=max(1,int(inference_batch_size or batch_size))
     batch_probe={"enabled": False, "selected_batch_size": effective_batch_size}
     if auto_batch_size:
+        recovery_context["phase"] = "batch_probe"
         effective_batch_size, batch_probe = _probe_lora_batch_size(
             model, train_dataset, requested_batch_size=batch_size,
             max_batch_size=max_batch_size or batch_size,
             safety_fraction=batch_probe_safety_fraction, use_bf16=use_bf16, use_fp16=use_fp16,
             optimizer_name=optimizer, weight_decay=weight_decay,
             gradient_checkpointing_enabled=gradient_checkpointing)
+        recovery_context["phase"] = "initialization"
     checkpointing_probe_batch_size = int(effective_batch_size)
     out.mkdir(parents=True,exist_ok=True)
     batch_probe.update({"requested_batch_size":int(batch_size),
@@ -1904,6 +2111,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             return LengthOrderedSampler(validation_dataset_rows)
         def evaluate(self, *args, **kwargs):
             started = time.perf_counter()
+            previous_phase = recovery_context.get("phase", "training")
+            recovery_context["phase"] = "validation"
             try:
                 metrics, effective, fallbacks = _evaluate_with_oom_batch_fallback(
                     lambda: super(OrderedValidationTrainer, self).evaluate(*args, **kwargs),
@@ -1913,8 +2122,14 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                 self.effective_eval_batch_size = effective
                 self.eval_oom_fallbacks += fallbacks
                 return metrics
+            except Exception as exc:
+                if _is_oom_error(exc):
+                    recovery_context["phase"] = "validation_oom"
+                raise
             finally:
                 self.validation_seconds += time.perf_counter() - started
+                if recovery_context.get("phase") == "validation":
+                    recovery_context["phase"] = previous_phase
 
     trainer_type=OrderedValidationTrainer
     if scheduler == "epoch_decay":
@@ -1935,8 +2150,10 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         callbacks=([snapshot_callback,progress_callback,early_stopping_callback]
                    if eval_each_epoch else [progress_callback]))
     startup_seconds = time.perf_counter() - start
+    recovery_context["phase"] = "training"
     training_started = time.perf_counter()
     trainer.train()
+    recovery_context["phase"] = "inference"
     training_seconds = time.perf_counter() - training_started
     post_training_started = time.perf_counter()
     out.mkdir(parents=True,exist_ok=True)
@@ -2101,6 +2318,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                 float(getattr(trainer,"validation_seconds",0.0))),
             "model_post_training_seconds":float(time.perf_counter()-post_training_started)},
         "requested_batch_size":int(batch_size),"effective_batch_size":effective_batch_size,
+        "gradient_accumulation_steps":int(gradient_accumulation_steps),
         "requested_inference_batch_size":requested_inference_batch_size,
         "lr_scheduler_type":scheduler,"warmup_ratio":float(warmup_ratio),
         "batch_size_probe":batch_probe,
