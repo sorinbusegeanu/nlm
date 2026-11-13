@@ -39,6 +39,14 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertEqual(selected, 11)
         self.assertIn(11, attempts)
         self.assertIn(12, attempts)
+        self.assertEqual(attempts[-2:], [12, 11])
+
+    def test_batch_probe_retries_one_below_oom_boundary(self):
+        attempts = []
+        selected = model_factory._largest_safe_batch_size(
+            1024, lambda size: attempts.append(size) or size <= 8)
+        self.assertEqual(selected, 8)
+        self.assertEqual(attempts[-2:], [9, 8])
 
     def test_configurable_vram_reserve_uses_five_to_ten_percent(self):
         limit_5, reserve_5 = model_factory._batch_probe_memory_limit(100, 1000, .95)
@@ -54,14 +62,44 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertEqual(model_factory._resolve_batch_accumulation(16, 8, 16), (16, 1))
         self.assertEqual(model_factory._resolve_batch_accumulation(11, 1, 32), (8, 4))
 
-    def test_throughput_selection_prefers_fastest_safe_candidate(self):
-        selected = model_factory._select_throughput_batch_size([
-            {"batch_size": 16, "fits": True, "examples_per_second": 90.0},
-            {"batch_size": 12, "fits": True, "examples_per_second": 105.0},
-            {"batch_size": 8, "fits": False, "examples_per_second": 200.0},
-        ])
-        self.assertEqual(selected, 12)
-        self.assertEqual(model_factory._nearby_batch_candidates(13), [13, 12, 11, 9])
+    def test_encoder_gradient_checkpointing_can_be_enabled_and_disabled(self):
+        class Model:
+            is_gradient_checkpointing = False
+            config = SimpleNamespace(use_cache=True)
+            def gradient_checkpointing_enable(self):
+                self.is_gradient_checkpointing = True
+            def gradient_checkpointing_disable(self):
+                self.is_gradient_checkpointing = False
+        model = Model()
+        model_factory._set_gradient_checkpointing(model, True)
+        self.assertTrue(model.is_gradient_checkpointing)
+        self.assertFalse(model.config.use_cache)
+        model_factory._set_gradient_checkpointing(model, False)
+        self.assertFalse(model.is_gradient_checkpointing)
+
+    def test_gradient_checkpointing_policy_does_not_disable_for_large_batches(self):
+        self.assertTrue(model_factory._gradient_checkpointing_for_batch(True, 16))
+        self.assertTrue(model_factory._gradient_checkpointing_for_batch(True, 1024))
+        self.assertFalse(model_factory._gradient_checkpointing_for_batch(False, 16))
+        backbone = SimpleNamespace(is_gradient_checkpointing=True)
+        self.assertIs(model_factory._gradient_checkpointing_target(
+            SimpleNamespace(backbone=backbone)), backbone)
+
+    def test_probe_selects_largest_safe_batch_even_when_smaller_is_faster(self):
+        selected, metrics, fallback = model_factory._select_probed_batch_size(
+            8, [{"batch_size": 4, "fits": True, "examples_per_second": 7.73},
+                {"batch_size": 8, "fits": True, "examples_per_second": 7.62}],
+            [{"batch_size": 8, "fits": True, "examples_per_second": 7.62}])
+        self.assertEqual(selected, 8)
+        self.assertEqual(metrics["examples_per_second"], 7.62)
+        self.assertFalse(fallback)
+
+    def test_v2_stage2_config_uses_max_physical_batch_without_accumulation_cap(self):
+        config = pipeline._read_yaml("configs/models/ultrabert380_v2_stage2.yaml")
+        self.assertEqual(config["max_batch_size"], 1024)
+        self.assertEqual(config["batch_probe_safety_fraction"], 0.95)
+        self.assertEqual(config["gradient_accumulation_steps"], 1)
+        self.assertIsNone(config["target_effective_batch_size"])
 
     def test_optimizer_step_count_uses_physical_batch_and_accumulation(self):
         self.assertEqual(model_factory._optimizer_steps_per_epoch(101, 16, 1), 7)
@@ -170,12 +208,14 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
              patch.object(pipeline, "train_frozen_backbone_fold", side_effect=fake_frozen):
             pipeline._train_fold("ultrabert380", rows, rows, ["a", "b"],
                 {"checkpoint": "base", "revision": "a" * 40, "max_length": 8,
-                 "save_epoch_checkpoints": True}, Path("/tmp/encoder"), 1, "validation", Path("/tmp/cache"))
+                 "save_epoch_checkpoints": True, "gradient_checkpointing": True},
+                Path("/tmp/encoder"), 1, "validation", Path("/tmp/cache"))
             pipeline._train_fold("embeddinggemma2", rows, rows, ["a", "b"],
                 {"training_mode": "frozen", "checkpoint": "base", "revision": "b" * 40,
                  "max_length": 8, "batch_size": 2, "inference_batch_size": 11},
                 Path("/tmp/frozen"), 1, "validation", Path("/tmp/cache"))
         self.assertTrue(encoder_calls["save_epoch_checkpoints"])
+        self.assertTrue(encoder_calls["gradient_checkpointing"])
         self.assertEqual(frozen_calls["inference_batch_size"], 11)
 
     def test_catboost_uses_standard_softmax_without_extra_training_inference(self):
@@ -264,6 +304,7 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         encoder_parameters = inspect.signature(model_factory.train_encoder_fold).parameters
         self.assertIn("inference_batch_size", encoder_parameters)
         self.assertFalse(any("calibrat" in name for name in encoder_parameters))
+        self.assertIn("gradient_checkpointing", encoder_parameters)
 
     def test_epoch_predictions_are_reused_only_for_matching_selected_checkpoint(self):
         epoch_predictions = [{"epoch": 1, "scores": np.ones((2, 3))},
@@ -367,6 +408,32 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertFalse(pipeline._continuation_source_matches(
             legacy, "train", "valid", train, valid.assign(text="changed"), "legacy-source-hash"))
 
+    def test_cross_dataset_continuation_requires_identical_v0_validation(self):
+        train = pd.DataFrame({"id": ["t1"], "prompt_id": ["pt1"],
+                              "text": ["stage two row"], "model": ["a"]})
+        valid = pd.DataFrame({"id": ["v1"], "prompt_id": ["pv1"],
+                              "text": ["validation response"], "model": ["a"]})
+        import hashlib
+        source = {"training_dataset": "v2.0.chunks800", "validation_dataset": "v0",
+            "training_dataset_sha256": "stage-one-data-hash",
+            "validation_dataset_sha256": pipeline._partition_sha256(valid),
+            "validation_rows": 1,
+            "validation_ids_sha256": hashlib.sha256(b"v1").hexdigest(),
+            "validation_prompt_ids_sha256": hashlib.sha256(b"pv1").hexdigest(),
+            "validation_normalized_text_sha256": hashlib.sha256(
+                b"validation response").hexdigest()}
+        self.assertFalse(pipeline._continuation_source_matches(
+            source, "v2.0", "v0", train, valid, "stage-two-data-hash"))
+        self.assertTrue(pipeline._continuation_source_matches(
+            source, "v2.0", "v0", train, valid, "stage-two-data-hash",
+            allow_cross_dataset_source=True))
+        self.assertFalse(pipeline._continuation_source_matches(
+            source, "v2.0", "v0", train, valid.assign(prompt_id="different-prompt"),
+            "stage-two-data-hash", allow_cross_dataset_source=True))
+        self.assertFalse(pipeline._continuation_source_matches(
+            source, "v2.0", "v0", train, valid.assign(text="changed"),
+            "stage-two-data-hash", allow_cross_dataset_source=True))
+
     def test_continuation_paths_forward_inference_and_calibration_settings(self):
         train = pd.DataFrame({"id": ["t1", "t2"], "prompt_id": ["pt1", "pt2"],
             "text": ["train a", "train b"], "model": ["a", "b"]})
@@ -441,7 +508,8 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                 pipeline.continue_encoder("v1", data_dir=str(data), artifact_dir=str(artifacts),
                     registry_path=str(root / "registry.sqlite"), from_experiment="encoder-source",
                     epochs=1, config_overrides={"batch_size": 4, "inference_batch_size": 8,
-                                                "calibration_enabled": True})
+                                                "calibration_enabled": True},
+                    allow_cross_dataset_source=True)
         self.assertEqual(calls["qwen"]["inference_batch_size"], 5)
         self.assertEqual(calls["qwen"]["batch_size"], 3)
         self.assertNotIn("calibration_enabled", calls["qwen"])
@@ -453,6 +521,9 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertTrue(calls["encoder"]["auto_batch_size"])
         self.assertEqual(calls["encoder"]["max_batch_size"], 64)
         self.assertEqual(calls["encoder"]["batch_probe_safety_fraction"], 0.8)
+        self.assertTrue(calls["encoder"]["gradient_checkpointing"])
+        self.assertEqual(calls["encoder"]["lr_scheduler_type"], "linear")
+        self.assertEqual(calls["encoder"]["warmup_ratio"], 0.0)
 
     def test_continuation_config_precedence_parent_then_yaml_then_explicit(self):
         with tempfile.TemporaryDirectory() as temp:

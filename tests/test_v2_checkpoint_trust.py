@@ -5,8 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+import numpy as np
 
 from src import v2_checkpoint_trust as trust
+from src.pipeline import _partition_sha256
 
 
 class V2CheckpointTrustTests(unittest.TestCase):
@@ -72,6 +74,72 @@ class V2CheckpointTrustTests(unittest.TestCase):
             result = trust.append_training_run({"model": "qwen06", "dataset": "v1"}, "run.json",
                                                root=root, roster_path=root / trust.ROSTER_PATH)
             self.assertEqual(result["status"], "deferred")
+
+    def test_rank_k_metrics_and_saved_probability_csv_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            v0_dir = root / "data/processed"
+            cache_dir = root / trust.PREDICTION_DIR
+            v0_dir.mkdir(parents=True)
+            cache_dir.mkdir(parents=True)
+            ids = [f"{index:04d}" for index in range(trust.V0_ROWS)]
+            labels = [trust.LABELS[index % len(trust.LABELS)] for index in range(trust.V0_ROWS)]
+            v0 = pd.DataFrame({"id": ids, "prompt_id": [f"p{i}" for i in ids],
+                               "text": [f"response {i}" for i in ids], "model": labels})
+            v0.to_parquet(v0_dir / "dataset_v0.parquet", index=False)
+            probabilities = np.full((trust.V0_ROWS, len(trust.LABELS)), 0.001, dtype=float)
+            for row_index, label in enumerate(labels):
+                correct = trust.LABELS.index(label)
+                other1 = (correct + 1) % len(trust.LABELS)
+                other2 = (correct + 2) % len(trust.LABELS)
+                if row_index % 3 == 0:
+                    order = [correct, other1, other2]
+                elif row_index % 3 == 1:
+                    order = [other1, correct, other2]
+                else:
+                    order = [other1, other2, correct]
+                probabilities[row_index, order] = [0.70, 0.20, 0.08]
+                probabilities[row_index] /= probabilities[row_index].sum()
+            experiment_id = "cached-exp"
+            cached = pd.DataFrame({"id": ids, "y_true": labels})
+            for index, label in enumerate(trust.LABELS):
+                cached[f"prob::{label}"] = probabilities[:, index]
+            cached.to_parquet(cache_dir / f"{experiment_id}.parquet", index=False)
+
+            rank1 = trust._rank_k_metrics(labels, probabilities, 1)
+            rows = []
+            for label in trust.LABELS:
+                metric = rank1[label]
+                rows.append({
+                    "sequence_id": "N0001", "experiment_id": experiment_id,
+                    "model": "fixture", "model_title": "Fixture", "target_label": label,
+                    "training_dataset": "v1", "dataset_lineage": "v1", "checkpoint": "model",
+                    "checkpoint_path": "artifacts/checkpoint", "checkpoint_created_at_utc": trust._utc_now(),
+                    "checkpoint_date": "11.13", **metric, "evaluation_eligible": True,
+                    "validation_training_overlap": 0, "evaluation_note": "Full V0 fixture",
+                    "checkpoint_available": True, "validation_split_sha256": "fixture",
+                    "catalog_source": "fixture", "smoothed_precision": 0.0,
+                    "rule_eligible": True, "overall_accuracy": rank1["_overall"]["overall_accuracy"],
+                    "balanced_accuracy": rank1["_overall"]["balanced_accuracy"],
+                    "validation_rows": trust.V0_ROWS,
+                })
+            metadata = {"generated_at_utc": trust._utc_now(),
+                        "validation_sha256": _partition_sha256(v0), "validation_rows": trust.V0_ROWS}
+            frame = pd.DataFrame(rows)
+            frame.attrs["trust_list_version"] = "trust-list-2-v001"
+            trust._publish_version(root, frame, metadata, "trust-list-2-v001")
+
+            report = trust.generate_topk_trust_lists(root=root)
+            top2 = pd.read_csv(root / "docs/trust-list-2-top2.csv")
+            top3 = pd.read_csv(root / "docs/trust-list-2-top3.csv")
+            self.assertEqual(list(top2.columns), trust.TRUST_COLUMNS)
+            self.assertEqual(list(top3.columns), trust.TRUST_COLUMNS)
+            self.assertEqual(len(top2), len(trust.LABELS))
+            self.assertEqual(len(top3), len(trust.LABELS))
+            self.assertEqual(int(top2.true_positive.sum()), sum(i % 3 == 1 for i in range(trust.V0_ROWS)))
+            self.assertEqual(int(top3.true_positive.sum()), sum(i % 3 == 2 for i in range(trust.V0_ROWS)))
+            self.assertFalse(report["rank1_artifact_mismatches"])
+            self.assertEqual(report["source_trust_list_version"], "trust-list-2-v001")
 
 
 if __name__ == "__main__":

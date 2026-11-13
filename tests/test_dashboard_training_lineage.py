@@ -4,9 +4,31 @@ import unittest
 from pathlib import Path
 
 from dashboard.training_lineage import training_lineage, trainer_completion
+from dashboard.training_config import live_training_config
 
 
 class TrainingLineageTests(unittest.TestCase):
+    def test_live_continuation_uses_config_file_unless_cli_overrides_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "stage2.yaml"
+            config_path.write_text(
+                "model: ultrabert380\nepochs: 20\nlearning_rate: 8.0e-6\n"
+                "learning_rate_decay: null\nlr_scheduler_type: linear\n")
+            options = {"--config": str(config_path), "--dataset": "v2.0",
+                       "--validation-dataset": "v0"}
+            config = live_training_config(root, "continue-encoder", "ultrabert380", options)
+            self.assertEqual(config["learning_rate"], 8e-6)
+            self.assertIsNone(config["learning_rate_decay"])
+            self.assertEqual(config["epochs"], 20)
+            self.assertEqual(config["lr_scheduler_type"], "linear")
+            self.assertEqual(config["training_data"], "v2.0")
+
+            options.update({"--learning-rate": "1e-5", "--epochs": "6"})
+            overridden = live_training_config(root, "continue-encoder", "ultrabert380", options)
+            self.assertEqual(overridden["learning_rate"], 1e-5)
+            self.assertEqual(overridden["epochs"], 6)
+
     def test_training_tables_show_raw_loss_without_calibration_columns(self):
         dashboard = Path(__file__).resolve().parents[1] / "dashboard" / "app.py"
         source = dashboard.read_text()

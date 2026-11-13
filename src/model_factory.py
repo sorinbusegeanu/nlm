@@ -85,7 +85,7 @@ def _should_restore_selected_epoch(best_epoch, last_evaluated_epoch):
 
 
 def _largest_safe_batch_size(maximum, fits):
-    """Find the greatest safe positive integer using exponential then binary search."""
+    """Find the greatest safe integer, then verify the boundary by stepping down by one."""
     maximum = max(1, int(maximum))
     successful, failed, candidate = 0, None, 1
     while candidate <= maximum:
@@ -107,6 +107,26 @@ def _largest_safe_batch_size(maximum, fits):
                 low = middle + 1
             else:
                 high = middle - 1
+        # Verify the boundary in the same one-at-a-time way used by OOM
+        # recovery: after a failure at N, explicitly retry N-1, then keep
+        # stepping down if memory pressure makes that attempt fail too.
+        candidate = min(maximum, successful + 1)
+        while candidate <= maximum:
+            if fits(candidate):
+                successful = candidate
+                candidate += 1
+                continue
+            candidate -= 1
+            verified = None
+            while candidate > 0:
+                if fits(candidate):
+                    verified = candidate
+                    break
+                candidate -= 1
+            if verified is None:
+                raise MemoryError("GPU batch-size probe could not re-verify a safe batch after OOM")
+            successful = verified
+            break
     return successful
 
 
@@ -122,22 +142,18 @@ def _batch_probe_memory_limit(base_reserved_bytes, free_bytes, usable_fraction,
     return int(base_reserved_bytes) + max(0, free_bytes - reserve), reserve
 
 
-def _nearby_batch_candidates(maximum_safe, *, count=4):
-    """Small set of nearby integer microbatches for throughput comparison."""
-    maximum_safe = max(1, int(maximum_safe))
-    offsets = (0, 1, 2, 4, 8)
-    return list(dict.fromkeys(max(1, maximum_safe - offset) for offset in offsets))[:max(1, int(count))]
-
-
-def _select_throughput_batch_size(results):
-    """Choose the fastest safe measured physical batch, preferring larger ties."""
-    valid = [item for item in results if item.get("fits") and
-             item.get("examples_per_second") is not None and
-             math.isfinite(float(item["examples_per_second"]))]
-    if not valid:
-        raise ValueError("no safe batch-size candidate has a throughput measurement")
-    return int(max(valid, key=lambda item: (float(item["examples_per_second"]),
-                                             int(item["batch_size"]))) ["batch_size"])
+def _select_probed_batch_size(maximum_safe, benchmark_results, attempts):
+    """Always select the largest verified safe batch; throughput is diagnostic only."""
+    safe_maximum = next((item for item in reversed(benchmark_results)
+                         if int(item.get("batch_size", 0)) == int(maximum_safe)
+                         and item.get("fits")), None)
+    if safe_maximum is None:
+        safe_maximum = next((item for item in reversed(attempts)
+                             if int(item.get("batch_size", 0)) == int(maximum_safe)
+                             and item.get("fits")), None)
+    if safe_maximum is None:
+        raise MemoryError("batch-size probe has no successful measurement for its safe maximum")
+    return int(maximum_safe), safe_maximum, False
 
 
 def _resolve_batch_accumulation(physical_batch_size, configured_accumulation=1,
@@ -586,6 +602,16 @@ def _set_gradient_checkpointing(model, enabled):
         model.config.use_cache = False
 
 
+def _gradient_checkpointing_for_batch(requested, _batch_size):
+    """Use the configured checkpointing mode consistently for every batch size."""
+    return bool(requested)
+
+
+def _gradient_checkpointing_target(model):
+    """Return the backbone that owns activation checkpointing for wrapped models."""
+    return getattr(model, "backbone", model)
+
+
 def _validation_loss_raw(y_true, raw_scores, classes):
     """Calculate validation log loss from unscaled model scores."""
     from sklearn.metrics import log_loss
@@ -642,8 +668,8 @@ def _ragged_token_cache_valid(path, cache_key, row_count):
         return False
 
 
-def train_svc(train_text, y_train, validation_text, classes, *, c=.5, seed=2026, feature_config=None, cache_dir=None, fold_token="", validation_labels=None):
-    """Fit TF-IDF and a LinearSVC on training rows; softmax its validation margins."""
+def train_svc(train_text, y_train, validation_text, classes, *, c=.5, seed=2026, feature_config=None, cache_dir=None, fold_token="", validation_labels=None, calibration=None, calibration_cv=3):
+    """Fit TF-IDF and LinearSVC; optionally calibrate its margins using train-only CV."""
     start = time.perf_counter()
     if cache_dir:
         x_train, x_val, features, cache_key = load_or_fit(train_text, validation_text,
@@ -654,15 +680,27 @@ def train_svc(train_text, y_train, validation_text, classes, *, c=.5, seed=2026,
         x_val = features.transform(validation_text)
         cache_key = None
     base = LinearSVC(C=c, class_weight="balanced", random_state=seed)
-    base.fit(x_train, y_train)
+    if calibration is None:
+        fitted = base.fit(x_train, y_train)
+    elif calibration == "sigmoid":
+        from sklearn.calibration import CalibratedClassifierCV
+        fitted = CalibratedClassifierCV(estimator=base, method="sigmoid",
+                                        cv=int(calibration_cv), ensemble="auto")
+        fitted.fit(x_train, y_train)
+    else:
+        raise ValueError("SVC calibration must be unset or 'sigmoid'")
     pred_start = time.perf_counter()
-    raw = _aligned(np.asarray(base.decision_function(x_val)), base.classes_, classes)
-    prob = softmax(raw, axis=1)
+    if calibration == "sigmoid":
+        prob = _aligned(np.asarray(fitted.predict_proba(x_val)), fitted.classes_, classes)
+        raw = np.log(np.maximum(prob, np.finfo(np.float64).tiny))
+    else:
+        raw = _aligned(np.asarray(fitted.decision_function(x_val)), fitted.classes_, classes)
+        prob = softmax(raw, axis=1)
     validation_loss = (_validation_loss_raw(validation_labels, raw, classes)
                        if validation_labels is not None else None)
     inference_seconds = time.perf_counter() - pred_start
     elapsed = time.perf_counter() - start
-    return {"scores": raw, "probabilities": prob, "model": base, "raw_model": base,
+    return {"scores": raw, "probabilities": prob, "model": fitted, "raw_model": fitted,
             "features": features, "cache_key": cache_key, "fit_seconds": elapsed, "classes": list(classes),
             "inference_seconds": inference_seconds, "peak_gpu_memory_bytes": None,
             "checkpoint_scoring_method": "in_memory_fitted_model_validation_predictions",
@@ -670,7 +708,9 @@ def train_svc(train_text, y_train, validation_text, classes, *, c=.5, seed=2026,
             "runtime_breakdown": {"training_seconds": float(pred_start - start),
                 "final_validation_inference_seconds": float(inference_seconds),
                 "best_checkpoint_restoration_seconds": 0.0},
-            "validation_loss_raw": validation_loss}
+            "validation_loss_raw": validation_loss,
+            "calibration_method": (f"sigmoid train-only CV ({int(calibration_cv)} folds)"
+                                   if calibration == "sigmoid" else "none")}
 
 
 class _BalancedAccuracyMetric:
@@ -1509,7 +1549,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        batch_probe_safety_fraction=0.95,
                        checkpoint_selection_metric="balanced_accuracy", save_epoch_checkpoints=False,
                        gradient_checkpointing=False, training_views=None, training_view_ids=None,
-                       _oom_recovery_context=None, _trainer_resume_checkpoint=None):
+                       _oom_recovery_context=None, _trainer_resume_checkpoint=None,
+                       copy_resume_state=True):
     """Fine-tune or continue an encoder after recording its validation baseline."""
     _force_huggingface_offline()
     recovery_context = _oom_recovery_context if _oom_recovery_context is not None else {"phase": "initialization"}
@@ -1564,7 +1605,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             train.restore_epoch_views(0)
     effective_batch_size, gradient_accumulation_steps = _resolve_batch_accumulation(
         effective_batch_size, gradient_accumulation_steps, target_effective_batch_size)
-    checkpointing_enabled = bool(gradient_checkpointing and effective_batch_size <= 8)
+    checkpointing_enabled = _gradient_checkpointing_for_batch(
+        gradient_checkpointing, effective_batch_size)
     if gradient_checkpointing:
         _set_gradient_checkpointing(model, checkpointing_enabled)
     batch_probe.update({"requested_batch_size": requested_batch_size,
@@ -1574,8 +1616,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                         "effective_optimizer_batch_size": effective_batch_size * gradient_accumulation_steps,
                         "gradient_accumulation_steps": int(gradient_accumulation_steps),
                         "gradient_checkpointing_enabled": checkpointing_enabled,
-                        "gradient_checkpointing_disabled_for_batch_threshold":
-                            bool(gradient_checkpointing and effective_batch_size > 8),
+                        "gradient_checkpointing_disabled_for_batch_threshold": False,
+                        "gradient_checkpointing_batch_policy": "configured_for_all_batch_sizes",
                         "padding_strategy": "dynamic", "pad_to_multiple_of": 8})
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     (Path(output_dir) / "batch_size_probe.json").write_text(json.dumps(batch_probe, indent=2) + "\n")
@@ -1594,7 +1636,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     training_state_dir = out / "training_state"
-    _copy_training_recovery_state(_trainer_resume_checkpoint or resume_checkpoint, out)
+    if copy_resume_state:
+        _copy_training_recovery_state(_trainer_resume_checkpoint or resume_checkpoint, out)
     from transformers import TrainerCallback
     from torch.utils.data import Sampler
 
@@ -1966,7 +2009,7 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
                          safety_fraction=0.92, use_bf16=False, use_fp16=False,
                          optimizer_name="adamw_torch", weight_decay=0.0,
                          runtime_overhead_reserve_bytes=0):
-    """Find a safe integer batch and select the fastest of nearby batch sizes."""
+    """Find and benchmark the largest safe integer batch under the configured mode."""
     torch, _ = _require_neural()
     requested = int(requested_batch_size)
     maximum = max(1, min(int(max_batch_size or requested), len(dataset)))
@@ -1995,7 +2038,8 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
     probe_order = (sorted(range(len(dataset)), key=lambda idx: dataset_lengths[idx], reverse=True)
                    if dataset_lengths is not None else list(range(len(dataset))))
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    checkpointing_requested = bool(getattr(model, "is_gradient_checkpointing", False))
+    checkpointing_target = _gradient_checkpointing_target(model)
+    checkpointing_requested = bool(getattr(checkpointing_target, "is_gradient_checkpointing", False))
     # Keep recovery copies on CPU so the probe does not consume VRAM with a
     # second copy of every trainable parameter before measuring batch capacity.
     saved_trainable = [parameter.detach().to(device="cpu", copy=True) for parameter in trainable]
@@ -2028,9 +2072,10 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
         model.zero_grad(set_to_none=True)
         batch = None
         probe_optimizer = None
-        checkpointing_enabled = checkpointing_requested and int(size) <= 8
+        checkpointing_enabled = _gradient_checkpointing_for_batch(
+            checkpointing_requested, size)
         if checkpointing_requested:
-            _set_gradient_checkpointing(model, checkpointing_enabled)
+            _set_gradient_checkpointing(checkpointing_target, checkpointing_enabled)
         try:
             # Probe the longest examples first so the chosen batch also fits
             # length-grouped batches at the truncation limit.
@@ -2127,7 +2172,9 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
             "usable_free_vram_fraction": float(safety_fraction),
             "runtime_overhead_reserve_bytes": runtime_overhead_reserve_bytes,
             "throughput_benchmark_steps": 3,
-            "max_batch_size": maximum}
+            "max_batch_size": maximum,
+            "batch_probe_algorithm_version": 2,
+            "checkpointing_policy": "configured_for_all_batch_sizes"}
         cache_key = hashlib.sha256(json.dumps(cache_payload, sort_keys=True).encode()).hexdigest()
         cache_path = Path(os.environ.get("NLM_BATCH_SIZE_CACHE", "artifacts/cache/batch_sizes")) / f"{cache_key}.json"
         cached_size = None
@@ -2154,19 +2201,31 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
             cache_path.unlink(missing_ok=True)
         if maximum_safe is None:
             maximum_safe = _largest_safe_batch_size(maximum, attempt)
+        one_step_maximum_safe = maximum_safe
         benchmark_results = []
-        for candidate in _nearby_batch_candidates(maximum_safe):
+        selected = maximum_safe
+        while selected > 0:
             before = len(report["attempts"])
-            if attempt(candidate, run_steps=3):
+            if attempt(selected, run_steps=3):
                 benchmark_results.append(report["attempts"][-1])
-            elif len(report["attempts"]) == before:
-                continue
+                break
+            if len(report["attempts"]) == before:
+                break
+            selected -= 1
         if not benchmark_results:
-            raise MemoryError("GPU batch-size throughput probes failed for all safe candidates")
-        selected = _select_throughput_batch_size(benchmark_results)
-        selected_metrics = next(item for item in benchmark_results if int(item["batch_size"]) == selected)
-        report.update({"status": "cached_validated" if cache_validated else "selected",
-                       "max_safe_batch_size": maximum_safe,
+            raise MemoryError("no batch size passed the repeated-step safety check")
+        # Throughput at smaller sizes is diagnostic only. Never discard the
+        # largest safe microbatch because a short benchmark was noisy.
+        maximum_safe = selected
+        selected, selected_metrics, throughput_fallback = _select_probed_batch_size(
+            maximum_safe, benchmark_results, report["attempts"])
+        report.update({"status": ("safe_maximum_fallback" if throughput_fallback else
+                                  "cached_validated" if cache_validated else "selected"),
+                       "selection_policy": "largest_verified_safe_batch",
+                       "boundary_backoff": "one_at_a_time",
+                       "throughput_benchmark_fallback": throughput_fallback,
+                       "max_safe_batch_size": one_step_maximum_safe,
+                       "repeated_step_safe_batch_size": maximum_safe,
                        "selected_batch_size": selected,
                        "selected_physical_batch_size": selected,
                        "effective_optimizer_batch_size": None,

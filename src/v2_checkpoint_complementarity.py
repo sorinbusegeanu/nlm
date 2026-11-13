@@ -44,54 +44,63 @@ def _resolve_prediction_path(experiment_id: str, cache_dir: Path,
 def _load_predictions(trust: pd.DataFrame, *, v0: pd.DataFrame,
                       cache_dir: Path, artifact_dir: Path,
                       labels: list[str]) -> tuple[dict[str, np.ndarray], dict[str, str]]:
-    expected_ids = v0.id.astype(str).tolist()
-    expected_y = v0.model.astype(str).to_numpy(dtype=object)
-    expected_prompts = v0.prompt_id.astype(str).to_numpy(dtype=object)
     predictions: dict[str, np.ndarray] = {}
     sources: dict[str, str] = {}
     for experiment_id in trust.experiment_id.astype(str).drop_duplicates():
-        path = _resolve_prediction_path(experiment_id, cache_dir, artifact_dir)
-        frame = pd.read_parquet(path)
-        required = {"id", "y_true"}
-        if missing := required - set(frame.columns):
-            raise ValueError(f"prediction file {path} is missing {sorted(missing)}")
-        frame = frame.copy()
-        frame["id"] = frame.id.astype(str)
-        frame["y_true"] = frame.y_true.astype(str)
-        if frame.id.duplicated().any() or len(frame) != len(v0) or set(frame.id) != set(expected_ids):
-            raise ValueError(f"prediction IDs do not exactly match full V0 for {experiment_id}: {path}")
-        aligned = frame.set_index("id").loc[expected_ids]
-        if not np.array_equal(aligned.y_true.to_numpy(dtype=object), expected_y):
-            raise ValueError(f"true labels do not align with full V0 for {experiment_id}: {path}")
-        if "prompt_id" in aligned and not np.array_equal(
-                aligned.prompt_id.astype(str).to_numpy(dtype=object), expected_prompts):
-            raise ValueError(f"prompt IDs do not align with full V0 for {experiment_id}: {path}")
-        if "y_pred" in aligned:
-            prediction = aligned.y_pred.astype(str).to_numpy(dtype=object)
-        else:
-            probability_columns = [f"prob::{label}" for label in labels]
-            if missing := set(probability_columns) - set(aligned.columns):
-                raise ValueError(f"prediction file {path} lacks probability columns {sorted(missing)}")
-            probabilities = aligned[probability_columns].to_numpy(dtype=float)
-            if probabilities.shape != (len(v0), len(labels)) or not np.isfinite(probabilities).all():
-                raise ValueError(f"invalid probabilities for {experiment_id}: {path}")
-            prediction = np.asarray(labels, dtype=object)[probabilities.argmax(axis=1)]
-        if not set(prediction).issubset(set(labels)):
-            raise ValueError(f"unknown predicted label in {path}")
-
+        predictions[experiment_id], sources[experiment_id] = _load_single_prediction(
+            experiment_id, v0=v0, cache_dir=cache_dir, artifact_dir=artifact_dir,
+            labels=labels)
         rows = trust.loc[trust.experiment_id.astype(str).eq(experiment_id)]
+        expected_y = v0.model.astype(str).to_numpy(dtype=object)
+        prediction = predictions[experiment_id]
         for rule in rows.itertuples(index=False):
             mask = prediction == str(rule.target_label)
             support = int(mask.sum())
-            tp = int(np.sum(mask & (expected_y == str(rule.target_label))) )
+            tp = int(np.sum(mask & (expected_y == str(rule.target_label))))
             measured_precision = tp / support if support else np.nan
             if support != int(rule.prediction_count):
                 raise ValueError(f"prediction support disagrees with trust list for {experiment_id}/{rule.target_label}")
             if support and not np.isclose(measured_precision, float(rule.precision), atol=1e-10, rtol=0):
                 raise ValueError(f"precision disagrees with trust list for {experiment_id}/{rule.target_label}")
-        predictions[experiment_id] = prediction
-        sources[experiment_id] = str(path)
     return predictions, sources
+
+
+def _load_single_prediction(experiment_id: str, *, v0: pd.DataFrame,
+                            cache_dir: Path, artifact_dir: Path,
+                            labels: list[str]) -> tuple[np.ndarray, str]:
+    """Load and align one saved top-1/probability prediction file to full V0."""
+    expected_ids = v0.id.astype(str).tolist()
+    expected_y = v0.model.astype(str).to_numpy(dtype=object)
+    expected_prompts = v0.prompt_id.astype(str).to_numpy(dtype=object)
+    path = _resolve_prediction_path(experiment_id, cache_dir, artifact_dir)
+    frame = pd.read_parquet(path)
+    required = {"id", "y_true"}
+    if missing := required - set(frame.columns):
+        raise ValueError(f"prediction file {path} is missing {sorted(missing)}")
+    frame = frame.copy()
+    frame["id"] = frame.id.astype(str)
+    frame["y_true"] = frame.y_true.astype(str)
+    if frame.id.duplicated().any() or len(frame) != len(v0) or set(frame.id) != set(expected_ids):
+        raise ValueError(f"prediction IDs do not exactly match full V0 for {experiment_id}: {path}")
+    aligned = frame.set_index("id").loc[expected_ids]
+    if not np.array_equal(aligned.y_true.to_numpy(dtype=object), expected_y):
+        raise ValueError(f"true labels do not align with full V0 for {experiment_id}: {path}")
+    if "prompt_id" in aligned and not np.array_equal(
+            aligned.prompt_id.astype(str).to_numpy(dtype=object), expected_prompts):
+        raise ValueError(f"prompt IDs do not align with full V0 for {experiment_id}: {path}")
+    if "y_pred" in aligned:
+        prediction = aligned.y_pred.astype(str).to_numpy(dtype=object)
+    else:
+        probability_columns = [f"prob::{label}" for label in labels]
+        if missing := set(probability_columns) - set(aligned.columns):
+            raise ValueError(f"prediction file {path} lacks probability columns {sorted(missing)}")
+        probabilities = aligned[probability_columns].to_numpy(dtype=float)
+        if probabilities.shape != (len(v0), len(labels)) or not np.isfinite(probabilities).all():
+            raise ValueError(f"invalid probabilities for {experiment_id}: {path}")
+        prediction = np.asarray(labels, dtype=object)[probabilities.argmax(axis=1)]
+    if not set(prediction).issubset(set(labels)):
+        raise ValueError(f"unknown predicted label in {path}")
+    return prediction, str(path)
 
 
 def _is_eligible(value) -> bool:

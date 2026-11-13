@@ -492,6 +492,165 @@ def build_roster_trust_list(*, root: str | Path = ".", batch_size: int = 4) -> d
             "rows": len(ranked), "roster_predictions": len(roster), "prediction_dir": str(output_dir)}
 
 
+def _read_saved_probabilities(root: Path, experiment_id: str, expected_ids: list[str],
+                              expected_y: list[str]) -> tuple[np.ndarray, Path]:
+    """Read aligned probabilities from a cache or the run's saved V0 prediction file."""
+    cache_path = root / PREDICTION_DIR / f"{experiment_id}.parquet"
+    candidates = [cache_path]
+    try:
+        manifest_path = _find_manifest(root, experiment_id)
+        manifest = json.loads(manifest_path.read_text())
+        saved_path = Path(str(manifest.get("prediction_path") or ""))
+        if str(saved_path):
+            candidates.append(saved_path if saved_path.is_absolute() else root / saved_path)
+    except FileNotFoundError:
+        manifest = {}
+    for path in candidates:
+        if not path.is_file():
+            continue
+        predictions = pd.read_parquet(path)
+        required = {"id", *(f"prob::{label}" for label in LABELS)}
+        if required - set(predictions.columns):
+            continue
+        if predictions.id.astype(str).tolist() != expected_ids:
+            raise ValueError(f"saved probability rows are not aligned to complete V0 for {experiment_id}: {path}")
+        if "y_true" in predictions and predictions.y_true.astype(str).tolist() != expected_y:
+            raise ValueError(f"saved probability labels disagree with complete V0 for {experiment_id}: {path}")
+        probabilities = predictions[[f"prob::{label}" for label in LABELS]].to_numpy(dtype=np.float64)
+        if probabilities.shape != (V0_ROWS, len(LABELS)) or not np.isfinite(probabilities).all():
+            raise ValueError(f"invalid saved probability matrix for {experiment_id}: {path}")
+        if (probabilities < 0).any() or not np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-5):
+            raise ValueError(f"saved probabilities are not normalized for {experiment_id}: {path}")
+        return probabilities, path
+    raise FileNotFoundError(f"no saved full-V0 probability artifact found for {experiment_id}")
+
+
+def _rank_k_metrics(y_true: list[str], probabilities: np.ndarray, rank: int) -> dict[str, dict]:
+    from sklearn.metrics import balanced_accuracy_score
+    order = np.argsort(-probabilities, axis=1, kind="stable")
+    predicted = np.asarray(LABELS, dtype=object)[order[:, rank - 1]]
+    y_array = np.asarray(y_true, dtype=object)
+    metrics = {}
+    for label in LABELS:
+        mask = predicted == label
+        correct = mask & (y_array == label)
+        prediction_count = int(mask.sum())
+        true_positive = int(correct.sum())
+        actual_count = int((y_array == label).sum())
+        metrics[label] = {
+            "precision": true_positive / prediction_count if prediction_count else 0.0,
+            "recall": true_positive / actual_count if actual_count else 0.0,
+            "prediction_count": prediction_count,
+            "true_positive": true_positive,
+            "false_positive": prediction_count - true_positive,
+            "false_negative": actual_count - true_positive,
+        }
+    metrics["_overall"] = {
+        "overall_accuracy": float(np.mean(predicted == y_array)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_array, predicted)),
+        "correct_predictions": int(np.sum(predicted == y_array)),
+    }
+    return metrics
+
+
+def generate_topk_trust_lists(*, root: str | Path = ".") -> dict:
+    """Generate rank-2/rank-3 trust CSVs from the current list's saved V0 probabilities."""
+    from .pipeline import _dataset_rows, _partition_sha256
+
+    root = Path(root).resolve()
+    latest = _latest_version(root)
+    if latest is None:
+        raise FileNotFoundError("Trust List 2 latest-version pointer is missing")
+    source_version, source_path, source_metadata_path = latest
+    source = pd.read_csv(source_path)
+    source_metadata = json.loads(source_metadata_path.read_text())
+    v0 = _dataset_rows("v0", root / "data" / "processed")
+    if len(v0) != V0_ROWS or set(v0.model.astype(str)) != set(LABELS):
+        raise ValueError("V0 reference is not the expected complete 2,699-row, 18-label dataset")
+    v0_hash = _partition_sha256(v0)
+    if source_metadata.get("validation_sha256") and source_metadata["validation_sha256"] != v0_hash:
+        raise ValueError("latest Trust List 2 V0 hash differs from the current V0 dataset")
+    ids = v0.id.astype(str).tolist()
+    y_true = v0.model.astype(str).tolist()
+    if source.duplicated(["experiment_id", "target_label"]).any():
+        raise ValueError("latest Trust List 2 has duplicate checkpoint-label entries")
+
+    rows_by_rank = {2: [], 3: []}
+    rank_summary = {rank: {"correct_predictions": 0, "eligible_combinations": 0,
+                           "high_precision_eligible_combinations": 0}
+                    for rank in rows_by_rank}
+    checkpoints = source.drop_duplicates("experiment_id").to_dict("records")
+    for checkpoint_row in checkpoints:
+        experiment_id = str(checkpoint_row["experiment_id"])
+        checkpoint_rows = source[source.experiment_id.astype(str).eq(experiment_id)]
+        if len(checkpoint_rows) != len(LABELS) or set(checkpoint_rows.target_label.astype(str)) != set(LABELS):
+            raise ValueError(f"Trust List 2 entry {experiment_id} does not have all 18 labels")
+        probabilities, prediction_path = _read_saved_probabilities(root, experiment_id, ids, y_true)
+        base_by_label = checkpoint_rows.set_index("target_label", drop=False)
+        for rank in rows_by_rank:
+            metrics = _rank_k_metrics(y_true, probabilities, rank)
+            summary = rank_summary[rank]
+            summary["correct_predictions"] += metrics["_overall"]["correct_predictions"]
+            summary["checkpoints_with_probabilities"] = summary.get("checkpoints_with_probabilities", 0) + 1
+            summary.setdefault("probability_sources", {})
+            source_key = "roster_cache" if prediction_path.parent == root / PREDICTION_DIR else "saved_validation_predictions"
+            summary["probability_sources"][source_key] = summary["probability_sources"].get(source_key, 0) + 1
+            for label in LABELS:
+                base = base_by_label.loc[label].to_dict()
+                calculated = metrics[label]
+                base.update(calculated)
+                base.update({
+                    "smoothed_precision": (calculated["true_positive"] + 1.0) /
+                                          (calculated["prediction_count"] + 2.0),
+                    "overall_accuracy": metrics["_overall"]["overall_accuracy"],
+                    "balanced_accuracy": metrics["_overall"]["balanced_accuracy"],
+                    "validation_rows": V0_ROWS,
+                })
+                rows_by_rank[rank].append(base)
+
+    generated_at = _utc_now()
+    outputs = {}
+    for rank, rows in rows_by_rank.items():
+        frame = pd.DataFrame(rows)
+        frame.attrs["trust_list_version"] = source_version
+        ranked = _sort_and_rank(frame, generated_at=generated_at)
+        rank_summary[rank]["eligible_combinations"] = int(ranked.rule_eligible.fillna(False).astype(bool).sum())
+        rank_summary[rank]["high_precision_eligible_combinations"] = int(
+            (ranked.rule_eligible.fillna(False).astype(bool) & ranked.precision.ge(0.90)).sum())
+        output_path = root / "docs" / f"trust-list-2-top{rank}.csv"
+        _atomic_write(ranked, output_path)
+        outputs[rank] = {"path": str(output_path.relative_to(root)), "rows": int(len(ranked)),
+                         "eligible_combinations": rank_summary[rank]["eligible_combinations"],
+                         "correct_predictions": rank_summary[rank]["correct_predictions"]}
+
+    # Verify that rank 1 in the same saved artifacts reproduces Trust List 2's
+    # recorded per-label counts and metrics; rank 2/3 are otherwise independent.
+    rank1_mismatches = []
+    for checkpoint_row in checkpoints:
+        experiment_id = str(checkpoint_row["experiment_id"])
+        checkpoint_rows = source[source.experiment_id.astype(str).eq(experiment_id)]
+        probabilities, _ = _read_saved_probabilities(root, experiment_id, ids, y_true)
+        calculated = _rank_k_metrics(y_true, probabilities, 1)
+        for row in checkpoint_rows.to_dict("records"):
+            label = str(row["target_label"])
+            metric = calculated[label]
+            if (int(row.get("true_positive", 0)) != metric["true_positive"] or
+                    int(row.get("prediction_count", 0)) != metric["prediction_count"]):
+                rank1_mismatches.append({"experiment_id": experiment_id, "label": label})
+    report = {
+        "source_trust_list_version": source_version,
+        "source_csv": str(source_path.relative_to(root)),
+        "generated_at_utc": generated_at,
+        "validation_rows": V0_ROWS,
+        "validation_sha256": v0_hash,
+        "checkpoints": len(checkpoints),
+        "rank_summaries": rank_summary,
+        "rank1_artifact_mismatches": rank1_mismatches,
+        "outputs": outputs,
+    }
+    return report
+
+
 def _atomic_write(frame: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -606,11 +765,15 @@ def append_training_run(manifest: dict, manifest_path: str | Path, *,
 def _cli() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".")
-    parser.add_argument("action", nargs="?", choices=("initialize", "build-roster"), default="initialize")
+    parser.add_argument("action", nargs="?", choices=("initialize", "build-roster", "generate-topk"), default="initialize")
     parser.add_argument("--batch-size", type=int, default=4)
     args = parser.parse_args()
-    result = (build_roster_trust_list(root=args.root, batch_size=args.batch_size)
-              if args.action == "build-roster" else initialize_v2_trust_list(root=args.root))
+    if args.action == "build-roster":
+        result = build_roster_trust_list(root=args.root, batch_size=args.batch_size)
+    elif args.action == "generate-topk":
+        result = generate_topk_trust_lists(root=args.root)
+    else:
+        result = initialize_v2_trust_list(root=args.root)
     print(json.dumps(result, indent=2))
 
 
