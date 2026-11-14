@@ -15,13 +15,19 @@ def evaluate(y_true, scores, classes, probabilities=None):
     if not np.isfinite(scores).all():
         raise ValueError("scores contain non-finite values")
     pred = np.asarray(classes)[scores.argmax(axis=1)]
+    matrix = confusion_matrix(y_true, pred, labels=classes)
+    true_positives = np.diag(matrix)
+    false_positives = matrix.sum(axis=0) - true_positives
     result = {
+        "accuracy": float(np.mean(y_true == pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, pred)),
         "macro_f1": float(f1_score(y_true, pred, labels=classes, average="macro", zero_division=0)),
         "per_class_precision": {str(c): float(p) for c, p in zip(
             classes, precision_score(y_true, pred, labels=classes, average=None, zero_division=0))},
         "per_class_recall": {str(c): float(r) for c, r in zip(classes, recall_score(y_true, pred, labels=classes, average=None, zero_division=0))},
-        "confusion_matrix": confusion_matrix(y_true, pred, labels=classes).tolist(),
+        "confusion_matrix": matrix.tolist(),
+        "per_class_true_positives": {str(c): int(v) for c, v in zip(classes, true_positives)},
+        "per_class_false_positives": {str(c): int(v) for c, v in zip(classes, false_positives)},
         "classes": classes,
     }
     if probabilities is not None:

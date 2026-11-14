@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from .inference import _predict_neural, predict_catboost_stylometry, predict_svc_bundle
+from .data_factory import _normal_text
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = ROOT / "data/processed/dataset_v2.14.parquet"
@@ -44,6 +45,7 @@ CATEGORY_NAMES = [
     "Strong consensus error", "Other errors",
 ]
 RETENTION = np.array([0.20, 0.50, 0.60, 1.00, 0.00, 1.00])
+RETENTION_80PCT = np.array([0.60, 1.00, 1.00, 1.00, 1.00, 1.00])
 
 
 def _sha256(path: Path) -> str:
@@ -71,9 +73,9 @@ def _load_manifests():
 
 
 def _load_cache(name: str, ids: np.ndarray, classes: list[str], manifest: dict,
-                dataset_sha256: str) -> np.ndarray | None:
-    path = OUT_DIR / f"{name}_probabilities.npz"
-    meta_path = OUT_DIR / f"{name}_probabilities.json"
+                dataset_sha256: str, cache_dir: Path = OUT_DIR) -> np.ndarray | None:
+    path = cache_dir / f"{name}_probabilities.npz"
+    meta_path = cache_dir / f"{name}_probabilities.json"
     if not path.is_file() or not meta_path.is_file():
         return None
     meta = json.loads(meta_path.read_text())
@@ -90,9 +92,9 @@ def _load_cache(name: str, ids: np.ndarray, classes: list[str], manifest: dict,
 
 
 def _save_cache(name: str, ids: np.ndarray, probs: np.ndarray, classes: list[str], manifest: dict,
-                manifest_path: Path, dataset_sha256: str):
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = OUT_DIR / f"{name}_probabilities.npz"
+                manifest_path: Path, dataset_sha256: str, cache_dir: Path = OUT_DIR):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"{name}_probabilities.npz"
     np.savez_compressed(path, ids=ids.astype(str), probabilities=probs.astype(np.float32))
     meta = {
         "experiment_id": manifest["experiment_id"], "checkpoint_path": manifest["checkpoint_path"],
@@ -101,17 +103,18 @@ def _save_cache(name: str, ids: np.ndarray, probs: np.ndarray, classes: list[str
         "rows": len(ids), "dataset_sha256": dataset_sha256,
         "probability_path": str(path.relative_to(ROOT)),
     }
-    (OUT_DIR / f"{name}_probabilities.json").write_text(json.dumps(meta, indent=2) + "\n")
+    (cache_dir / f"{name}_probabilities.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
-def get_predictions(frame: pd.DataFrame, classes: list[str], dataset_sha256: str) -> tuple[dict[str, np.ndarray], dict]:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+def get_predictions(frame: pd.DataFrame, classes: list[str], dataset_sha256: str,
+                    cache_dir: Path = OUT_DIR) -> tuple[dict[str, np.ndarray], dict]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
     manifests = _load_manifests()
     texts, ids = frame.text.astype(str).tolist(), frame.id.astype(str).to_numpy()
     probabilities = {}
     for name in ("svc", "catboost", "ultrabert"):
         manifest, checkpoint, manifest_path = manifests[name]
-        probs = _load_cache(name, ids, classes, manifest, dataset_sha256)
+        probs = _load_cache(name, ids, classes, manifest, dataset_sha256, cache_dir)
         if probs is None:
             print(f"Running {name} inference for {len(ids):,} V2.14 rows", flush=True)
             model_classes = list(manifest["classes"])
@@ -142,7 +145,7 @@ def get_predictions(frame: pd.DataFrame, classes: list[str], dataset_sha256: str
                 raise ValueError(f"invalid {name} probability matrix: {probs.shape}")
             if np.any(probs < -1e-8) or not np.allclose(probs.sum(axis=1), 1, atol=1e-4):
                 raise ValueError(f"{name} probability rows are invalid")
-            _save_cache(name, ids, probs, classes, manifest, manifest_path, dataset_sha256)
+            _save_cache(name, ids, probs, classes, manifest, manifest_path, dataset_sha256, cache_dir)
         probabilities[name] = probs
     return probabilities, {name: value[0] for name, value in manifests.items()}
 
@@ -210,14 +213,18 @@ def _stratum_columns(frame: pd.DataFrame):
     return source.to_numpy(), length.astype(str).to_numpy(), words.to_numpy()
 
 
-def select_rows(frame: pd.DataFrame, categories: np.ndarray, seed: int = 2026) -> np.ndarray:
+def select_rows(frame: pd.DataFrame, categories: np.ndarray, seed: int = 2026,
+                retention: np.ndarray | list[float] | tuple[float, ...] | None = None) -> np.ndarray:
     """Apply per-stratum nearest-integer rates with largest-remainder allocation."""
+    rates = np.asarray(RETENTION if retention is None else retention, dtype=float)
+    if rates.shape != (len(CATEGORY_NAMES),) or not np.isfinite(rates).all() or np.any((rates < 0) | (rates > 1)):
+        raise ValueError(f"retention must contain {len(CATEGORY_NAMES)} rates in [0, 1]")
     source, lengths, _ = _stratum_columns(frame)
     labels = frame.model.astype(str).to_numpy()
     ids = frame.id.astype(str).to_numpy()
     keep = np.zeros(len(frame), dtype=bool)
     rng = np.random.default_rng(seed)
-    for cat, rate in enumerate(RETENTION):
+    for cat, rate in enumerate(rates):
         indexes = np.flatnonzero(categories == cat)
         if rate == 1:
             keep[indexes] = True
@@ -273,19 +280,24 @@ def _decision_table(frame: pd.DataFrame, classes: list[str], probs: dict[str, np
     })
 
 
-def _metrics_report(frame, classes, probs, result, keep, cache_meta, output_sha):
+def _metrics_report(frame, classes, probs, result, keep, cache_meta, output_sha, *,
+                    retention: np.ndarray | list[float] | tuple[float, ...] | None = None,
+                    dataset_version: str = "v2.14-prediction-filtered", output_data: Path = OUT_DATA,
+                    output_profile: Path = OUT_PROFILE, output_decisions: Path = OUT_DECISIONS,
+                    output_dir: Path = OUT_DIR, seed: int = 2026):
+    rates = np.asarray(RETENTION if retention is None else retention, dtype=float)
     category = result["category"]
     decisions = {}
     for i, name in enumerate(CATEGORY_NAMES):
         original = int((category == i).sum())
         kept = int(((category == i) & keep).sum())
-        decisions[name] = (original, kept, original - kept, RETENTION[i])
+        decisions[name] = (original, kept, original - kept, rates[i])
     lines = [
-        "# V2.14 prediction-guided dataset reduction", "",
+        f"# {dataset_version} prediction-guided dataset reduction", "",
         "This is a deterministic, inference-only reduction. Models were not retrained.",
-        f"Input: `data/processed/dataset_v2.14.parquet` ({len(frame):,} rows).",
-        f"Output: `data/processed/dataset_v2.14-prediction-filtered.parquet` ({int(keep.sum()):,} rows).",
-        f"Output SHA-256: `{output_sha}`. Selection seed: `2026`.", "",
+        f"Input: `{DATA_PATH.relative_to(ROOT)}` ({len(frame):,} rows).",
+        f"Output: `{output_data.relative_to(ROOT) if output_data.is_absolute() else output_data}` ({int(keep.sum()):,} rows).",
+        f"Output SHA-256: `{output_sha}`. Selection seed: `{seed}`.", "",
         "## Checkpoints", "",
         "| Model | Experiment | Training dataset | Checkpoint | V0 balanced accuracy |",
         "|---|---|---|---|---:|",
@@ -341,15 +353,29 @@ def _metrics_report(frame, classes, probs, result, keep, cache_meta, output_sha)
     lines += ["", f"UltraBERT median confidence by true label among correct rows: {json.dumps(result['medians'], ensure_ascii=False)}", "",
         f"Overall confidence p10/p25/p50/p75/p90: {', '.join(f'{x:.4f}' for x in np.quantile(confidence,[.1,.25,.5,.75,.9]))}.",
         f"Correct-row confidence median: {np.median(correct_conf):.4f}; incorrect-row confidence median: {np.median(wrong_conf):.4f}.", "",
-        "Selection is stratified within each category by true label, `source_dataset`, and word-count bucket (short <100; medium 100–300; long >300). Integer quotas use largest-remainder allocation to match each category's requested retention rate as closely as possible; candidate ordering and seed `2026` make sampling reproducible.", "",
+        f"Selection is stratified within each category by true label, `source_dataset`, and word-count bucket (short <100; medium 100–300; long >300). Integer quotas use largest-remainder allocation to match each category's requested retention rate as closely as possible; candidate ordering and seed `{seed}` make sampling reproducible.", "",
         "### Cache and outputs", "",
-        f"Prediction caches, cache metadata, and row decisions are under `{OUT_DIR.relative_to(ROOT)}/`.",
-        f"Row decisions CSV: `{OUT_DECISIONS.relative_to(ROOT)}`. Dataset profile: `{OUT_PROFILE.relative_to(ROOT)}`.",
+        f"Prediction caches are reused from `{OUT_DIR.relative_to(ROOT)}/`; row decisions are under `{output_dir.relative_to(ROOT) if output_dir.is_absolute() else output_dir}/`.",
+        f"Row decisions CSV: `{output_decisions.relative_to(ROOT) if output_decisions.is_absolute() else output_decisions}`. Dataset profile: `{output_profile.relative_to(ROOT) if output_profile.is_absolute() else output_profile}`.",
         "V2.14 source data was not modified. Only V2.14 external rows were selected; no V0 rows were appended.", ""]
     return "\n".join(lines)
 
 
-def run(*, infer=True):
+def run(*, infer=True, retention=None, seed: int = 2026,
+        dataset_version: str = "v2.14-prediction-filtered", output_data: Path = OUT_DATA,
+        output_profile: Path = OUT_PROFILE, output_report: Path = OUT_REPORT,
+        output_decisions: Path = OUT_DECISIONS, output_dir: Path = OUT_DIR,
+        cache_dir: Path = OUT_DIR, verify_existing_classifications: bool = True):
+    # Accept path-like strings as well as Path objects for both CLI and Python callers.
+    output_data = Path(output_data)
+    output_profile = Path(output_profile)
+    output_report = Path(output_report)
+    output_decisions = Path(output_decisions)
+    output_dir = Path(output_dir)
+    cache_dir = Path(cache_dir)
+    rates = np.asarray(RETENTION if retention is None else retention, dtype=float)
+    if rates.shape != (len(CATEGORY_NAMES),) or not np.isfinite(rates).all() or np.any((rates < 0) | (rates > 1)):
+        raise ValueError(f"retention must contain {len(CATEGORY_NAMES)} rates in [0, 1]")
     frame = pd.read_parquet(DATA_PATH)
     profile = json.loads(PROFILE_PATH.read_text())
     if len(frame) != int(profile["rows"]) or len(frame) != 231336:
@@ -359,50 +385,98 @@ def run(*, infer=True):
         raise ValueError("V2.14 IDs/text are invalid")
     if frame.model.nunique() != 18 or set(frame.model.astype(str)) != set(classes):
         raise ValueError("V2.14 label roster does not match its profile")
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     if infer:
-        probs, manifests = get_predictions(frame, classes, profile["dataset_sha256"])
+        probs, manifests = get_predictions(frame, classes, profile["dataset_sha256"], cache_dir)
     else:
         probs, manifests = {}, {name: (_load_manifests()[name][0]) for name in CHECKPOINTS}
         for name in CHECKPOINTS:
             probs[name] = _load_cache(name, frame.id.astype(str).to_numpy(), classes,
-                                      manifests[name], profile["dataset_sha256"])
+                                      manifests[name], profile["dataset_sha256"], cache_dir)
             if probs[name] is None:
                 raise FileNotFoundError(f"missing valid {name} prediction cache")
     result = classify_rows(frame, probs, classes)
-    keep = select_rows(frame, result["category"], 2026)
+    if verify_existing_classifications:
+        reference_path = OUT_DIR / "row_decisions.csv"
+        if reference_path.is_file() and reference_path.resolve() != output_decisions.resolve():
+            reference = pd.read_csv(reference_path, usecols=["response_id", "category"])
+            if not np.array_equal(reference.response_id.astype(str).to_numpy(), frame.id.astype(str).to_numpy()):
+                raise ValueError("existing prediction-filter decision IDs do not align with V2.14 rows")
+            actual = np.asarray([CATEGORY_NAMES[i] for i in result["category"]], dtype=object)
+            if not np.array_equal(reference.category.astype(str).to_numpy(), actual):
+                raise ValueError("recomputed categories differ from the existing cached classification")
+    keep = select_rows(frame, result["category"], seed, rates)
     decisions = _decision_table(frame, classes, probs, result, keep)
-    decisions.to_csv(OUT_DECISIONS, index=False)
+    output_decisions.parent.mkdir(parents=True, exist_ok=True)
+    decisions.to_csv(output_decisions, index=False)
     filtered = frame.loc[keep].copy().reset_index(drop=True)
-    filtered.to_parquet(OUT_DATA, index=False)
-    output_sha = _sha256(OUT_DATA)
+    output_data.parent.mkdir(parents=True, exist_ok=True)
+    filtered.to_parquet(output_data, index=False)
+    output_sha = _sha256(output_data)
+    v0_path = DATA_PATH.parent / "dataset_v0.parquet"
+    v0_profile_path = DATA_PATH.parent / "dataset_profile.json"
+    v0 = pd.read_parquet(v0_path)
+    if len(v0) != 2699:
+        raise ValueError(f"full V0 validation artifact must contain 2,699 rows; found {len(v0)}")
+    v0_ids = set(v0.id.astype(str))
+    v0_text = set(v0.text.astype(str).map(_normal_text)) - {""}
+    output_ids = set(filtered.id.astype(str))
+    output_text = set(filtered.text.astype(str).map(_normal_text)) - {""}
+    id_overlap = output_ids & v0_ids
+    text_overlap = output_text & v0_text
+    train_prompts = set()
+    for column in ("prompt_group", "prompt_id"):
+        if column in filtered:
+            train_prompts |= set(filtered[column].dropna().astype(str)) - {""}
+    v0_prompts = set(v0.prompt_id.dropna().astype(str)) - {""}
+    prompt_overlap = train_prompts & v0_prompts
+    if id_overlap or text_overlap or prompt_overlap:
+        raise ValueError(f"V0 isolation failed: ids={len(id_overlap)}, text={len(text_overlap)}, prompts={len(prompt_overlap)}")
     new_profile = dict(profile)
     new_profile.update({
-        "dataset_version": "v2.14-prediction-filtered", "dataset_sha256": output_sha,
+        "dataset_version": dataset_version, "dataset_sha256": output_sha,
         "rows": len(filtered), "parent_dataset": "v2.14",
         "parent_dataset_sha256": profile["dataset_sha256"],
-        "prediction_filter": {"seed": 2026, "retention_rates": dict(zip(CATEGORY_NAMES, RETENTION.tolist())),
+        "prediction_filter": {"seed": int(seed), "retention_rates": dict(zip(CATEGORY_NAMES, rates.tolist())),
                               "category_counts": {name: list(map(int, decisions_count)) for name, decisions_count in _category_counts(result["category"], keep).items()},
                               "checkpoints": {name: {"experiment_id": m["experiment_id"], "checkpoint_path": m["checkpoint_path"]}
                                               for name, m in manifests.items()}},
+        "artifacts": {"dataset": str(output_data), "profile": str(output_profile),
+                      "report": str(output_report), "row_decisions": str(output_decisions)},
         "training_only": True, "external_source_rows_only": True,
         # Avoid _load_dataset's historical behavior of appending held-out V0
         # rows when this profile points to validation_dataset_version='v0'.
         "validation_dataset_version": None,
+        "validation_dataset": "v0",
+        "validation_isolation": {
+            "validation_dataset": "v0", "validation_rows": len(v0),
+            "validation_dataset_sha256": (json.loads(v0_profile_path.read_text()).get("dataset_sha256")
+                                           if v0_profile_path.is_file() else None),
+            "id_overlap": len(id_overlap), "normalized_text_overlap": len(text_overlap),
+            "prompt_group_overlap": len(prompt_overlap),
+            "scope": "all 2,699 official V0 examples; V0 rows excluded from this external-only training dataset",
+        },
         "notes": list(profile.get("notes", [])) + ["Derived by deterministic prediction-guided selection; no V0 rows were appended."],
     })
     new_profile["class_counts"] = {label: int((filtered.model.astype(str) == label).sum()) for label in classes}
     new_profile["rows_by_source_dataset"] = (filtered.source_dataset.fillna("<missing>").astype(str).value_counts().sort_index().astype(int).to_dict()
                                               if "source_dataset" in filtered else {})
-    OUT_PROFILE.write_text(json.dumps(new_profile, indent=2, ensure_ascii=False) + "\n")
+    output_profile.parent.mkdir(parents=True, exist_ok=True)
+    output_profile.write_text(json.dumps(new_profile, indent=2, ensure_ascii=False) + "\n")
     cache_meta = {}
     for name, (manifest, checkpoint, manifest_path) in _load_manifests().items():
         cache_meta[name] = {"experiment_id": manifest["experiment_id"], "checkpoint_path": str(checkpoint),
                             "dataset": manifest.get("dataset"),
                             "v0_balanced_accuracy": float(manifest.get("metrics", {}).get("balanced_accuracy", float("nan")))}
-    OUT_REPORT.write_text(_metrics_report(frame, classes, probs, result, keep, cache_meta, output_sha))
+    output_report.parent.mkdir(parents=True, exist_ok=True)
+    output_report.write_text(_metrics_report(frame, classes, probs, result, keep, cache_meta, output_sha,
+        retention=rates, dataset_version=dataset_version, output_data=output_data,
+        output_profile=output_profile, output_decisions=output_decisions, output_dir=output_dir, seed=seed))
     return {"rows": len(frame), "retained": int(keep.sum()), "removed": int((~keep).sum()),
-            "dataset": str(OUT_DATA), "report": str(OUT_REPORT), "decisions": str(OUT_DECISIONS)}
+            "dataset": str(output_data), "profile": str(output_profile),
+            "report": str(output_report), "decisions": str(output_decisions),
+            "category_counts": _category_counts(result["category"], keep),
+            "categories": result["category"], "keep": keep}
 
 
 def _category_counts(category, keep):
@@ -416,8 +490,30 @@ def _category_counts(category, keep):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cached-only", action="store_true", help="require complete prediction caches; skip inference")
+    parser.add_argument("--dataset-version", default="v2.14-prediction-filtered")
+    parser.add_argument("--retention", help="six comma-separated rates in category order; defaults to the original rates")
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--output-data", type=Path, default=OUT_DATA)
+    parser.add_argument("--output-profile", type=Path, default=OUT_PROFILE)
+    parser.add_argument("--output-report", type=Path, default=OUT_REPORT)
+    parser.add_argument("--output-decisions", type=Path, default=OUT_DECISIONS)
+    parser.add_argument("--output-dir", type=Path, default=OUT_DIR)
+    parser.add_argument("--cache-dir", type=Path, default=OUT_DIR)
     args = parser.parse_args(argv)
-    print(json.dumps(run(infer=not args.cached_only), indent=2))
+    retention = None
+    if args.retention:
+        try:
+            retention = np.asarray([float(value.strip()) for value in args.retention.split(",")], dtype=float)
+        except ValueError as exc:
+            parser.error(f"invalid --retention value: {exc}")
+    result = run(infer=not args.cached_only, retention=retention, seed=args.seed,
+        dataset_version=args.dataset_version, output_data=args.output_data,
+        output_profile=args.output_profile, output_report=args.output_report,
+        output_decisions=args.output_decisions, output_dir=args.output_dir,
+        cache_dir=args.cache_dir)
+    result.pop("categories")
+    result.pop("keep")
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

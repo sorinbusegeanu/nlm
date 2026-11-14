@@ -30,7 +30,8 @@ from .feature_factory import load_or_fit, stylometry
 from .model_factory import (FROZEN_BACKBONE_MODELS, calculate_max_token_length,
                             train_encoder_fold,
                             train_frozen_backbone_fold, train_qwen_lora_fold,
-                            train_catboost_stylometry, train_svc, select_epoch_view_indices)
+                            train_catboost_stylometry, train_svc,
+                            select_epoch_view_indices)
 from .registry import Registry
 from .v2_0_chunks800 import main as build_v2_0_chunks800_dataset
 
