@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import os
 import ast
+import math
 import re
+import time
 from pathlib import Path
 import sys
 
@@ -16,6 +18,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.registry import Registry
 from dashboard.training_lineage import training_lineage, trainer_completion
+from dashboard.training_config import live_training_config
 from src.dataset_catalog import load_dataset_catalog
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +58,14 @@ def model_display(name):
             "ultrabert380": "UltraBERT-380M", "phi35_mini": "Phi-3.5 Mini",
             "embeddinggemma2": "EmbeddingGemma 2",
             "granite4_350m": "Granite 4.0 350M Base",
+            "granite41_3b": "Granite 4.1 3B Base",
+            "modernbert_large": "ModernBERT-large",
+            "deberta_v3_large": "DeBERTa-v3-large",
+            "electra_large": "ELECTRA-large-discriminator",
+            "gte_large": "GTE-large-en-v1.5",
+            "mpnet_base": "MPNet-base",
+            "deberta_gemini": "DeBERTa-v3-base Gemini specialist",
+            "deberta_glm": "DeBERTa-v3-base GLM specialist",
             "minicpm5_2b": "MiniCPM5-2B-Base",
             "hunyuan_1_8b": "Hunyuan-1.8B-Pretrain",
             "catboost_stylometry": "CatBoost + Stylometry"}.get(name, name)
@@ -90,7 +101,9 @@ def active_training(root):
         try:
             module_index = args.index("src.pipeline")
             command = args[module_index + 1:]
-            if len(command) < 2 or command[0] != "models" or command[1] not in {"train", "continue-qwen", "continue-encoder"}:
+            if len(command) < 2 or command[0] != "models" or command[1] not in {
+                "train", "continue-qwen", "continue-lora", "continue-encoder"
+            }:
                 continue
             action = command[1]
             options = {}
@@ -102,24 +115,9 @@ def active_training(root):
                     index += 2
                 else:
                     index += 1
-            model = "qwen06" if action == "continue-qwen" else options.get("--model", "svc")
-            if action == "continue-encoder":
-                config = {
-                    "model": model,
-                    "epochs": int(options.get("--epochs", 10)),
-                    "learning_rate": float(options.get("--learning-rate", 5e-5)),
-                    "learning_rate_decay": float(options.get("--learning-rate-decay", 0.9)),
-                    "training_data": options.get("--dataset", "v0"),
-                    "validation_data": options.get("--dataset", "v0"),
-                }
-            else:
-                config_path = Path(options.get("--config", f"configs/models/{model}.yaml"))
-                if not config_path.is_absolute():
-                    config_path = root / config_path
-                import yaml
-                config = yaml.safe_load(config_path.read_text()) if config_path.is_file() else {"model": model}
-                if action == "continue-qwen":
-                    config = {**config, "epochs": int(options.get("--epochs", 4))}
+            model = options.get("--model", "qwen06" if action == "continue-qwen" else "svc")
+            training_dataset = options.get("--dataset", "v1")
+            config = live_training_config(root, action, model, options)
             try:
                 log_path = Path(os.readlink(entry / "fd/1"))
                 if not log_path.is_absolute():
@@ -135,8 +133,31 @@ def active_training(root):
                         break
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
+            console_log_path = None
+            if progress_path is not None:
+                candidate = progress_path.parents[2] / "training_console.log"
+                if candidate.is_file():
+                    console_log_path = candidate
+            if console_log_path is None:
+                # The console log is created before model loading and baseline
+                # inference, so it can identify the active run before the
+                # trainer has emitted training_progress.json.
+                for candidate in (root / "artifacts/runs").rglob("training_console.log"):
+                    try:
+                        first_line = candidate.open(encoding="utf-8", errors="replace").readline()
+                        if not first_line.startswith("TRAINING_RUN "):
+                            continue
+                        if int(json.loads(first_line[len("TRAINING_RUN "):]).get("pid", -1)) == int(entry.name):
+                            console_log_path = candidate
+                            break
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        continue
+            if console_log_path is not None:
+                log_path = console_log_path
             return {"pid": int(entry.name), "model": model, "config": config,
-                    "action": action, "log_path": log_path, "progress_path": progress_path}
+                    "training_dataset": training_dataset,
+                    "action": action, "log_path": log_path, "progress_path": progress_path,
+                    "console_log_path": console_log_path}
         except (OSError, ValueError, IndexError):
             continue
     return None
@@ -152,6 +173,70 @@ def latest_training_step(log_path):
     matches = re.findall(r"(?<!\d)(\d{1,9})/(\d{1,9})(?!\d)", content)
     return tuple(map(int, matches[-1])) if matches else None
 
+def _format_epoch_eta(seconds):
+    if seconds is None:
+        return "—"
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+def live_progress_details(progress_path, log_path, epoch_limit):
+    """Return epoch-local step progress and ETA, without exposing process IDs."""
+    live_state = {}
+    if progress_path and progress_path.is_file():
+        try:
+            live_state = json.loads(progress_path.read_text()).get("live", {})
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    current = live_state.get("epoch_step")
+    total = live_state.get("steps_per_epoch")
+    eta = live_state.get("epoch_eta_seconds")
+    live_epoch = live_state.get("epoch")
+    global_step = live_state.get("global_step")
+    progress_age = None
+    if live_state.get("updated_at") is not None:
+        try:
+            progress_age = max(0.0, time.time() - float(live_state["updated_at"]))
+        except (TypeError, ValueError):
+            progress_age = None
+    if total and current is None and global_step is not None:
+        current = ((int(global_step) - 1) % int(total)) + 1 if int(global_step) else 0
+        if live_epoch is None:
+            live_epoch = min((int(global_step) - 1) // int(total) + 1,
+                             max(1, int(epoch_limit or 1))) if int(global_step) else 1
+    if current is None or total is None:
+        step = latest_training_step(log_path)
+        if step and step[1]:
+            # Older runs may expose only Trainer's whole-run tqdm counter.
+            # Convert it to an epoch-local counter when the epoch count is known.
+            total = max(1, math.ceil(step[1] / max(1, int(epoch_limit or 1))))
+            current = ((step[0] - 1) % total) + 1 if step[0] else 0
+    step_text = f"{int(current):,}/{int(total):,}" if current is not None and total is not None else "—/—"
+    eta_text = _format_epoch_eta(eta) if eta is not None else "estimating"
+    if progress_age is not None and progress_age > 45:
+        step_text += " (stale)"
+        eta_text = "— (stale)"
+    return step_text, eta_text, live_epoch
+
+def training_log_tail(log_path, *, max_lines=100, max_bytes=256_000):
+    """Read only the newest bounded section of a live training console log."""
+    if not log_path or not log_path.is_file():
+        return None
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(max(0, size - max_bytes))
+            content = stream.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    return "\n".join(content.replace("\r", "\n").splitlines()[-max_lines:])
+
 @st.fragment(run_every="10s")
 def live_training_banner():
     live = active_training(Path(__file__).resolve().parents[1])
@@ -164,7 +249,7 @@ def live_training_banner():
     if trainer_state["finished"]:
         epoch = trainer_state.get("epoch")
         epoch_text = f" after epoch {epoch}" if epoch is not None else ""
-        st.info(f"Training finished{epoch_text}; post-training pipeline work is still running for {title} · {model_display(live['model'])} · PID {live['pid']}.")
+        st.info(f"Training finished{epoch_text}; post-training pipeline work is still running for {title} · {model_display(live['model'])}.")
         return
     epoch_limit = int(config.get("epochs", 0) or 0)
     completed_epochs = 0
@@ -181,15 +266,13 @@ def live_training_banner():
             completed_epochs = 0
     # Trainer callbacks publish epoch metrics at the end of each epoch. Before
     # that first update, the active training process is working on epoch one.
-    current_epoch = min(completed_epochs + 1, epoch_limit) if epoch_limit else None
-    step = latest_training_step(live.get("log_path"))
+    step_text, eta_text, live_epoch = live_progress_details(
+        live.get("progress_path"), live.get("log_path"), epoch_limit)
+    current_epoch = (int(live_epoch) if live_epoch is not None else
+                     min(completed_epochs + 1, epoch_limit) if epoch_limit else None)
     epoch_label = (f"epoch {current_epoch}/{epoch_limit} max" if current_epoch is not None
                    else "epoch unknown")
-    if step and step[1]:
-        st.progress(min(step[0] / step[1], 1.0),
-                    text=f"Training: {title} · {model_display(live['model'])} · {epoch_label} · step {step[0]:,}/{step[1]:,}")
-    else:
-        st.info(f"Training in progress: {title} · {model_display(live['model'])} · {epoch_label} · PID {live['pid']}")
+    st.info(f"Training in progress: {title} · {model_display(live['model'])} · {epoch_label} · steps {step_text} · epoch ETA {eta_text}")
 
 st.subheader("Live training")
 live_training_banner()
@@ -255,6 +338,37 @@ frame = pd.DataFrame(comparison, columns=["Experiment", "Description", "Model", 
     "acc_weighted", "Macro F1", "Log loss", "Runtime (s)", "Validation rows", "Seed", "Created"])
 validation = frame[frame.Split.eq("validation") & frame["acc_raw"].notna()]
 
+# The headline validation metrics refer to V2 training runs, not the historical
+# 540-row profile or unrelated older experiments.
+v2_validation_runs = []
+for row in records:
+    if row.get("split") != "validation":
+        continue
+    run_manifest = manifest_for(row)
+    dataset_name = str(run_manifest.get("dataset") or run_manifest.get("training_dataset") or
+                       run_manifest.get("dataset_version") or "")
+    if not dataset_name.lower().startswith("v2"):
+        continue
+    accuracy = run_manifest.get("selected_validation_accuracy")
+    if accuracy is None:
+        try:
+            accuracy = metrics(row).get("accuracy")
+        except (KeyError, TypeError, json.JSONDecodeError):
+            accuracy = None
+    try:
+        accuracy = float(accuracy)
+    except (TypeError, ValueError):
+        continue
+    validation_rows = run_manifest.get("validation_rows")
+    if validation_rows is None:
+        try:
+            validation_rows = metrics(row).get("validation_rows")
+        except (KeyError, TypeError, json.JSONDecodeError):
+            validation_rows = None
+    v2_validation_runs.append({"accuracy": accuracy, "validation_rows": validation_rows,
+                               "dataset": dataset_name, "experiment_id": row.get("experiment_id")})
+v2_best_validation = max(v2_validation_runs, key=lambda item: item["accuracy"]) if v2_validation_runs else None
+
 @st.fragment(run_every="10s")
 def render_current_training():
     st.subheader("Current training")
@@ -269,10 +383,22 @@ def render_current_training():
         epoch_text = f" at epoch {epoch}" if epoch is not None else ""
         st.caption(f"Trainer has finished{epoch_text}; the pipeline process is completing post-training work.")
     st.markdown(f"**Model:** {model_display(live_training['model'])}")
+    dataset_id = live_training.get("training_dataset") or config.get("training_data") or config.get("dataset", "v1")
+    dataset_labels = {"v0": "V0", "v1": "V1", "v1.1": "V1.1", "v1.2_bm": "V1.2-BM",
+                      "v1_all": "V1-all", "v1.3": "V1.3", "v1.5": "V1.5",
+                      "v2.0": "V2.0", "v2.1": "V2.1"}
+    st.markdown(f"**Training dataset:** {dataset_labels.get(str(dataset_id).lower(), dataset_id)} (`{dataset_id}`)")
     st.markdown(f"**Epochs:** {config.get('epochs', '—')}")
+    recent_log = training_log_tail(live_training.get("console_log_path") or live_training.get("log_path"))
+    with st.expander("Recent training log", expanded=False):
+        if recent_log:
+            st.code(recent_log, language="text")
+        else:
+            st.caption("No per-run console log is available for this training process.")
     st.markdown("**Training parameters**")
     if config:
         batch_probe = {}
+        live_metrics = {}
         progress_path = live_training.get("progress_path")
         if progress_path:
             probe_path = Path(progress_path).with_name("batch_size_probe.json")
@@ -281,21 +407,74 @@ def render_current_training():
                     batch_probe = json.loads(probe_path.read_text())
             except (OSError, ValueError, json.JSONDecodeError):
                 batch_probe = {}
+            try:
+                live_metrics = json.loads(Path(progress_path).read_text()).get("live", {})
+            except (OSError, ValueError, json.JSONDecodeError):
+                live_metrics = {}
         requested_batch = batch_probe.get("requested_batch_size", config.get("batch_size"))
-        effective_batch = batch_probe.get("effective_batch_size",
-                                          batch_probe.get("selected_batch_size", requested_batch))
+        selected_physical_batch = batch_probe.get("selected_physical_batch_size",
+            batch_probe.get("selected_batch_size", batch_probe.get("effective_batch_size", requested_batch)))
+        if selected_physical_batch is None:
+            selected_physical_batch = requested_batch
         accumulation = batch_probe.get("gradient_accumulation_steps",
                                        config.get("gradient_accumulation_steps", 1))
+        if accumulation is None:
+            accumulation = config.get("gradient_accumulation_steps", 1)
+        effective_optimizer_batch = batch_probe.get("effective_optimizer_batch_size")
+        if effective_optimizer_batch is None:
+            effective_optimizer_batch = config.get("target_effective_batch_size")
+        if effective_optimizer_batch is None:
+            try:
+                effective_optimizer_batch = int(selected_physical_batch) * int(accumulation)
+            except (TypeError, ValueError):
+                effective_optimizer_batch = "—"
         params = [{"Parameter": key, "Value": json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value}
-                  for key, value in config.items() if key not in {"model", "epochs", "batch_size"}]
+                  for key, value in config.items() if key not in {"model", "epochs", "batch_size",
+                      "gradient_accumulation_steps", "target_effective_batch_size"}]
         params.extend([
-            {"Parameter": "Batch size (requested per GPU)", "Value": requested_batch},
-            {"Parameter": "Batch size (effective per GPU)", "Value": effective_batch},
+            {"Parameter": "Requested physical batch (per GPU)", "Value": requested_batch},
+            {"Parameter": "Selected physical batch (per GPU)", "Value": selected_physical_batch},
             {"Parameter": "Gradient accumulation steps", "Value": accumulation},
-            {"Parameter": "Effective examples per optimizer step",
-             "Value": int(effective_batch) * int(accumulation) if effective_batch is not None else None},
+            {"Parameter": "Effective batch per optimizer step", "Value": effective_optimizer_batch},
         ])
-        st.dataframe(params, use_container_width=True, hide_index=True)
+        allocated = live_metrics.get("training_peak_allocated_bytes",
+                                     batch_probe.get("peak_probe_allocated_bytes"))
+        reserved = live_metrics.get("training_peak_reserved_bytes",
+                                    batch_probe.get("peak_probe_reserved_bytes"))
+        utilization = live_metrics.get("gpu_vram_utilization",
+                                       batch_probe.get("selected_peak_vram_utilization"))
+        throughput_examples = batch_probe.get("selected_examples_per_second")
+        throughput_tokens = batch_probe.get("selected_tokens_per_second")
+        padded_tokens = batch_probe.get("selected_padded_tokens_per_batch")
+        training_examples = live_metrics.get("training_examples_per_second")
+        training_tokens = live_metrics.get("training_tokens_per_second")
+        params.extend([
+            {"Parameter": "Peak allocated VRAM (GiB)",
+             "Value": round(float(allocated) / 1024**3, 2) if allocated is not None else "—"},
+            {"Parameter": "Peak reserved VRAM (GiB)",
+             "Value": round(float(reserved) / 1024**3, 2) if reserved is not None else "—"},
+            {"Parameter": "VRAM utilization", "Value":
+             f"{float(utilization):.1%}" if utilization is not None else "—"},
+            {"Parameter": "Probe throughput (examples/sec)", "Value":
+             round(float(throughput_examples), 2) if throughput_examples is not None else "—"},
+            {"Parameter": "Probe throughput (tokens/sec)", "Value":
+             round(float(throughput_tokens), 2) if throughput_tokens is not None else "—"},
+            {"Parameter": "Training examples/sec (live estimate)", "Value":
+             round(float(training_examples), 2) if training_examples is not None else
+             (round(float(throughput_examples), 2) if throughput_examples is not None else "—")},
+            {"Parameter": "Training tokens/sec (live estimate)", "Value":
+             round(float(training_tokens), 2) if training_tokens is not None else
+             (round(float(throughput_tokens), 2) if throughput_tokens is not None else "—")},
+            {"Parameter": "Padded tokens per selected batch", "Value":
+             int(padded_tokens) if padded_tokens is not None else "—"},
+        ])
+        params_frame = pd.DataFrame(params)
+        # The settings table intentionally combines values of different types.
+        # Normalize for Streamlit's Arrow serializer instead of triggering a
+        # failed conversion and fallback on each dashboard rerun.
+        params_frame["Value"] = params_frame["Value"].map(
+            lambda value: "—" if value is None else str(value))
+        st.dataframe(params_frame, use_container_width=True, hide_index=True)
     else:
         st.caption("No training parameters are available.")
     epoch_count = int(config.get("epochs", 0) or 0)
@@ -314,9 +493,7 @@ def render_current_training():
         epoch_rows.append({"Epoch": "Baseline", "Learning rate": None,
                            "Accuracy": baseline.get("accuracy"), "Train error": None,
                            "Validation loss (raw)": baseline.get("validation_loss_raw",
-                                                                  baseline.get("validation_loss")),
-                           "Validation loss (calibrated)": baseline.get("validation_loss_calibrated"),
-                           "Calibration temperature": baseline.get("calibration_temperature")})
+                                                                  baseline.get("validation_loss"))})
     for epoch in range(1, epoch_count + 1):
         item = history_by_epoch.get(epoch, {})
         epoch_rows.append({
@@ -327,75 +504,92 @@ def render_current_training():
             "Train error": item.get("train_loss", item.get("loss")),
             "Validation loss (raw)": item.get("validation_loss_raw",
                                                item.get("validation_loss", item.get("eval_loss"))),
-            "Validation loss (calibrated)": item.get("validation_loss_calibrated"),
-            "Calibration temperature": item.get("calibration_temperature"),
         })
     st.markdown("**Epochs**")
-    st.caption("Raw validation loss is the epoch eval_loss. Calibrated loss and temperature are recorded after train-only calibration is fitted.")
     st.dataframe(pd.DataFrame(epoch_rows, columns=["Epoch", "Learning rate", "Accuracy", "Train error",
-                 "Validation loss (raw)", "Validation loss (calibrated)", "Calibration temperature"]),
+                 "Validation loss (raw)"]),
                  use_container_width=True, hide_index=True)
 
-def render_prediction_factory():
-    st.subheader("Checkpoint accuracy by model label")
-    root = Path(__file__).resolve().parents[1]
-    trust_list_path = root / "docs" / "checkpoint_label_trust_list.csv"
-    trust_metadata_path = root / "docs" / "checkpoint_label_trust_list.json"
+def render_trust_list_table(trust_path, metadata, *, empty_message, caption):
+    trust = pd.read_csv(trust_path)
+    if trust.empty:
+        st.info(empty_message)
+        return
+    trust["SeqID"] = pd.to_numeric(trust["SeqID"], errors="raise").astype(int)
+    trust["prediction_count"] = pd.to_numeric(trust["prediction_count"], errors="coerce")
+    trust["checkpoint_model_display"] = trust["model"].map(model_display)
+    trust["checkpoint_status"] = trust["checkpoint_available"].map(
+        lambda value: "Available" if str(value).lower() in {"true", "1"} else "Missing")
+    trust["rule_eligible_display"] = trust["rule_eligible"].map(
+        lambda value: "Yes" if str(value).lower() in {"true", "1"} else "No")
+    trust = trust.rename(columns={
+        "sequence_id": "ID", "target_label": "Model label",
+        "checkpoint_model_display": "Checkpoint model", "checkpoint": "Checkpoint",
+        "dataset_lineage": "Training dataset", "checkpoint_date": "Date (MM.DD)",
+        "precision": "Label accuracy (precision)", "recall": "Recall",
+        "prediction_count": "Predicted rows", "rule_eligible_display": "Rule eligible",
+        "checkpoint_status": "Checkpoint status", "evaluation_note": "Validation note",
+    })
+    columns = ["SeqID", "ID", "Model label", "Checkpoint model", "Checkpoint",
+               "Training dataset", "Date (MM.DD)", "Label accuracy (precision)",
+               "Recall", "Predicted rows", "Rule eligible", "Checkpoint status",
+               "Validation note"]
+    table = trust[columns].style.format({
+        "SeqID": "{:.0f}", "Label accuracy (precision)": "{:.1%}",
+        "Recall": "{:.1%}", "Predicted rows": "{:.0f}",
+    }, na_rep="—")
+    version = metadata.get("version", "unknown version")
+    generated = metadata.get("generated_at_utc", "unknown generation time")
+    st.caption(f"{version}, generated {generated}. {caption}")
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+def render_trust_list_two(root):
+    st.subheader("Trust List 2")
     try:
-        if not trust_list_path.is_file():
-            st.info("The versioned checkpoint-label trust list has not been generated yet.")
+        from src.v2_checkpoint_trust import latest_trust_paths
+        latest = latest_trust_paths(root)
+        if latest is None:
+            st.info("Trust List 2 has not been generated yet.")
             return
-        catalog = pd.read_csv(trust_list_path)
-        if catalog.empty:
-            st.info("The checkpoint-label trust list is empty.")
-            return
-        metadata = json.loads(trust_metadata_path.read_text()) if trust_metadata_path.is_file() else {}
-        if "SeqID" not in catalog or catalog["SeqID"].isna().any():
-            raise ValueError("versioned trust list must assign a SeqID to every checkpoint-label row")
-        catalog["SeqID"] = pd.to_numeric(catalog["SeqID"], errors="raise").astype(int)
-        catalog = catalog.sort_values("SeqID", kind="stable").reset_index(drop=True)
-        catalog["prediction_count"] = pd.to_numeric(catalog["prediction_count"], errors="coerce")
-        catalog["validation_training_overlap"] = pd.to_numeric(
-            catalog["validation_training_overlap"], errors="coerce").fillna(0)
-        catalog["checkpoint_model_display"] = catalog["model"].map(model_display)
-        catalog["validation_note"] = catalog.apply(
-            lambda row: (f"V0 training overlap: {int(row['validation_training_overlap'])} rows"
-                         if row["validation_training_overlap"] else
-                         (str(row.get("evaluation_note") or "Not eligible for ranking")
-                          if str(row.get("evaluation_eligible", "True")).lower() not in {"true", "1"} else "")),
-            axis=1)
-        catalog["checkpoint_status"] = catalog["checkpoint_available"].map(
-            lambda value: "Available" if str(value).lower() in {"true", "1"} else "Missing")
-        catalog["rule_eligible_display"] = catalog["rule_eligible"].map(
-            lambda value: "Yes" if str(value).lower() in {"true", "1"} else "No")
-        catalog = catalog.rename(columns={
-            "sequence_id": "ID", "target_label": "Model label",
-            "checkpoint_model_display": "Checkpoint model", "checkpoint": "Checkpoint",
-            "dataset_lineage": "Training dataset", "checkpoint_date": "Date (MM.DD)",
-            "precision": "Label accuracy (precision)", "recall": "Recall",
-            "prediction_count": "Predicted rows", "validation_note": "Validation note",
-            "checkpoint_status": "Checkpoint status", "rule_eligible_display": "Rule eligible",
-        })
-        columns = ["SeqID", "ID", "Model label", "Checkpoint model", "Checkpoint", "Training dataset",
-                   "Date (MM.DD)", "Label accuracy (precision)", "Recall", "Predicted rows",
-                   "Rule eligible", "Checkpoint status", "Validation note"]
-        table = catalog[columns].style.format({
-            "SeqID": "{:.0f}",
-            "Label accuracy (precision)": "{:.1%}", "Recall": "{:.1%}",
-            "Predicted rows": "{:.0f}",
-        }, na_rep="—")
-        generated = metadata.get("generated_at_utc", "unknown generation time")
-        version = metadata.get("version", catalog.trust_list_version.iloc[0])
-        st.caption(f"Trust-list reference: {version}, generated {generated}. SeqID is the row's order in this complete ranked list; ID identifies the checkpoint. ZOD03 skips rows that fail support eligibility or its repeated-label rule. Metrics use frozen V0 validation.")
-        st.dataframe(table, use_container_width=True, hide_index=True)
+        trust_path, _, metadata = latest
+        render_trust_list_table(
+            trust_path, metadata, empty_message="Trust List 2 is empty.",
+            caption="Scores use the full 2,699-row V0 validation set and are development diagnostics.")
     except (OSError, ValueError, TypeError, KeyError) as exc:
-        st.error(f"Could not read checkpoint-label trust list: {exc}")
+        st.error(f"Could not read Trust List 2: {exc}")
+
+
+def render_trust_list_two_two(root):
+    st.subheader("Trust List 2.2")
+    try:
+        from src.trust_list2_2 import latest_trust_list_2_2_paths
+        latest = latest_trust_list_2_2_paths(root)
+        if latest is None:
+            st.info("Trust List 2.2 has not been generated yet.")
+            return
+        trust_path, _, metadata = latest
+        render_trust_list_table(
+            trust_path, metadata, empty_message="Trust List 2.2 is empty.",
+            caption="Includes only checkpoints trained on v2.x datasets. Scores use the full 2,699-row V0 validation set and are development diagnostics.")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        st.error(f"Could not read Trust List 2.2: {exc}")
+
+
+def render_prediction_factory():
+    root = Path(__file__).resolve().parents[1]
+    render_trust_list_two(root)
+    render_trust_list_two_two(root)
 
 columns = st.columns(4)
 columns[0].metric("Experiments", len(records))
 columns[1].metric("Models", int(frame.Model.nunique()))
-columns[2].metric("Best validation accuracy", f"{validation['acc_raw'].max():.4f}" if not validation.empty else "—")
-columns[3].metric("Validation rows", int(profile_validation_rows) if profile_validation_rows is not None else "—")
+columns[2].metric("Best validation accuracy", f"{v2_best_validation['accuracy']:.4f}" if v2_best_validation else "—",
+                  help=(f"Best full-V0 result among V2 training runs: {v2_best_validation['dataset']} · "
+                        f"{v2_best_validation['experiment_id']}" if v2_best_validation else "No V2 validation runs found."))
+rows_value = v2_best_validation.get("validation_rows") if v2_best_validation else None
+columns[3].metric("Validation rows", int(rows_value) if rows_value is not None and not pd.isna(rows_value) else "—",
+                  help="Validation row count from the selected best V2 training run.")
 
 tabs = st.tabs(["Overview", "Experiments", "Prediction factory", "Current training", "Models", "Errors", "Compute", "Data"])
 with tabs[0]:
@@ -474,10 +668,6 @@ with tabs[4]:
             "Validation loss (raw)": manifest.get("validation_loss_raw",
                 validation_metrics.get("validation_loss_raw",
                     selected_history.get("eval_loss") if selected_history else None)),
-            "Validation loss (calibrated)": manifest.get("validation_loss_calibrated",
-                validation_metrics.get("validation_loss_calibrated",
-                    validation_metrics.get("log_loss"))),
-            "Calibration temperature": manifest.get("calibration_temperature"),
             "Best run": row.get("description") or row.get("experiment_id"),
             "Training": training_lineage(
                 manifest, Path(row.get("artifact_path") or "artifacts/predictions").parent),
@@ -528,6 +718,37 @@ with tabs[6]:
             if manifest: manifests.append({"Experiment": f"{int(row['sequence_number']):04d}", "Description": row.get("description", ""), "Fit seconds": manifest.get("fit_seconds"),
                 "Inference seconds": manifest.get("inference_seconds"), "Checkpoint": manifest.get("checkpoint_path")})
         if manifests: st.json(manifests)
+        timing_fields = [
+            ("Best checkpoint restore", "best_checkpoint_restoration_seconds"),
+            ("Final validation inference", "final_validation_inference_seconds"),
+            ("Final validation rows/sec", "final_validation_rows_per_second"),
+            ("Effective inference batch", "effective_inference_batch_size"),
+            ("OOM batch fallbacks", "inference_oom_fallbacks"),
+            ("Best checkpoint snapshot", "best_checkpoint_state_snapshot_seconds"),
+            ("Checkpoint serialization", "checkpoint_serialization_seconds"),
+            ("Prediction export", "prediction_export_seconds"),
+            ("Manifest export", "manifest_export_seconds"),
+            ("Manifest and prediction export", "manifest_prediction_export_seconds"),
+            ("Ensemble/catalog refresh", "downstream_refresh_seconds"),
+            ("Model post-training stages", "model_post_training_seconds"),
+            ("Total post-training", "total_post_training_seconds"),
+        ]
+        timing_rows = []
+        for row in records:
+            manifest = manifest_for(row)
+            if not manifest:
+                continue
+            runtime = manifest.get("runtime_breakdown") or {}
+            timing_rows.append({"Experiment": f"{int(row['sequence_number']):04d}",
+                "Model": row.get("model"),
+                **{label: (runtime[key] if key in runtime and runtime[key] is not None else "not recorded")
+                   for label, key in timing_fields}})
+        if timing_rows:
+            st.subheader("Post-training stages (seconds)")
+            timing_frame = pd.DataFrame(timing_rows)
+            for label, _ in timing_fields:
+                timing_frame[label] = pd.to_numeric(timing_frame[label], errors="coerce")
+            st.dataframe(timing_frame, use_container_width=True, hide_index=True)
         epoch_runs = [row for row in records if manifest_for(row).get("validation_metrics_by_epoch")]
         if epoch_runs:
             chosen_run = st.selectbox("Validation accuracy by epoch", epoch_runs,
@@ -545,10 +766,11 @@ with tabs[6]:
                 st.caption(f"Selected by highest validation balanced accuracy: {picked} · balanced accuracy {float(selected_balanced_accuracy):.4f}")
             history_frame = pd.DataFrame([{"Epoch": item.get("epoch"),
                 "Accuracy": item.get("eval_accuracy"), "Balanced accuracy": item.get("eval_balanced_accuracy"),
-                "Validation loss (raw)": item.get("validation_loss_raw", item.get("eval_loss")),
-                "Validation loss (calibrated)": item.get("validation_loss_calibrated"),
-                "Calibration temperature": item.get("calibration_temperature")} for item in history])
+                "Validation loss (raw)": item.get("validation_loss_raw", item.get("eval_loss"))}
+                for item in history])
             if not history_frame.empty:
+                for column in ("Epoch", "Accuracy", "Balanced accuracy", "Validation loss (raw)"):
+                    history_frame[column] = pd.to_numeric(history_frame[column], errors="coerce")
                 if selected_epoch is not None:
                     history_frame["Selected"] = history_frame["Epoch"].round().eq(int(selected_epoch))
                 st.dataframe(history_frame, use_container_width=True, hide_index=True)

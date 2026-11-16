@@ -19,6 +19,8 @@ MODEL_TITLES = {
     "catboost_stylometry": "CatBoost + Stylometry",
     "embeddinggemma2": "EmbeddingGemma 2",
     "granite4_350m": "Granite 4.0 350M Base",
+    "granite41_3b": "Granite 4.1 3B Base",
+    "modernbert_large": "ModernBERT-large",
     "gemma4_e2b": "Gemma 4 E2B",
     "granite4_h_micro": "Granite 4 H Micro",
     "llama32_3b": "Llama 3.2 3B",

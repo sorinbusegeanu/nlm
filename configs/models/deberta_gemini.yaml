@@ -1,0 +1,26 @@
+model: deberta_gemini
+checkpoint: microsoft/deberta-v3-base
+revision: 8ccc9b6f36199bec6961081d44eb72fb3f7353f3
+training_mode: full
+
+epochs: 3
+early_stopping_patience: 2
+checkpoint_selection: highest_validation_balanced_accuracy
+checkpoint_selection_metric: balanced_accuracy
+
+batch_size: 8
+inference_batch_size: 8
+auto_batch_size: true
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
+gradient_accumulation_steps: 1
+
+learning_rate: 0.00002
+optimizer: adamw_torch
+weight_decay: 0.01
+lr_scheduler_type: linear
+warmup_ratio: 0.02
+
+cap_sequence_length_at_context_window: true
+gradient_checkpointing: false
+local_files_only: true

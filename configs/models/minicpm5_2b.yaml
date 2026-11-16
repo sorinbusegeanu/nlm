@@ -1,9 +1,10 @@
 model: minicpm5_2b
-checkpoint_selection: highest_validation_accuracy
+checkpoint_selection: highest_validation_balanced_accuracy
+checkpoint_selection_metric: balanced_accuracy
 checkpoint_selection_version: 2
 checkpoint: openbmb/MiniCPM5-2B-Base
 revision: 96a57cd572a02506b4500f54427dca24970c1bac
-epochs: 20
+epochs: 5
 early_stopping_patience: 2
 quantization: qlora4
 attention_backend: sdpa
@@ -11,6 +12,7 @@ lora_rank: 16
 lora_alpha: 32
 lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
 batch_size: 1
+inference_batch_size: 8
 gradient_accumulation_steps: 8
 gradient_checkpointing: true
 auto_batch_size: true

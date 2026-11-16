@@ -1,0 +1,27 @@
+model: electra_large
+checkpoint: google/electra-large-discriminator
+revision: c13c3df7efadc2162f42588bd28eb4e187d602a5
+
+training_mode: full
+
+epochs: 5
+early_stopping_patience: 2
+checkpoint_selection: highest_validation_balanced_accuracy
+checkpoint_selection_metric: balanced_accuracy
+
+batch_size: 8
+inference_batch_size: 8
+auto_batch_size: true
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
+gradient_accumulation_steps: 1
+cap_sequence_length_at_context_window: true
+
+learning_rate: 0.00001
+optimizer: adamw_torch
+weight_decay: 0.01
+lr_scheduler_type: linear
+warmup_ratio: 0.02
+
+gradient_checkpointing: false
+local_files_only: true

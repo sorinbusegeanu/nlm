@@ -3,9 +3,10 @@ checkpoint_selection: highest_validation_accuracy
 checkpoint: microsoft/Phi-3.5-mini-instruct
 revision: 2fe192450127e6a83f7441aef6e3ca586c338b77
 trust_remote_code: true
-epochs: 10
+epochs: 20
 early_stopping_patience: 2
 batch_size: 1
+inference_batch_size: 8
 auto_batch_size: true
 max_batch_size: 1024
 batch_probe_safety_fraction: 0.95

@@ -1,0 +1,151 @@
+prompt_id,inferred_prompt,answer_alignment
+p000,"Write a lyrical prose paragraph about the Voyager Golden Record drifting beyond the Sun. Evoke the sounds, greetings, music, or human life it carries as a message from Earth.",high
+p001,"Explain how the golden ratio, approximately 1.618, appears in patterns of growth in nature and in art or architecture, using vivid prose.",high
+p002,"Describe a future in which synthetic biology lets people design genomes and program living cells, including both its promise and implications.",high
+p003,"Explain Nash equilibrium through a tense standoff between rivals, showing why neither benefits by changing strategy alone.",high
+p004,"Explain Gödel's incompleteness theorems in accessible terms, using the idea of a mathematical rulebook and its limits.",high
+p005,"Write a contemplative paragraph about haiku and Zen, showing how a brief poem can hold a moment or suggest something vast.",high
+p006,"Reflect on how much human knowledge depends on testimony from people we do not know, and why that dependence matters.",high
+p007,Describe the 1859 Carrington Event and imagine the consequences a comparable solar storm could have for modern technology.,high
+p008,"Explain the Kardashev scale and how it classifies civilizations by the energy they can harness, from planetary to stellar or greater.",high
+p009,Describe Arctic permafrost as it thaws and explain how released carbon and methane could intensify climate warming.,high
+p010,"Write a reflective passage about Earth as a tiny, fragile pale-blue point seen from the immense darkness of space.",high
+p011,Use an intuitive spatial analogy to explain why high-dimensional spaces behave differently from familiar low-dimensional ones.,med
+p012,"Describe what a person might experience while falling toward or into a black hole, including how gravity and tidal forces matter.",high
+p013,"Explain why camera-like eyes evolved independently in vertebrates and octopuses, connecting similar solutions to shared physical or ecological pressures.",high
+p014,Describe the speculative idea of quantum foam and how spacetime might behave at the Planck scale.,med
+p015,Write a short surreal scene in which an ordinary room begins to violate familiar physical or perceptual rules.,med
+p016,"Explain how dark matter, though unseen, shapes the formation and structure of galaxies through gravity.",high
+p017,"Explain how the simple rules of elementary cellular automaton Rule 110 can produce complex, computational behavior.",high
+p018,Describe how grid cells in the entorhinal cortex help an animal represent space and navigate its surroundings.,high
+p019,Explain déjà vu as a possible mismatch between familiarity and recollection in the brain.,high
+p020,"Explain cosmic inflation: how the very early universe expanded extraordinarily rapidly, and why this does not mean objects locally traveled through space faster than light.",high
+p021,Explain a zero-knowledge proof through an analogy that shows how someone can prove they know a secret without revealing it.,high
+p022,"Describe how famine or trauma can leave epigenetic marks that affect gene expression, without changing the DNA sequence itself.",high
+p023,Describe the early migration of Jupiter toward the inner Solar System and how it may have reshaped the young planetary system.,med
+p024,Explain how Gutenberg's movable-type printing press changed access to knowledge and helped ideas spread through Europe.,high
+p025,"Explain Ramsey theory's insight that sufficiently large structures contain order, even when their parts are arranged in apparently chaotic ways.",high
+p026,"Reflect on how CRISPR gene editing could let humanity influence its own evolution, including potential benefits and ethical risks.",high
+p027,Describe continental drift across geological time using the image of continents as slowly moving jigsaw pieces.,high
+p028,"Tell the story of the Antikythera mechanism, an ancient geared device recovered from a shipwreck, and explain why it is remarkable.",high
+p029,Describe rogue planets: worlds ejected from their star systems that travel through interstellar darkness without a parent star.,high
+p030,Explain the octopus's distributed nervous system and explore what it means for thought when much neural processing occurs in its arms.,high
+p031,Assess the Neolithic shift to agriculture as both a transformative achievement and a costly trade-off for human societies.,high
+p032,"Explain how the Inca used khipu, knotted cords, to record and communicate information across an empire.",high
+p033,"Explain entropy through a familiar example such as a tidy room becoming disordered, clarifying what the concept means physically.",high
+p034,Describe how an unreliable narrator shapes a story by making readers question what is true and what the narrator conceals or believes.,high
+p035,Write a suspenseful dramatic-irony scene in which the audience recognizes a danger that a character onstage does not.,med
+p036,"Explain the Banach–Tarski paradox: how, under mathematical assumptions, a sphere can be decomposed and reassembled into two spheres of the same size.",high
+p037,Explain the Monty Hall problem and why switching doors improves the chance of winning after the host reveals a goat.,high
+p038,"Describe the sublime feeling of standing before a violent alpine storm, where awe and fear exceed ordinary human scale.",high
+p039,Explain the P versus NP problem and why the gap between finding and checking solutions matters for computing and cybersecurity.,high
+p040,"Explain the Japanese aesthetic concept ma: how a pause, interval, or emptiness can carry meaning rather than signify mere absence.",high
+p041,Imagine a tardigrade exposed to the vacuum of space and describe how its survival mechanisms help it endure extreme conditions.,high
+p042,Explain network effects and why a platform can become more valuable as more people join and connect through it.,high
+p043,"Assess the feasibility and challenges of terraforming Mars, including its atmosphere, temperature, radiation, and planetary-scale engineering.",high
+p044,Explain the evidence that Earth's mantle may hold a vast quantity of water within minerals such as ringwoodite.,med
+p045,Tell how ancient China guarded the knowledge of silk production and why sericulture was treated as a valuable state secret.,high
+p046,Describe how the Rosetta Stone enabled Champollion to decipher Egyptian hieroglyphs.,high
+p047,"Compare an infant learning to walk with a reinforcement-learning agent, focusing on exploration, feedback, failure, and learning.",high
+p048,"Reflect on nostalgia as a feeling shaped by memory, including how recollection can soften or revise the past.",high
+p049,"Describe cryovolcanism on icy moons, where water, ammonia, or other volatile materials erupt in place of molten rock.",high
+p050,Explain phantom-limb sensations and how the brain's body map can persist after a limb has been amputated.,high
+p051,Explain John Rawls's veil of ignorance and how choosing social rules without knowing one's future position can guide ideas of justice.,high
+p052,Describe how young songbirds learn local songs from older birds and how this learning can create regional dialects.,high
+p053,"Describe how microbes might live deep within Earth's rocks, obtaining energy from chemical reactions rather than sunlight.",med
+p054,Explain the Late Bronze Age collapse around 1200 BCE as a cascading breakdown of interconnected eastern Mediterranean societies and trade networks.,high
+p055,Explain Hawking radiation using quantum fluctuations near a black hole's event horizon and the possibility that one member of a particle pair escapes.,high
+p056,"Write from the perspective of a human consciousness living in a computer or server, remembering bodily sensations that it can no longer feel.",med
+p057,Reflect on metaphor as a basic tool of thought that lets people understand abstract ideas through familiar bodily experiences.,high
+p058,"Describe quantum foam as a possible picture of fluctuating spacetime at extremely small scales, while distinguishing the idea from established observation.",med
+p059,Describe the Cambrian explosion and the rapid diversification of complex animal life in ancient seas.,high
+p060,"Reflect on the difficulty of translating poetry: how a translator balances literal meaning, music, tone, and fidelity to the original.",high
+p061,"Explain coral bleaching as a response in which stressed corals expel their symbiotic algae, losing color and a crucial source of nourishment.",high
+p062,"Write an atmospheric scene at a desert caravanserai at dusk, using sensory details such as lantern light, spices, animals, and travelers.",high
+p063,Explain how algorithmic feeds and echo chambers can fragment shared reality and weaken common ground.,high
+p064,Describe what time dilation near the speed of light might feel like to a traveler whose own time seems ordinary while much more time passes elsewhere.,high
+p065,Explain the illusion of explanatory depth: why people may feel they understand familiar objects until asked to explain how they work.,high
+p066,Explain how the suprachiasmatic nucleus and light cues help coordinate circadian rhythms in the body.,high
+p067,Describe how a ribosome reads messenger RNA codons and assembles amino acids into a protein.,high
+p068,"Write a sensory reflection on how sound is experienced in the body, linking vibration with hearing and physical sensation.",med
+p069,Reflect on the loss of knowledge associated with the Library of Alexandria and what the destruction of a great archive means for humanity.,med
+p070,"Explore the relationship between human intuition and machine intelligence in scientific discovery, including what each can contribute.",med
+p071,Explain the philosophical zombie thought experiment and what it asks about consciousness beyond observable behavior.,high
+p072,Explore whether human choices can be free if they arise within a deterministic physical universe.,med
+p073,Explain why communities matter in data science: how collaboration and shared practice shape what counts as useful knowledge.,med
+p074,"Explain imaginary and complex numbers with an intuitive analogy, showing how they extend the number system and support useful mathematics.",high
+p075,"Trace the long contest between code makers and code breakers, showing how cryptography and its deciphering have shaped history.",high
+p076,"Write an interior monologue of a person waking into an ordinary morning, letting sensory details and memories flow in a fragmented stream of thought.",high
+p077,Explain Descartes's evil-demon thought experiment and how radical doubt challenges certainty about the external world.,high
+p078,Use a thought experiment about teleportation or psychological continuity to explore whether a copied or transported person remains the same person.,med
+p079,Imagine a future medical use for molecular nanobots that travel through the body and repair cellular or molecular damage.,high
+p080,"Explain dark energy as the name for whatever is driving the universe's observed accelerated expansion, while noting how little is understood about its nature.",high
+p081,"Reflect on what is lost when a language dies, including distinctive ways of describing the world, the sky, and human relationships.",high
+p082,"Reflect on the pale-blue-dot view of Earth and how cosmic perspective can challenge human pride, borders, and conflict.",high
+p083,Describe how the Event Horizon Telescope linked radio observatories around Earth to produce an image of a black hole's shadow.,high
+p084,"Explain Shannon entropy as a measure of uncertainty or information, using a simple example such as a coin toss.",high
+p085,Explain PageRank through the image of a random web surfer and show how links help estimate the importance of pages.,high
+p086,"Describe how the return of wolves can reshape an ecosystem, including effects on prey, riversides, and other species.",high
+p087,Reflect on open-source software as a shared human project and how open collaboration can create value beyond individual ownership.,med
+p088,Explain the Ship of Theseus puzzle and how replacing every part of an object raises questions about identity over time.,high
+p089,Explore why diverting a runaway trolley with a switch to save five people at the cost of one may feel different from pushing a person to stop it.,high
+p090,Describe the extraordinary density of a neutron star and explain how a small volume can contain more mass than a mountain or planet-scale object.,high
+p091,Explain atmospheric rivers as narrow bands of water vapor that transport enormous quantities of moisture and can produce intense rainfall.,high
+p092,Explain how harmonics and overtones give a brass instrument its distinctive timbre beyond the fundamental pitch.,high
+p093,Describe Göbekli Tepe and why its monumental stone structures complicate simple stories about the origins of agriculture and civilization.,med
+p094,Explain the Fermi paradox or Great Silence: why the apparent absence of extraterrestrial civilizations is puzzling given the size of the universe.,high
+p095,Explain money as a shared system of trust and belief that lets societies assign and exchange value.,high
+p096,"Describe split-brain research and what it reveals about the brain's hemispheres, the corpus callosum, and the feeling of a unified self.",high
+p097,Describe the semicircular canals of the inner ear and how fluid movement helps the brain sense head rotation and balance.,high
+p098,Explain the hedonic treadmill: why people often adapt to positive changes and return toward a characteristic level of happiness.,high
+p099,Explain Hume's problem of induction using the example of observing many white swans and asking whether that proves all swans are white.,high
+p100,Describe the underground fungal networks that connect forest roots and how they can exchange resources or signals among plants.,high
+p101,"Write an immersive scene of entering the Lascaux caves, using torchlight, stone, and prehistoric animal paintings to evoke the experience.",high
+p102,Explain the tragedy of the commons through herders adding animals to shared pasture while each pursues private benefit.,high
+p103,Explain the ocean's thermohaline circulation as a global movement of water shaped by temperature and salinity differences.,high
+p104,Explain the inverted-spectrum thought experiment and why two people who use the same color words might have different private experiences.,high
+p105,Describe how life in the deep ocean uses bioluminescence in a world where sunlight no longer reaches.,high
+p106,Explain adult neuroplasticity and how learning and repeated practice can physically reshape connections in the brain.,high
+p107,Describe the cosmic microwave background as ancient light that preserves evidence about the early universe.,high
+p108,"Describe how a plant responds when an insect chews its leaves, including chemical signals that can warn or defend against further attack.",high
+p109,Write a scene aboard a generation ship where people are born and die during a long voyage and Earth becomes a distant inherited memory.,high
+p110,"Describe how Polynesian navigators used stars, waves, winds, and other cues to cross the Pacific without modern instruments.",high
+p111,Explain Gödel's speed-up theorem and how adding stronger axioms can dramatically shorten proofs of some mathematical statements.,med
+p112,"Describe how the brainless slime mold Physarum can explore a maze or form efficient networks, and what this suggests about decentralized behavior.",high
+p113,Explain the double-slit experiment with a single photon and what it reveals about wave-like and particle-like behavior.,high
+p114,Describe black smokers on the ocean floor and how their heat and chemistry support life without sunlight.,high
+p115,"Explore how a conscious observer might look for evidence that its universe is a simulation, and why such evidence would be difficult to establish.",med
+p116,Consider Nozick's experience machine and whether you would choose a perfectly pleasurable simulation over an authentic life.,med
+p117,"Describe how collisions between orbiting satellites could create cascading debris and threaten access to space, as in the Kessler syndrome.",high
+p118,Explain Searle's Chinese Room argument and its challenge to the idea that manipulating symbols is the same as understanding meaning.,high
+p119,Describe how air trapped in Antarctic ice preserves samples of Earth's ancient atmosphere and climate.,high
+p120,"Imagine the far-future end of the universe as stars fade and the cosmos grows cold, dark, and quiet.",high
+p121,Explain the Mary thought experiment: what a scientist who knows every fact about color might learn when she first experiences red.,high
+p122,Explain cellular senescence: how aging cells can stop dividing yet remain in tissues and influence the surrounding body.,high
+p123,Explain the Fourier transform as a way to decompose a complex waveform or sound into its component frequencies.,high
+p124,Describe the Voynich manuscript as an undeciphered historical puzzle and consider what its writing and illustrations leave unknown.,high
+p125,Reflect on Earth's deep history and the briefness of human life and civilization against billions of years of planetary change.,high
+p126,Explain semantic satiation: how repeating a familiar word can temporarily make it feel strange or lose its meaning.,high
+p127,Explain Turing's halting problem and why no general algorithm can determine whether every possible program will stop.,high
+p128,Explain fractal patterns in nature and how repeated simple growth rules can produce complex shapes such as Romanesco broccoli or coastlines.,high
+p129,"Describe the endosymbiotic origin of complex cells, in which an ancestral cell engulfed bacteria that became mitochondria.",high
+p130,"Describe gravitational waves produced by two black holes spiraling together and merging, and how those ripples travel through spacetime.",high
+p131,"Imagine a civilization building a Dyson sphere or swarm to capture a star's energy, and consider how this would change life around it.",high
+p132,Explain Schumpeter's idea of creative destruction: how innovation creates new industries while displacing older ones.,high
+p133,"Write a synesthetic scene in which music is experienced as colors, shapes, or textures moving through a room.",high
+p134,Describe a quasar as the brilliant center of a distant galaxy powered by matter falling toward a supermassive black hole.,high
+p135,Use the idea that architecture is frozen music to describe the forms and atmosphere of a Gothic cathedral.,high
+p136,Describe the intricate boundary of the Mandelbrot set and how repeated zooming reveals ever more elaborate patterns.,high
+p137,"Explain how the solar wind interacts with Earth's magnetic field and atmosphere, producing auroras and helping shield the planet.",high
+p138,Explain how Cooper pairs and lattice interactions help account for superconductivity and the absence of electrical resistance below a critical temperature.,high
+p139,Explain how psychological stress can make people defend a coherent self-story and rationalize beliefs that conflict with evidence.,med
+p140,"Explain the Collatz conjecture: repeatedly halve an even number or triple an odd number and add one, then ask whether every positive integer reaches one.",high
+p141,Explain Hilbert's Hotel and how an infinite hotel can make room for more guests even when every room is occupied.,high
+p142,Explain how campfire storytelling may have helped early humans share survival knowledge and build cooperation across generations.,high
+p143,Explain Reed-Solomon error-correcting codes through the idea of adding mathematical redundancy so damaged data can be recovered.,high
+p144,Explain quantum entanglement through an analogy with linked coins or particles whose outcomes remain correlated across distance.,high
+p145,Explain the bystander effect and how the presence of a crowd can diffuse each person's sense of responsibility to help.,high
+p146,Describe mycorrhizal fungal networks beneath forests and the exchanges of nutrients or signals they may facilitate between plants.,high
+p147,Describe the experience of navigating a language model's high-dimensional latent space as movement through a landscape of meanings and concepts.,high
+p148,"Explain Conway's Game of Life and how a few local rules on a grid can generate complex, lifelike patterns.",high
+p149,Explain the uncanny valley: why an almost-human face or figure can provoke unease rather than affinity.,high

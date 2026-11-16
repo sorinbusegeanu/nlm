@@ -79,7 +79,7 @@ def predict_catboost_stylometry(checkpoint, texts, classes, *, temperature=1.0):
 def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max_length=384, temperature=1.0,
                     base_checkpoint=None, revision=None, fix_mistral_regex=False,
                     text_only_backbone=False, local_base_model=None, return_scores=False,
-                    quantization=None, attention_backend=None):
+                    quantization=None, attention_backend=None, code_revision=None):
     try:
         import torch
         from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
@@ -90,6 +90,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     checkpoint_metadata_path = checkpoint / "checkpoint_manifest.json"
     checkpoint_metadata = (json.loads(checkpoint_metadata_path.read_text())
                            if checkpoint_metadata_path.is_file() else {})
+    code_revision = code_revision or checkpoint_metadata.get("code_revision")
     quantization = str(quantization or checkpoint_metadata.get("quantization") or "none").lower()
     attention_backend = attention_backend or checkpoint_metadata.get("attention_backend")
     if quantization not in {"none", "qlora4"}:
@@ -123,9 +124,17 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
         tokenizer_kwargs["fix_mistral_regex"] = True
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, **tokenizer_kwargs)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    if model_name == "ultrabert380":
-        network = AutoModelForSequenceClassification.from_pretrained(checkpoint, local_files_only=True, trust_remote_code=True)
-    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}:
+    if model_name in {"ultrabert380", "modernbert_large", "deberta_v3_large", "electra_large", "gte_large", "mpnet_base", "deberta_gemini", "deberta_glm"}:
+        model_kwargs = {"attn_implementation": attention_backend} if (
+            model_name == "modernbert_large" and attention_backend) else {}
+        if code_revision:
+            model_kwargs["code_revision"] = code_revision
+        network = AutoModelForSequenceClassification.from_pretrained(
+            checkpoint, local_files_only=True, trust_remote_code=True, **model_kwargs)
+        if model_name == "gte_large":
+            from .model_factory import ensure_gte_transformers_compatibility
+            network = ensure_gte_transformers_compatibility(network)
+    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}:
         backbone_path = checkpoint / "merged_backbone"
         if backbone_path.exists() and quantization != "qlora4":
             network = AutoModel.from_pretrained(backbone_path, local_files_only=True, torch_dtype=model_dtype,
@@ -196,7 +205,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                 text_batch = ["task: classification | query: " + str(text) for text in text_batch]
             try:
                 enc=tokenizer(text_batch,truncation=True,max_length=max_length,padding=True,return_tensors="pt")
-                if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
+                if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
                 enc={k:v.to(device) for k,v in enc.items()}; logits=network(**enc)
                 if hasattr(logits,"logits"): logits=logits.logits
                 raw_logits = logits.float()
@@ -261,7 +270,8 @@ def export_submission(model, checkpoint, test_path, output_path):
             fix_mistral_regex=manifest.get("config",{}).get("fix_mistral_regex",False),
             text_only_backbone=manifest.get("config",{}).get("text_only_backbone",False),
             quantization=manifest.get("config",{}).get("quantization",manifest.get("quantization")),
-            attention_backend=manifest.get("config",{}).get("attention_backend",manifest.get("attention_backend")))
+            attention_backend=manifest.get("config",{}).get("attention_backend",manifest.get("attention_backend")),
+            code_revision=manifest.get("config",{}).get("code_revision"))
     output = pd.DataFrame({"id": frame.id, "model": np.asarray(classes)[probabilities.argmax(1)]})
     if output.id.astype(str).tolist() != frame.id.astype(str).tolist(): raise RuntimeError("output row order does not match input")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -340,6 +350,7 @@ def predict_candidate(model_spec, texts, classes, bundle_root):
             text_only_backbone=config.get("text_only_backbone", False),
             quantization=config.get("quantization", model_spec.get("quantization")),
             attention_backend=config.get("attention_backend", model_spec.get("attention_backend")),
+            code_revision=config.get("code_revision"),
             local_base_model=(bundle_root / model_spec["base_model"] if model_spec.get("base_model") else None))
     if returned_classes != classes:
         indexes = {label: index for index, label in enumerate(returned_classes)}
@@ -489,7 +500,7 @@ def package_prediction_bundle(selection_manifest, output_zip, *, include_base_mo
                 "checkpoint": packed_checkpoint, "config": item.get("config", {}),
                 "model_revision": item.get("model_revision"),
                 "calibration_temperature": item.get("calibration_temperature", 1.0)}
-            if model not in {"svc", "catboost_stylometry", "ultrabert380"}:
+            if model not in {"svc", "catboost_stylometry", "ultrabert380", "modernbert_large", "deberta_v3_large", "electra_large", "gte_large", "mpnet_base", "deberta_gemini", "deberta_glm"}:
                 model_dir = root / packed_checkpoint
                 if model_dir.is_file():
                     model_dir = model_dir.parent

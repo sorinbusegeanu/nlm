@@ -1,0 +1,232 @@
+dataset_version: vercel_v01
+# Budget reservations use pre-promotion list rates or the highest configured
+# available route rate where the Gateway lists multiple providers.
+reasoning_seed: 2026
+reasoning_distribution:
+  default: 0.70
+  high: 0.30
+max_response_characters: 2000
+system_prompt: ""
+request_timeout_seconds: 120
+retry:
+  max_attempts: 5
+  base_delay_seconds: 1
+  max_delay_seconds: 60
+  jitter_seconds: 0.5
+throttling:
+  concurrency: 1
+  requests_per_minute: 30
+  tokens_per_minute: null
+budget:
+  max_spend_usd: 300
+  enforce: true
+backends:
+  local:
+    base_url: http://localhost:8000/v1
+    api_key_env: VLLM_API_KEY
+  vercel:
+    base_url: https://ai-gateway.vercel.sh/v1
+    api_key_env: AI_GATEWAY_API_KEY
+local_test_model:
+  name: local-qwen
+  dataset_version: vercel_local_test
+  model_id: Qwen/Qwen3-0.6B
+  provider: local-vllm
+  reasoning_supported: true
+  default_reasoning: omit_effort_parameter
+  high_effort_parameters:
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: true
+  max_completion_tokens: 2048
+  completion_token_parameter: max_tokens
+  request_parameters: {}
+models:
+  claude-fable-5:
+    provider: anthropic
+    model_id: anthropic/claude-fable-5
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters:
+      extra_body:
+        reasoning:
+          effort: high
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 10.0, output_usd_per_million: 50.0, source_url: https://vercel.com/ai-gateway/models/claude-fable-5, checked_at: '2026-11-14'}
+  claude-opus-4-6:
+    provider: anthropic
+    model_id: anthropic/claude-opus-4.6
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters:
+      extra_body:
+        reasoning:
+          effort: high
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 5.0, output_usd_per_million: 25.0, source_url: https://vercel.com/ai-gateway/models/claude-opus-4.6, checked_at: '2026-11-14'}
+  claude-opus-4-8:
+    provider: anthropic
+    model_id: anthropic/claude-opus-4.8
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters:
+      extra_body:
+        reasoning:
+          effort: high
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 5.0, output_usd_per_million: 25.0, source_url: https://vercel.com/ai-gateway/models/claude-opus-4.8, checked_at: '2026-11-14'}
+  claude-opus-5:
+    provider: anthropic
+    model_id: anthropic/claude-opus-5
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters:
+      extra_body:
+        reasoning:
+          effort: high
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 5.0, output_usd_per_million: 25.0, source_url: https://vercel.com/ai-gateway/models/claude-opus-5, checked_at: '2026-11-14'}
+  claude-sonnet-5:
+    provider: anthropic
+    model_id: anthropic/claude-sonnet-5
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters:
+      extra_body:
+        reasoning:
+          effort: high
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 2.0, output_usd_per_million: 10.0, source_url: https://vercel.com/ai-gateway/models/claude-sonnet-5, checked_at: '2026-11-14'}
+  gemini-3.1-pro-preview:
+    provider: google
+    model_id: google/gemini-3.1-pro-preview
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters: {reasoning_effort: high}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 2.0, output_usd_per_million: 12.0, source_url: https://vercel.com/ai-gateway/models/gemini-3.1-pro-preview, checked_at: '2026-11-14'}
+  gemini-3.6-flash:
+    provider: google
+    model_id: google/gemini-3.6-flash
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters: {reasoning_effort: high}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 1.5, output_usd_per_million: 7.5, source_url: https://vercel.com/ai-gateway/models/gemini-3.6-flash, checked_at: '2026-11-14'}
+  gemini-3.7-flash:
+    provider: google
+    model_id: google/gemini-3.7-flash
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters: {reasoning_effort: high}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 1.5, output_usd_per_million: 7.5, source_url: https://vercel.com/ai-gateway/models/gemini-3.7-flash, checked_at: '2026-11-14'}
+  gemini-3.8-flash:
+    provider: google
+    model_id: google/gemini-3.8-flash
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters: {reasoning_effort: high}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 1.5, output_usd_per_million: 7.5, source_url: https://vercel.com/ai-gateway/models/gemini-3.8-flash, checked_at: '2026-11-14'}
+  glm-5.3:
+    provider: zai
+    model_id: zai/glm-5.3
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters:
+      extra_body:
+        thinking: {type: enabled}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 1.4, output_usd_per_million: 4.4, source_url: https://vercel.com/ai-gateway/models/glm-5.3, checked_at: '2026-11-14'}
+  glm-5.3-flash:
+    provider: zai
+    model_id: zai/glm-5.3-flash
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters:
+      extra_body:
+        thinking: {type: enabled}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 0.45, output_usd_per_million: 1.5, source_url: https://vercel.com/ai-gateway/models/glm-5.3-flash, checked_at: '2026-11-14'}
+  gpt-5.5:
+    provider: openai
+    model_id: openai/gpt-5.5
+    completion_token_parameter: max_completion_tokens
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters: {reasoning_effort: high}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 5.0, output_usd_per_million: 30.0, source_url: https://vercel.com/ai-gateway/models/gpt-5.5, checked_at: '2026-11-14'}
+  gpt-5.6-luna:
+    provider: openai
+    model_id: openai/gpt-5.6-luna
+    completion_token_parameter: max_completion_tokens
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters: {reasoning_effort: high}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 0.2, output_usd_per_million: 1.2, source_url: https://vercel.com/ai-gateway/models/gpt-5.6-luna, checked_at: '2026-11-14'}
+  gpt-5.6-sol:
+    provider: openai
+    model_id: openai/gpt-5.6-sol
+    completion_token_parameter: max_completion_tokens
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters: {reasoning_effort: high}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 4.0, output_usd_per_million: 20.0, source_url: https://vercel.com/ai-gateway/models/gpt-5.6-sol, checked_at: '2026-11-14'}
+  gpt-5.6-terra:
+    provider: openai
+    model_id: openai/gpt-5.6-terra
+    completion_token_parameter: max_completion_tokens
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters: {reasoning_effort: high}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 2.0, output_usd_per_million: 12.0, source_url: https://vercel.com/ai-gateway/models/gpt-5.6-terra, checked_at: '2026-11-14'}
+  gpt-6-astra:
+    provider: openai
+    model_id: openai/gpt-6-astra
+    completion_token_parameter: max_completion_tokens
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters: {reasoning_effort: high}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 10.0, output_usd_per_million: 50.0, source_url: https://vercel.com/ai-gateway/models/gpt-6-astra, checked_at: '2026-11-14'}
+  kimi-k3:
+    provider: moonshotai
+    model_id: moonshotai/kimi-k3
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: false
+    high_effort_parameters: {}
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 2.1, output_usd_per_million: 10.95, source_url: https://vercel.com/ai-gateway/models/kimi-k3, checked_at: '2026-11-14'}
+  qwen3.8-max:
+    provider: alibaba
+    model_id: alibaba/qwen3.8-max
+    enabled: true
+    default_reasoning: omit_effort_parameter
+    reasoning_supported: true
+    high_effort_parameters:
+      extra_body:
+        enable_thinking: true
+    max_completion_tokens: 4096
+    pricing: {input_usd_per_million: 2.0, output_usd_per_million: 6.0, source_url: https://vercel.com/ai-gateway/models/qwen3.8-max, checked_at: '2026-11-14'}

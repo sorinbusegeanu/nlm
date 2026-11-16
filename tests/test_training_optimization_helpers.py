@@ -218,6 +218,23 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
         self.assertTrue(encoder_calls["gradient_checkpointing"])
         self.assertEqual(frozen_calls["inference_batch_size"], 11)
 
+    def test_modernbert_uses_standard_encoder_training_and_attention_backend(self):
+        rows = pd.DataFrame({"id": ["1", "2"], "prompt_id": ["p1", "p2"],
+            "text": ["text one", "text two"], "model": ["a", "b"]})
+        calls = {}
+        def fake_encoder(*args, **kwargs):
+            calls.update(kwargs)
+            return {"scores": np.zeros((2, 2)), "probabilities": np.full((2, 2), .5)}
+        with patch.object(pipeline, "train_encoder_fold", side_effect=fake_encoder):
+            pipeline._train_fold("modernbert_large", rows, rows, ["a", "b"],
+                {"checkpoint": "base", "revision": "a" * 40, "max_length": 512,
+                 "batch_size": 8, "auto_batch_size": True, "max_batch_size": 16,
+                 "gradient_accumulation_steps": 1, "attention_backend": "sdpa"},
+                Path("/tmp/modernbert"), 2026, "validation", Path("/tmp/cache"))
+        self.assertEqual(calls["attention_backend"], "sdpa")
+        self.assertEqual(calls["max_length"], 512)
+        self.assertEqual(calls["checkpoint_selection_metric"], "balanced_accuracy")
+
     def test_catboost_uses_standard_softmax_without_extra_training_inference(self):
         import sys
         class FakeCatBoost:

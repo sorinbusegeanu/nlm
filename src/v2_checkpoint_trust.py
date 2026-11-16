@@ -87,9 +87,26 @@ def _eligible_models(roster_path: Path) -> set[str]:
     return set(roster.model.astype(str))
 
 
-def _next_checkpoint_id(frame: pd.DataFrame) -> str:
+def _next_checkpoint_id(frame: pd.DataFrame, *, root: Path | None = None) -> str:
+    """Allocate checkpoint IDs from the shared project-wide sequence namespace."""
     numbers = [int(m.group(1)) for value in frame.get("sequence_id", pd.Series(dtype=str)).dropna().astype(str)
                if (m := re.fullmatch(r"N(\d+)", value))]
+    root = Path(root or ".")
+    # Trust List 2 is a view over checkpoints already assigned IDs by the
+    # dashboard/catalog workflows. Its shorter eligible roster must not cause
+    # an older sequence ID to be reused for a different checkpoint.
+    for path in (root / "docs" / "checkpoint_label_catalog.csv",
+                 root / "docs" / "v2-ckpt-nov0.csv",
+                 root / "docs" / "v2-ckpt-nov0_active.csv"):
+        if not path.is_file():
+            continue
+        try:
+            ids = pd.read_csv(path, usecols=lambda column: column in {"sequence_id"})
+        except (OSError, ValueError, pd.errors.EmptyDataError):
+            continue
+        if "sequence_id" in ids:
+            numbers.extend(int(match.group(1)) for value in ids.sequence_id.dropna().astype(str)
+                           if (match := re.fullmatch(r"N(\d+)", value)))
     return f"N{max(numbers, default=0) + 1:04d}"
 
 
@@ -745,7 +762,7 @@ def append_training_run(manifest: dict, manifest_path: str | Path, *,
     experiment_id = str(manifest.get("experiment_id") or manifest_path.stem.removesuffix("_manifest"))
     if experiment_id in set(current.experiment_id.astype(str)):
         return {"status": "already_recorded", "experiment_id": experiment_id}
-    sequence_id = _next_checkpoint_id(current)
+    sequence_id = _next_checkpoint_id(current, root=root)
     rows = _rows_from_training_manifest(manifest, manifest_path, sequence_id=sequence_id, root=root)
     if len(rows) != len(LABELS):
         return {"status": "skipped", "reason": "complete full-V0 training metrics are unavailable"}

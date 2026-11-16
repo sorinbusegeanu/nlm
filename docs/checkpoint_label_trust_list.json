@@ -1,11 +1,11 @@
 {
-  "version": "trust-v007",
-  "generated_at_utc": "2026-11-10T20:46:52+00:00",
-  "source_catalog": "docs/checkpoint_label_catalog.csv",
-  "source_catalog_sha256": "2bd3b8dbca92ee8c7d24b9d8706899f43aea147424d9f72a0a15e3f2eba333ce",
-  "rows": 1782,
-  "checkpoints": 99,
-  "eligible_rules": 1714,
+  "version": "trust-v009",
+  "generated_at_utc": "2026-11-15T18:21:10+00:00",
+  "source_catalog": "/home/zodrak/nlm/docs/checkpoint_label_catalog.csv",
+  "source_catalog_sha256": "0a26f0eac0c6d283b0b4a5c439895a58b1cbc8c100a3752cf708575d22d4922b",
+  "rows": 1800,
+  "checkpoints": 100,
+  "eligible_rules": 1731,
   "minimum_support": 10,
   "smoothing": "Beta(1,1): (true_positive + 1) / (prediction_count + 2)",
   "ordering": [

@@ -1,0 +1,35 @@
+model: qwen06
+experiment_name: qwen06_v2.14_lora_lr5e-5
+training_mode: lora
+checkpoint: Qwen/Qwen3-0.6B
+revision: c1899de289a04d12100db370d81485cdf75e47ca
+checkpoint_selection: highest_validation_balanced_accuracy
+checkpoint_selection_version: 2
+
+quantization: none
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+learning_rate: 5.0e-05
+optimizer: adamw_torch
+weight_decay: 0.01
+lr_scheduler_type: linear
+warmup_ratio: 0.03
+
+batch_size: 4
+auto_batch_size: true
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
+gradient_accumulation_steps: 1
+gradient_checkpointing: false
+inference_batch_size: 8
+
+epochs: 5
+early_stopping_patience: 2
+local_files_only: true

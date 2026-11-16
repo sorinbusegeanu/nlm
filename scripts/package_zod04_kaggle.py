@@ -57,9 +57,11 @@ def _checkpoint_path(candidate_id: str, manifest: dict, catalog_row: pd.Series) 
     return source
 
 
-def _selected_rules(trust: pd.DataFrame) -> tuple[list[dict], str, list[str]]:
-    if trust.trust_list_version.nunique() != 1 or trust.trust_list_version.iloc[0] != "trust-v005":
-        raise ValueError("ZOD04 must be built from exactly one trust-v005 snapshot")
+def _selected_rules(trust: pd.DataFrame, *, expected_trust_version: str = "trust-v005",
+                    fallback_id: str | None = None) -> tuple[list[dict], str, list[str]]:
+    if (trust.trust_list_version.nunique() != 1
+            or trust.trust_list_version.iloc[0] != expected_trust_version):
+        raise ValueError(f"ZOD04 must be built from exactly one {expected_trust_version} snapshot")
     trust["SeqID"] = pd.to_numeric(trust.SeqID, errors="raise")
     trust = trust.sort_values("SeqID", kind="stable")
     chosen_labels: set[str] = set()
@@ -81,12 +83,15 @@ def _selected_rules(trust: pd.DataFrame) -> tuple[list[dict], str, list[str]]:
     if len(records) != 18:
         raise ValueError(f"expected one eligible rule for each of 18 labels; got {len(records)}")
 
-    from src.zod01_fixed_cascade import _resolve_fallback
-    fallback_id = str(_resolve_fallback(str(ROOT / "experiments/registry.sqlite"))["experiment_id"])
+    if fallback_id is None:
+        from src.zod01_fixed_cascade import _resolve_fallback
+        fallback_id = str(_resolve_fallback(str(ROOT / "experiments/registry.sqlite"))["experiment_id"])
+    else:
+        fallback_id = str(fallback_id)
     catalog = pd.read_csv(CATALOG_PATH, dtype=str, keep_default_na=False)
     catalog = catalog.drop_duplicates("experiment_id").set_index("experiment_id")
     fallback_sequence = str(catalog.loc[fallback_id, "sequence_id"])
-    if fallback_sequence != FALLBACK_SEQUENCE:
+    if expected_trust_version == "trust-v005" and fallback_sequence != FALLBACK_SEQUENCE:
         raise ValueError(f"expected the established fallback {FALLBACK_SEQUENCE}, got {fallback_sequence}")
     candidate_ids = list(dict.fromkeys([record["candidate_id"] for record in records] + [fallback_id]))
     return records, fallback_id, candidate_ids

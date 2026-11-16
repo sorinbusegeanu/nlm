@@ -1,0 +1,26 @@
+model: deberta_v3_large
+checkpoint: microsoft/deberta-v3-large
+revision: 64a8c8eab3e352a784c658aef62be1662607476f
+
+training_mode: full
+
+epochs: 5
+early_stopping_patience: 2
+checkpoint_selection: highest_validation_balanced_accuracy
+checkpoint_selection_metric: balanced_accuracy
+
+batch_size: 8
+inference_batch_size: 8
+auto_batch_size: true
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
+gradient_accumulation_steps: 1
+
+learning_rate: 0.000006
+optimizer: adamw_torch
+weight_decay: 0.01
+lr_scheduler_type: linear
+warmup_ratio: 0.02
+
+gradient_checkpointing: false
+local_files_only: true

@@ -1,0 +1,33 @@
+model: granite41_3b
+checkpoint_selection: highest_validation_balanced_accuracy
+checkpoint_selection_version: 2
+checkpoint: ibm-granite/granite-4.1-3b-base
+revision: dacb9cb9157bec98e99b09f285c92a4d58405c96
+training_mode: lora
+quantization: none
+epochs: 3
+early_stopping_patience: 2
+batch_size: 2
+inference_batch_size: 8
+auto_batch_size: true
+max_batch_size: 4
+batch_probe_safety_fraction: 0.90
+gradient_accumulation_steps: 1
+learning_rate: 0.0002
+learning_rate_decay: 1.0
+optimizer: adamw_torch
+weight_decay: 0.0
+lr_scheduler_type: linear
+warmup_ratio: 0.02
+max_length: 512
+attention_backend: sdpa
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+gradient_checkpointing: false
+local_files_only: true
+checkpoint_selection_metric: balanced_accuracy

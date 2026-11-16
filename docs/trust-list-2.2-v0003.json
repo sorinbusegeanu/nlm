@@ -1,0 +1,75 @@
+{
+  "version": "trust-list-2.2-v0003",
+  "trust_list_release": "2.2",
+  "generated_at_utc": "2026-11-15T06:00:38+00:00",
+  "parent_version": "trust-list-2-v022",
+  "parent_csv_path": "docs/trust-list-2-v022.csv",
+  "parent_metadata_path": "docs/trust-list-2-v022.json",
+  "parent_csv_sha256": "f891f9bd3c20e044afdbe841c4f19e9fb196adbaa88a7b74002cdae599cd4193",
+  "filter": "Keep only rows whose recorded training_dataset matches ^v2\\.\\d; eligibility, precision, recall, support, and sorting use existing Trust List 2 rules.",
+  "training_dataset_prefix": "v2.x",
+  "validation_scope": "full_v0",
+  "validation_rows": 2699,
+  "validation_sha256": "40a22ce8d88c5f46feb4637a099db815bef5f713ffe53e89dbe1b7b21de77707",
+  "source_rows": 1368,
+  "source_checkpoints": 76,
+  "filtered_rows": 360,
+  "filtered_checkpoints": 20,
+  "included_training_datasets": {
+    "v2.0": {
+      "checkpoints": 4,
+      "checkpoint_label_rows": 72,
+      "rule_eligible_rows": 72
+    },
+    "v2.0.chunks.200TokBalanced": {
+      "checkpoints": 1,
+      "checkpoint_label_rows": 18,
+      "rule_eligible_rows": 17
+    },
+    "v2.0.chunks.300TokBalanced": {
+      "checkpoints": 1,
+      "checkpoint_label_rows": 18,
+      "rule_eligible_rows": 18
+    },
+    "v2.0.chunks800": {
+      "checkpoints": 1,
+      "checkpoint_label_rows": 18,
+      "rule_eligible_rows": 18
+    },
+    "v2.1": {
+      "checkpoints": 1,
+      "checkpoint_label_rows": 18,
+      "rule_eligible_rows": 17
+    },
+    "v2.14": {
+      "checkpoints": 8,
+      "checkpoint_label_rows": 144,
+      "rule_eligible_rows": 142
+    },
+    "v2.14-prediction-filtered": {
+      "checkpoints": 1,
+      "checkpoint_label_rows": 18,
+      "rule_eligible_rows": 17
+    },
+    "v2.14-prediction-filtered-80pct": {
+      "checkpoints": 1,
+      "checkpoint_label_rows": 18,
+      "rule_eligible_rows": 18
+    },
+    "v2.14.balanced": {
+      "checkpoints": 1,
+      "checkpoint_label_rows": 18,
+      "rule_eligible_rows": 18
+    },
+    "v2.15_extrato_14": {
+      "checkpoints": 1,
+      "checkpoint_label_rows": 18,
+      "rule_eligible_rows": 17
+    }
+  },
+  "rows": 360,
+  "checkpoints": 20,
+  "eligibility_method": "Recomputed with the same evaluation eligibility, zero validation-training overlap, and minimum support of 10 used by Trust List 2.",
+  "csv_path": "docs/trust-list-2.2-v0003.csv",
+  "metadata_path": "docs/trust-list-2.2-v0003.json"
+}

@@ -1,11 +1,15 @@
 model: qwen17
-checkpoint_selection: highest_validation_accuracy
+checkpoint_selection: highest_validation_balanced_accuracy
+checkpoint_selection_metric: balanced_accuracy
 checkpoint_selection_version: 2
 checkpoint: Qwen/Qwen3-1.7B-Base
 revision: ea980cb0a6c2ae4b936e82123acc929f1cec04c1
-epochs: 20
+training_mode: lora
+quantization: none
+epochs: 5
 early_stopping_patience: 2
 batch_size: 2
+inference_batch_size: 8
 auto_batch_size: true
 max_batch_size: 1024
 batch_probe_safety_fraction: 0.95

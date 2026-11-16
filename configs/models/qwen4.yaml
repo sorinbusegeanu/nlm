@@ -8,6 +8,7 @@ early_stopping_patience: 2
 quantization: qlora4
 attention_backend: sdpa
 batch_size: 1
+inference_batch_size: 8
 auto_batch_size: true
 max_batch_size: 1024
 batch_probe_safety_fraction: 0.95

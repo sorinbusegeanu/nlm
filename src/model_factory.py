@@ -10,6 +10,7 @@ import inspect
 import hashlib
 import gc
 import shutil
+import types
 from collections import deque
 from functools import wraps
 from contextlib import nullcontext
@@ -280,8 +281,27 @@ def _atomic_torch_save(torch, value, path):
     temporary.replace(path)
 
 
+def _persist_continuation_checkpoint(checkpoint_path, output_dir):
+    """Keep an atomic copy of a selected epoch with its optimizer and scheduler state."""
+    checkpoint_path = Path(checkpoint_path)
+    output_dir = Path(output_dir)
+    if not _is_complete_trainer_checkpoint(checkpoint_path):
+        return None
+    destination = output_dir / "continuation_checkpoint"
+    temporary = output_dir / ".continuation_checkpoint.tmp"
+    previous = output_dir / ".continuation_checkpoint.old"
+    shutil.rmtree(temporary, ignore_errors=True)
+    shutil.rmtree(previous, ignore_errors=True)
+    shutil.copytree(checkpoint_path, temporary)
+    if destination.exists():
+        destination.replace(previous)
+    temporary.replace(destination)
+    shutil.rmtree(previous, ignore_errors=True)
+    return destination
+
+
 def _remove_trainer_recovery_files(output_dir):
-    """Remove transient optimizer checkpoints and selection sidecars on success."""
+    """Remove transient Trainer state while retaining the selected resumable epoch."""
     output_dir = Path(output_dir)
     for checkpoint in output_dir.glob("checkpoint-*"):
         if checkpoint.is_dir():
@@ -494,7 +514,8 @@ def _with_cuda_oom_recovery(function):
                     result["runtime_breakdown"]["oom_recovery_retry_seconds"] = failed_attempt_seconds
                 if isinstance(result.get("batch_size_probe"), dict):
                     result["batch_size_probe"]["oom_recovery"] = result["oom_recovery"]
-                for key in ("best_checkpoint_path", "selected_checkpoint_path"):
+                for key in ("best_checkpoint_path", "selected_checkpoint_path",
+                            "continuation_checkpoint_path"):
                     path = result.get(key)
                     if path and str(path).startswith(str(attempt_output)):
                         result[key] = str(output_dir) + str(path)[len(str(attempt_output)):]
@@ -749,7 +770,8 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
                               thread_count=8, seed=2026,
                               validation_labels=None, early_stopping_rounds=100,
                               feature_recipe=None, feature_matrices=None, init_model=None,
-                              checkpoint_metadata=None, checkpoint_selection_metric="balanced_accuracy"):
+                              checkpoint_metadata=None, checkpoint_selection_metric="balanced_accuracy",
+                              stop_file=None):
     """Fit CatBoost on deterministic row-local style statistics; no validation fitting."""
     try:
         from catboost import CatBoostClassifier
@@ -775,6 +797,18 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         random_seed=int(seed), thread_count=int(thread_count), verbose=False,
         allow_writing_files=False)
     fit_kwargs = {}
+    class CooperativeCatBoostStop:
+        requested = False
+
+        def after_iteration(self, info):
+            if stop_file is not None and Path(stop_file).is_file():
+                self.requested = True
+                return True
+            return False
+
+    stop_callback = CooperativeCatBoostStop()
+    if stop_file is not None:
+        fit_kwargs["callbacks"] = [stop_callback]
     if init_model is not None:
         fit_kwargs["init_model"] = str(init_model)
     if validation_labels is not None:
@@ -868,6 +902,8 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         "checkpoint_scoring_method": "in_memory_selected_iteration_validation_predictions",
         "final_validation_reused_existing_predictions": False,
         "added_iterations": int(iterations), "parent_checkpoint": str(init_model) if init_model is not None else None,
+        "stop_requested": bool(stop_callback.requested),
+        "stop_request_path": str(stop_file) if stop_callback.requested else None,
         "peak_gpu_memory_bytes": None}
 
 
@@ -878,8 +914,10 @@ EMBEDDINGGEMMA2_TASK_PREFIX = "task: classification | query: "
 def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
                                task_prefix="", use_processor=False,
                                trust_remote_code=False, fix_mistral_regex=False,
-                               local_files_only=True, batch_size=256):
-    """Return the uncapped maximum encoded length and reject context overflow."""
+                               local_files_only=True, batch_size=256,
+                               code_revision=None, cap_at_context_window=False,
+                               max_length_cap=None):
+    """Select the observed maximum token length, optionally capped by model context."""
     _force_huggingface_offline()
     _, tr = _require_neural()
     load_kwargs = {"local_files_only": local_files_only}
@@ -891,8 +929,10 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
         load_kwargs["fix_mistral_regex"] = True
     tokenizer = (tr.AutoProcessor.from_pretrained(checkpoint, **load_kwargs) if use_processor
                  else tr.AutoTokenizer.from_pretrained(checkpoint, **load_kwargs))
-    config = tr.AutoConfig.from_pretrained(checkpoint, **{
-        key: value for key, value in load_kwargs.items() if key != "fix_mistral_regex"})
+    config_kwargs = {key: value for key, value in load_kwargs.items() if key != "fix_mistral_regex"}
+    if code_revision is not None:
+        config_kwargs["code_revision"] = code_revision
+    config = tr.AutoConfig.from_pretrained(checkpoint, **config_kwargs)
 
     context_fields = ("max_position_embeddings", "n_positions", "max_sequence_length",
                       "max_seq_len", "max_seq_length", "seq_length")
@@ -921,6 +961,9 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
     cache_payload = json.dumps({"model": model_name, "checkpoint": str(checkpoint),
         "revision": revision, "prefix": prefix, "processor": bool(use_processor),
         "trust_remote_code": bool(trust_remote_code), "fix_mistral_regex": bool(fix_mistral_regex),
+        "code_revision": code_revision,
+        "cap_at_context_window": bool(cap_at_context_window),
+        "max_length_cap": int(max_length_cap) if max_length_cap is not None else None,
         "texts_sha256": hashlib.sha256("\0".join(all_texts).encode("utf-8")).hexdigest(),
         "rows": len(all_texts)}, sort_keys=True)
     cache_key = hashlib.sha256(cache_payload.encode()).hexdigest()
@@ -939,9 +982,10 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
         if (cached is not None and cached.get("cache_key") == cache_key and token_cache_valid
                 and int(cached.get("rows", -1)) == len(all_texts)):
             if maximum > context_window:
-                raise ValueError(f"{model_name} dataset requires {maximum} tokens (including special tokens and task prefix), "
-                                 f"exceeding the model context window of {context_window}")
-            return maximum
+                if not cap_at_context_window and max_length_cap is None:
+                    raise ValueError(f"{model_name} dataset requires {maximum} tokens (including special tokens and task prefix), "
+                                     f"exceeding the model context window of {context_window}")
+            return min(maximum, context_window, int(max_length_cap) if max_length_cap is not None else context_window)
     maximum = 0
     token_rows = []
     for start in range(0, len(all_texts), max(1, int(batch_size))):
@@ -958,15 +1002,52 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
                 token_rows.append({key: encoded[key][index]
                     for key in ("input_ids", "attention_mask", "mm_token_type_ids")
                     if key in encoded})
-    if maximum > context_window:
+    if maximum > context_window and not cap_at_context_window and max_length_cap is None:
         raise ValueError(f"{model_name} dataset requires {maximum} tokens (including special tokens and task prefix), "
                          f"exceeding the model context window of {context_window}")
+    selected_maximum = min(maximum, context_window,
+                           int(max_length_cap) if max_length_cap is not None else context_window)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps({"cache_key": cache_key, "maximum_tokens": maximum,
-        "rows": len(all_texts), "context_window": context_window}, indent=2) + "\n", encoding="utf-8")
+        "selected_maximum_tokens": selected_maximum, "rows": len(all_texts),
+        "context_window": context_window}, indent=2) + "\n", encoding="utf-8")
     if use_processor:
         _write_ragged_token_cache(tokenized_cache_path, cache_key, token_rows)
-    return maximum
+    return selected_maximum
+
+
+def ensure_gte_transformers_compatibility(model):
+    """Repair two compatibility gaps in GTE's pinned custom Transformers model."""
+    torch, _ = _require_neural()
+    backbone = getattr(model, "new", None)
+    embeddings = getattr(backbone, "embeddings", None)
+    if backbone is None or embeddings is None:
+        raise TypeError("GTE sequence classifier does not expose its expected NEW encoder")
+
+    # Hugging Face's low-memory loader can leave this non-persistent custom
+    # buffer uninitialized. The upstream implementation indexes RoPE tables
+    # with it, so rebuild it after loading the checkpoint.
+    device = embeddings.word_embeddings.weight.device
+    embeddings.position_ids = torch.arange(
+        int(model.config.max_position_embeddings), dtype=torch.long, device=device)
+
+    # Alibaba's implementation still calls this helper removed from recent
+    # Transformers PreTrainedModel versions. Recreate the encoder mask layout
+    # used by the upstream implementation.
+    if not callable(getattr(backbone, "get_extended_attention_mask", None)):
+        def get_extended_attention_mask(self, attention_mask, input_shape, device=None, dtype=None):
+            if attention_mask.dim() == 2:
+                extended = attention_mask[:, None, None, :]
+            elif attention_mask.dim() == 3:
+                extended = attention_mask[:, None, :, :]
+            else:
+                raise ValueError("GTE attention_mask must have rank 2 or 3")
+            if dtype is None:
+                dtype = self.embeddings.word_embeddings.weight.dtype
+            extended = extended.to(device=extended.device if device is None else device, dtype=dtype)
+            return (1.0 - extended) * torch.finfo(dtype).min
+        backbone.get_extended_attention_mask = types.MethodType(get_extended_attention_mask, backbone)
+    return model
 
 
 def _load_frozen_backbone(model_name, checkpoint, revision, *, fix_mistral_regex=False):
@@ -1469,6 +1550,22 @@ def _accuracy_early_stopping_callback(TrainerCallback, patience, metric="accurac
     return AccuracyEarlyStoppingCallback()
 
 
+def _cooperative_stop_callback(TrainerCallback, stop_file):
+    """Stop after an optimizer update and force a checkpoint save on user request."""
+    stop_file = Path(stop_file) if stop_file else None
+    class CooperativeStopCallback(TrainerCallback):
+        requested = False
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if stop_file is not None and stop_file.is_file():
+                self.requested = True
+                control.should_save = True
+                control.should_training_stop = True
+            return control
+
+    return CooperativeStopCallback()
+
+
 def _early_stopping_summary(callback, patience, max_epochs, metric="accuracy"):
     return {
         "metric": f"validation_{metric}",
@@ -1548,7 +1645,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        auto_batch_size=False, max_batch_size=1024,
                        batch_probe_safety_fraction=0.95,
                        checkpoint_selection_metric="balanced_accuracy", save_epoch_checkpoints=False,
-                       gradient_checkpointing=False, training_views=None, training_view_ids=None,
+                       gradient_checkpointing=False, attention_backend=None, code_revision=None,
+                       training_views=None, training_view_ids=None, stop_file=None,
                        _oom_recovery_context=None, _trainer_resume_checkpoint=None,
                        copy_resume_state=True):
     """Fine-tune or continue an encoder after recording its validation baseline."""
@@ -1569,10 +1667,17 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     model_revision = None if (_trainer_resume_checkpoint or resume_checkpoint) else revision
     tokenizer = tr.AutoTokenizer.from_pretrained(model_source, revision=model_revision, trust_remote_code=True,
                                                   local_files_only=local_files_only)
+    if attention_backend not in {None, "sdpa", "flash_attention_2"}:
+        raise ValueError("attention_backend must be 'sdpa', 'flash_attention_2', or None")
+    model_load_kwargs = {"attn_implementation": attention_backend} if attention_backend else {}
+    if code_revision is not None:
+        model_load_kwargs["code_revision"] = code_revision
     model = tr.AutoModelForSequenceClassification.from_pretrained(
         model_source, revision=model_revision, num_labels=len(classes),
         id2label=dict(enumerate(classes)), label2id=label_map, trust_remote_code=True,
-        local_files_only=local_files_only)
+        local_files_only=local_files_only, **model_load_kwargs)
+    if code_revision is not None:
+        model = ensure_gte_transformers_compatibility(model)
     if gradient_checkpointing:
         _set_gradient_checkpointing(model, True)
     train = _TextDataset(train_text, y_indices, tokenizer, max_length,
@@ -1693,6 +1798,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     class BestCheckpointCallback(TrainerCallback):
         def __init__(self):
             self.save_seconds = 0.0
+            self.continuation_checkpoint_path = None
             self.epoch_checkpoints = [str(path) for path in sorted(out.glob("epoch-*")) if path.is_dir()]
 
         def on_train_begin(self, args, state, control, **kwargs):
@@ -1714,6 +1820,23 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                         "epoch": int(metadata["epoch"]),
                         "model_state": torch.load(state_path, map_location="cpu", weights_only=True),
                     })
+            if (select_best_checkpoint and best_state["epoch"] is None and
+                    best_state["last_evaluated_epoch"] is not None and trainer_resume_checkpoint):
+                historical = [item for item in state.log_history or []
+                              if item.get(f"eval_{checkpoint_selection_metric}") is not None]
+                selected = max(historical, key=lambda item: (
+                    float(item[f"eval_{checkpoint_selection_metric}"]),
+                    -int(round(float(item.get("epoch", 0))))))
+                best_state.update({
+                    "metric": float(selected[f"eval_{checkpoint_selection_metric}"]),
+                    "accuracy": selected.get("eval_accuracy"),
+                    "balanced_accuracy": selected.get("eval_balanced_accuracy"),
+                    "epoch": int(round(float(selected.get("epoch", 0)))),
+                    "model_state": _snapshot_state_dict_cpu(model),
+                })
+                preserved = _persist_continuation_checkpoint(trainer_resume_checkpoint, out)
+                if preserved is not None:
+                    self.continuation_checkpoint_path = str(preserved)
             return control
 
         def on_evaluate(self, args, state, control, metrics=None, **kwargs):
@@ -1745,6 +1868,15 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                     json.dumps(metrics or {}, indent=2) + "\n")
                 self.epoch_checkpoints.append(str(epoch_dir))
                 self.save_seconds += time.perf_counter() - save_started
+            return control
+
+        def on_save(self, args, state, control, **kwargs):
+            epoch = int(round(float(state.epoch or 0)))
+            if select_best_checkpoint and epoch == best_state.get("epoch"):
+                checkpoint_path = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+                preserved = _persist_continuation_checkpoint(checkpoint_path, out)
+                if preserved is not None:
+                    self.continuation_checkpoint_path = str(preserved)
             return control
 
     encoder_steps_per_epoch = _optimizer_steps_per_epoch(
@@ -1784,7 +1916,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
 
         trainer_type = EpochDecayTrainer
 
-    callbacks = [live_callback, epoch_prediction_callback]
+    cooperative_stop_callback = _cooperative_stop_callback(TrainerCallback, stop_file)
+    callbacks = [live_callback, epoch_prediction_callback, cooperative_stop_callback]
     if training_views is not None:
         class EpochTrainingViewCallback(TrainerCallback):
             def on_epoch_begin(self, args, state, control, **kwargs):
@@ -1874,6 +2007,11 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     checkpoint_started = time.perf_counter()
     model.save_pretrained(output_dir, safe_serialization=True)
     tokenizer.save_pretrained(output_dir)
+    if code_revision is not None:
+        (Path(output_dir) / "checkpoint_manifest.json").write_text(json.dumps({
+            "code_revision": code_revision, "model_revision": revision,
+            "trust_remote_code": True,
+        }, indent=2) + "\n")
     checkpoint_save_seconds = time.perf_counter() - checkpoint_started
     if not np.isfinite(logits).all(): raise ValueError("encoder produced non-finite scores")
     probs = softmax(logits, axis=1)
@@ -1936,8 +2074,11 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "early_stopping": (_early_stopping_summary(early_stopping_callback, early_stopping_patience, epochs,
                                                         metric=checkpoint_selection_metric)
                                if early_stopping_callback is not None else None),
+            "stop_requested": bool(cooperative_stop_callback.requested),
+            "stop_request_path": str(stop_file) if cooperative_stop_callback.requested else None,
             "checkpoint_selection_metric": f"validation_{checkpoint_selection_metric}" if select_best_checkpoint else None,
             "best_checkpoint_path": str(out) if best_state["epoch"] is not None else None,
+            "continuation_checkpoint_path": best_checkpoint_callback.continuation_checkpoint_path,
             "selected_checkpoint_path": str(out),
             "training_view_sampling": (train.sampling_summary() if training_views is not None else None),
             "epoch_checkpoints": list(best_checkpoint_callback.epoch_checkpoints),
@@ -2320,7 +2461,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          early_stopping_patience=2, trust_remote_code=False,
                          quantization="none", attention_backend=None,
                          checkpoint_selection_metric="balanced_accuracy", save_epoch_checkpoints=False,
-                         training_views=None, training_view_ids=None,
+                         training_views=None, training_view_ids=None, stop_file=None,
                          _oom_recovery_context=None, _trainer_resume_checkpoint=None):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
     _force_huggingface_offline()
@@ -2509,6 +2650,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     class EpochSnapshotCallback(TrainerCallback):
         def __init__(self):
             self.checkpoints=[str(path) for path in sorted(out.glob("epoch-*")) if path.is_dir()]
+            self.continuation_checkpoint_path = None
             self.validation_predictions=[]; self.best_state=None
             self.save_seconds=0.0; self.snapshot_seconds=0.0
             for path in sorted(training_state_dir.glob("validation_epoch_*.npy")):
@@ -2534,6 +2676,25 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                     self.best_state = {"adapter": saved["adapter"],
                         "classifier": saved["classifier"], "metrics": metadata["metrics"],
                         "epoch": int(metadata["epoch"])}
+            if self.best_state is None and _trainer_resume_checkpoint:
+                historical = [item for item in state.log_history or []
+                              if item.get(f"eval_{checkpoint_selection_metric}") is not None]
+                if historical:
+                    selected = max(historical, key=lambda item: (
+                        float(item[f"eval_{checkpoint_selection_metric}"]),
+                        -int(round(float(item.get("epoch", 0))))))
+                    from peft import get_peft_model_state_dict
+                    self.best_state = {
+                        "adapter": {k: v.detach().cpu().clone()
+                                    for k, v in get_peft_model_state_dict(backbone).items()},
+                        "classifier": {k: v.detach().cpu().clone()
+                                       for k, v in model.classifier.state_dict().items()},
+                        "metrics": dict(selected),
+                        "epoch": int(round(float(selected.get("epoch", 0)))),
+                    }
+                    preserved = _persist_continuation_checkpoint(_trainer_resume_checkpoint, out)
+                    if preserved is not None:
+                        self.continuation_checkpoint_path = str(preserved)
             return control
 
         def on_evaluate(self,args,state,control,metrics=None,**kwargs):
@@ -2580,6 +2741,15 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                 (epoch_dir/"validation_metrics.json").write_text(json.dumps(metrics or {},indent=2)+"\n")
                 self.checkpoints.append(str(epoch_dir))
                 self.save_seconds += time.perf_counter() - save_started
+            return control
+
+        def on_save(self, args, state, control, **kwargs):
+            epoch = int(round(float(state.epoch or 0)))
+            if self.best_state is not None and epoch == int(self.best_state["epoch"]):
+                checkpoint_path = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+                preserved = _persist_continuation_checkpoint(checkpoint_path, out)
+                if preserved is not None:
+                    self.continuation_checkpoint_path = str(preserved)
             return control
     snapshot_callback=EpochSnapshotCallback()
     if checkpoint_selection_metric not in {"accuracy", "balanced_accuracy"}:
@@ -2747,18 +2917,45 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                             decay=decay,steps_per_epoch=steps_per_epoch,warmup_steps=warmup_steps))
                 return self.lr_scheduler
         trainer_type=EpochDecayTrainer
+    cooperative_stop_callback=_cooperative_stop_callback(TrainerCallback,stop_file)
     trainer=trainer_type(model=model,args=args,train_dataset=train_dataset,data_collator=data_collator,
         eval_dataset=validation_dataset_rows if eval_each_epoch else None,
         compute_metrics=compute_metrics if eval_each_epoch else None,
-        callbacks=([snapshot_callback,progress_callback,early_stopping_callback]
-                   if eval_each_epoch else [progress_callback]))
+        callbacks=([snapshot_callback,progress_callback,early_stopping_callback,cooperative_stop_callback]
+                   if eval_each_epoch else [progress_callback,cooperative_stop_callback]))
     if training_views is not None:
         class EpochTrainingViewCallback(TrainerCallback):
             def on_epoch_begin(self,args,state,control,**kwargs):
                 train_dataset.set_epoch(int(round(float(state.epoch or 0))))
                 return control
         trainer.add_callback(EpochTrainingViewCallback())
-    startup_seconds = time.perf_counter() - start
+    baseline_validation_started = time.perf_counter()
+    baseline_metrics = None
+    baseline_validation_seconds = 0.0
+    if validation_labels is not None:
+        prediction_device = next(model.classifier.parameters()).device
+        if quantization != "qlora4":
+            prediction_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model.to(prediction_device)
+        amp_dtype = (torch.bfloat16 if use_bf16 else torch.float16 if use_fp16 else None)
+        baseline_logits, _ = _predict_cached_dataset(
+            model, validation_dataset_rows, batch_size=requested_inference_batch_size,
+            data_collator=data_collator, device=prediction_device, amp_dtype=amp_dtype,
+            return_info=True)
+        baseline_validation_seconds = time.perf_counter() - baseline_validation_started
+        from sklearn.metrics import accuracy_score, balanced_accuracy_score, log_loss
+        baseline_predicted = np.asarray(classes)[baseline_logits.argmax(axis=1)]
+        baseline_metrics = {
+            "accuracy": float(accuracy_score(validation_labels, baseline_predicted)),
+            "balanced_accuracy": float(balanced_accuracy_score(validation_labels, baseline_predicted)),
+            "validation_loss": float(log_loss(validation_labels, softmax(baseline_logits, axis=1),
+                                               labels=list(classes))),
+            "checkpoint": str(resume_checkpoint or checkpoint),
+            "resumed_trainer_state": str(_trainer_resume_checkpoint) if _trainer_resume_checkpoint else None,
+        }
+        _write_json_atomic(out / "baseline_validation.json", baseline_metrics)
+        progress_callback.set_baseline(baseline_metrics)
+    startup_seconds = max(0.0, time.perf_counter() - start - baseline_validation_seconds)
     recovery_context["phase"] = "training"
     training_started = time.perf_counter()
     if torch.cuda.is_available():
@@ -2864,15 +3061,19 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "fit_seconds":time.perf_counter()-start,"inference_seconds":inference_seconds,
         "classes":list(classes),"trainable_parameters":trainable,
         "validation_metrics_by_epoch":validation_metrics_by_epoch,
+        "baseline_validation_metrics":baseline_metrics,
         "validation_loss_raw": (float(validation_loss_raw)
                                 if validation_loss_raw is not None else None),
         "validation_predictions_by_epoch":snapshot_callback.validation_predictions,
         "early_stopping": (_early_stopping_summary(early_stopping_callback, early_stopping_patience, epochs,
                                                     metric=checkpoint_selection_metric)
                            if early_stopping_callback is not None else None),
+        "stop_requested": bool(cooperative_stop_callback.requested),
+        "stop_request_path": str(stop_file) if cooperative_stop_callback.requested else None,
         "epoch_checkpoints":snapshot_callback.checkpoints,
         "selected_checkpoint_path":str(out),
         "best_checkpoint_path":str(out),
+        "continuation_checkpoint_path":snapshot_callback.continuation_checkpoint_path,
         "best_epoch":best_epoch,"best_validation_accuracy":best_validation_accuracy,
         "best_validation_balanced_accuracy":best_validation_balanced_accuracy,
         "checkpoint_selection_metric":f"validation_{checkpoint_selection_metric}" if eval_each_epoch else None,
@@ -2880,6 +3081,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "final_validation_reused_epoch_predictions":bool(final_validation_reused_epoch_predictions),
         "training_view_sampling":(train_dataset.sampling_summary() if training_views is not None else None),
         "runtime_breakdown":{"startup_seconds":startup_seconds,
+            "baseline_validation_seconds":baseline_validation_seconds,
             "training_including_validation_seconds":training_seconds,
             "validation_seconds":float(getattr(trainer,"validation_seconds",0.0)),
             "epoch_validation_oom_fallbacks":int(getattr(trainer,"eval_oom_fallbacks",0)),

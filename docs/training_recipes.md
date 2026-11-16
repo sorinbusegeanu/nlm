@@ -90,3 +90,21 @@ experiment hash.
 - [Meta Llama Cookbook fine-tuning config](https://github.com/meta-llama/llama-cookbook/blob/main/getting-started/finetuning/README.md): LR `1e-4`, weight decay `0`, per-epoch gamma `0.85`.
 - [IBM Granite LoRA recipe](https://github.com/ibm-granite/granite.build/blob/main/configurations/assets/environments/bash/steps/lora-finetune/README.md): LR default `2e-4`, LoRA rank 16, alpha 32.
 - [NVIDIA Megatron Bridge Ministral 3 example](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/models/mistral/ministral3): model-family LoRA/DoRA example; exact values are recipe- and task-dependent.
+
+# Cooperative training stop
+
+For a model training job, request a clean stop with:
+
+```bash
+python -m src.pipeline models stop --run-id <run_id>
+```
+
+The command writes a stop request and waits for normal finalization. Encoder,
+LoRA and QLoRA jobs stop at the next completed optimizer step and force a
+resumable checkpoint save. CatBoost stops at an iteration boundary. Single-fit
+estimators such as SVC finish their current fit. Each path then exports its
+validation predictions, records the selected checkpoint, updates the experiment
+registry and Trust List 2 when eligible, and exits. The command does not send SIGINT/SIGTERM.
+Use `--no-wait` to return immediately after recording the request, or
+`--timeout-seconds` to change how long it waits. The `run_id` is the directory
+name under `artifacts/runs/`.

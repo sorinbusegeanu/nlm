@@ -15,6 +15,7 @@ lora_rank: 16
 lora_alpha: 32
 lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
 batch_size: 1
+inference_batch_size: 8
 gradient_accumulation_steps: 8
 gradient_checkpointing: true
 auto_batch_size: true

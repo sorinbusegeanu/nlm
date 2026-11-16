@@ -211,9 +211,31 @@ def sort_catalog_for_dashboard(frame: pd.DataFrame) -> pd.DataFrame:
                               kind="stable").reset_index(drop=True)
 
 
-def _next_sequence(frame: pd.DataFrame) -> int:
+def _next_sequence(frame: pd.DataFrame, *, root: Path | None = None) -> int:
+    """Allocate IDs from the shared checkpoint sequence used by all trust lists."""
     numbers = [int(match.group(1)) for value in frame.sequence_id.dropna().astype(str)
                if (match := re.fullmatch(r"N(\d+)", value))]
+    root = Path(root or Path.cwd())
+    paths = [root / "docs" / "checkpoint_label_catalog.csv",
+             root / "docs" / "v2-ckpt-nov0.csv",
+             root / "docs" / "v2-ckpt-nov0_active.csv"]
+    for pointer_path in (root / "docs" / "trust-list-2-latest.json",
+                         root / "docs" / "trust-list-2.2-latest.json"):
+        try:
+            pointer = json.loads(pointer_path.read_text())
+            paths.append(root / pointer["csv_path"])
+        except (OSError, KeyError, ValueError, json.JSONDecodeError):
+            pass
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            ids = pd.read_csv(path, usecols=lambda column: column == "sequence_id")
+        except (OSError, ValueError, pd.errors.EmptyDataError):
+            continue
+        if "sequence_id" in ids:
+            numbers.extend(int(match.group(1)) for value in ids.sequence_id.dropna().astype(str)
+                           if (match := re.fullmatch(r"N(\d+)", value)))
     return max(numbers, default=0) + 1
 
 
@@ -400,7 +422,7 @@ def append_manifest(*, manifest: dict, manifest_path, catalog_path=DEFAULT_CATAL
         raise ValueError(f"{experiment_id}: saved probability matrix is invalid")
     predicted = np.asarray(classes, dtype=object)[probabilities.argmax(axis=1)]
     y_true = validation.model.to_numpy(dtype=object)
-    sequence_id = _sequence_id(_next_sequence(current))
+    sequence_id = _sequence_id(_next_sequence(current, root=Path.cwd()))
     new_rows = []
     for label in classes:
         pred_mask = predicted == label

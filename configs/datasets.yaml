@@ -136,14 +136,6 @@ datasets:
     reports:
       - docs/v1_all_balanced_deduped.md
 
-  - id: v2
-    name: V2 — Full eligible Open Pool plus V0
-    section: Training datasets
-    description: Combines the eligible Open Pool rows with the V0 training partition while preserving the Open Pool class distribution.
-    artifact: data/processed/dataset_v2.parquet
-    profile: data/processed/dataset_profile_v2.json
-    validation: Historical split contains 190,254 train and the unchanged 540 V0 validation rows.
-
   - id: v2_openpool
     name: V2 Open Pool — eligible source rows
     section: Staging datasets
@@ -161,6 +153,48 @@ datasets:
     validation: External training rows; use the V0 validation dataset in training experiments.
     reports:
       - docs/v2.0.md
+
+  - id: v2.0.chunks800
+    name: V2.0 chunks800 — One full response plus chunk views
+    section: Training datasets
+    description: V2.0 with up to three deterministic, word-boundary-aware 800-character chunk views per original response; training samples one complete or chunk view per original each epoch.
+    artifact: data/processed/dataset_v2.0.chunks800.parquet
+    profile: data/processed/dataset_profile_v2.0.chunks800.json
+    validation: Training uses one view per original response per epoch; validation and checkpoint selection use complete responses from V0.
+    reports:
+      - docs/v2.0.chunks800.md
+
+  - id: v2.0.chunks.300TokBalanced
+    name: V2.0 token chunks — 300 tokens
+    section: Training datasets
+    description: Every V2.0 response is split into deterministic overlapping 300-token maximum windows (150-token stride); every chunk is an independent, equally weighted training row with no additional balancing.
+    artifact: data/processed/dataset_v2.0.chunks.300TokBalanced.parquet
+    profile: data/processed/dataset_profile_v2.0.chunks.300TokBalanced.json
+    validation: External training chunks; validate and select checkpoints on complete unchunked V0 responses.
+    max_encoded_length: 300
+    reports:
+      - docs/v2.0.chunks.300TokBalanced.md
+
+  - id: v2.0.chunks.200TokBalanced
+    name: V2.0 token chunks — 200 tokens
+    section: Training datasets
+    description: Every V2.0 response is split into deterministic overlapping 200-token maximum windows (100-token stride); every chunk is an independent, equally weighted training row with no additional balancing.
+    artifact: data/processed/dataset_v2.0.chunks.200TokBalanced.parquet
+    profile: data/processed/dataset_profile_v2.0.chunks.200TokBalanced.json
+    validation: External training chunks; validate and select checkpoints on complete unchunked V0 responses.
+    max_encoded_length: 200
+    reports:
+      - docs/v2.0.chunks.200TokBalanced.md
+
+  - id: v2_0_c800_t300_t200
+    name: V2.0 combined c800 + t300 + t200 views
+    section: Training datasets
+    description: Concatenates all rows from the V2.0 800-character multi-view dataset and the 300-token and 200-token chunk datasets; each combined row is an independent, equally weighted training example.
+    artifact: data/processed/dataset_v2_0_c800_t300_t200.parquet
+    profile: data/processed/dataset_profile_v2_0_c800_t300_t200.json
+    validation: Training-only rows derived from V2.0; validate and select checkpoints on complete unchunked V0 responses.
+    reports:
+      - docs/v2_0_c800_t300_t200.md
 
   - id: v2.1
     name: V2.1 — Balanced external corpus with unverified Gemini 3.7 source
@@ -192,3 +226,83 @@ datasets:
     validation: External training rows; all 2,699 V0 rows are used for validation by the full-V0 training workflow.
     reports:
       - docs/v2.14.balanced.md
+
+  - id: v2.14-prediction-filtered
+    name: V2.14 prediction-filtered
+    section: Training datasets
+    description: V2.14 rows selected by deterministic UltraBERT, SVC, and CatBoost prediction categories to retain more difficult examples.
+    artifact: data/processed/dataset_v2.14-prediction-filtered.parquet
+    profile: data/processed/dataset_profile_v2.14-prediction-filtered.json
+    validation: External training rows only; use the complete V0 validation dataset in the standard training workflow.
+    reports:
+      - docs/v2.14_prediction_filter_report.md
+
+  - id: v2.14-prediction-filtered-80pct
+    name: V2.14 prediction-filtered 80%
+    section: Training datasets
+    description: V2.14 prediction-guided reduction retaining 60% of very-easy examples and all examples in the other five categories; deterministic, external-only, with natural label frequencies.
+    artifact: data/processed/dataset_v2.14-prediction-filtered-80pct.parquet
+    profile: data/processed/dataset_profile_v2.14-prediction-filtered-80pct.json
+    validation: External-only training data; use all 2,699 official V0 rows for validation and checkpoint selection. No V0 rows are included in training.
+    reports:
+      - docs/v2.14_prediction_filter_80pct_report.md
+
+  - id: v2.15_extrato_14
+    name: V2.15_extrato_14 — New external responses absent from V2.14
+    section: Training datasets
+    description: Incremental, natural-frequency external corpus from five requested Kaggle sources, deduplicated against full V2.14, isolated from known V0 response and prompt groups, and filtered to responses of at most 2,000 characters.
+    artifact: data/processed/dataset_v2.15_extrato_14.parquet
+    profile: data/processed/dataset_profile_v2.15_extrato_14.json
+    validation: External-only training data; use all 2,699 official V0 rows for validation. Known prompt-ID overlaps are excluded; official V0 contains no canonical prompt text for exact prompt-text comparison.
+    reports:
+      - docs/v2.15_extrato_14.md
+      - docs/v2.15_extrato_14_length_filter.md
+
+  - id: v2.16_14plus15
+    name: V2.16_14plus15 — V2.14 plus V2.15_extrato_14
+    section: Training datasets
+    description: Complete V2.14 dataset combined with all 46,347 V2.15_extrato_14 additions; no extra filtering, balancing, or sampling.
+    artifact: data/processed/dataset_v2.16_14plus15.parquet
+    profile: data/processed/dataset_profile_v2.16_14plus15.json
+    validation: External-only training rows; validate and select checkpoints on all 2,699 V0 rows.
+    reports:
+      - docs/v2.16_14plus15.md
+
+  - id: v2.16
+    name: V2.16 — V2.14 plus V2.15_extrato_14
+    section: Training datasets
+    description: Alias for v2.16_14plus15, preserving the same 277,683-row external-only artifact and provenance.
+    artifact: data/processed/dataset_v2.16.parquet
+    profile: data/processed/dataset_profile_v2.16.json
+    validation: External-only training rows; validate and select checkpoints on all 2,699 V0 rows.
+    reports:
+      - docs/v2.16_14plus15.md
+
+  - id: v2.14_plus_v2.15_extrato_14
+    name: V2.14 + V2.15_extrato_14 — Combined external training corpus
+    section: Training datasets
+    description: Complete V2.14 corpus concatenated with the 46,347 incremental V2.15_extrato_14 rows. V2.15 was deduplicated against V2.14 during curation; validate and select checkpoints on all V0 rows.
+    artifact: data/processed/dataset_v2.14_plus_v2.15_extrato_14.parquet
+    profile: data/processed/dataset_profile_v2.14_plus_v2.15_extrato_14.json
+    validation: External-only training rows; use the complete V0 validation dataset.
+    reports:
+      - docs/v2.15_extrato_14.md
+
+  - id: v2.14-gemini
+    name: V2.14 Gemini specialist
+    section: Specialist classifier datasets
+    description: Deterministically balanced V2.14 subset for labels gemini-3.6-flash,
+      gemini-3.7-flash, gemini-3.8-flash; 4,432 rows per label, seed 2026.
+    artifact: data/processed/dataset_v2.14-gemini.parquet
+    profile: data/processed/dataset_profile_v2.14-gemini.json
+    validation: Prompt-grouped 80/20 split for checkpoint selection; full V0 rows for
+      these labels are predicted and evaluated after training.
+  - id: v2.14-glm
+    name: V2.14 GLM specialist
+    section: Specialist classifier datasets
+    description: Deterministically balanced V2.14 subset for labels glm-5.3, glm-5.3-flash;
+      12,292 rows per label, seed 2026.
+    artifact: data/processed/dataset_v2.14-glm.parquet
+    profile: data/processed/dataset_profile_v2.14-glm.json
+    validation: Prompt-grouped 80/20 split for checkpoint selection; full V0 rows for
+      these labels are predicted and evaluated after training.
