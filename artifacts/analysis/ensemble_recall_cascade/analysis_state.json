@@ -1,0 +1,9 @@
+{
+  "status": "completed",
+  "trust_sha256": "c93ae4cc0612ed36b7c126d6d50a5b50456ecfafd4e835369272076442e8cf9b",
+  "prediction_cache_sha256": "6aa4becdf1ebc2f9c671ed7a56eba9bc3cb7e4864487f267178e0d5f6297cb33",
+  "rows": 2699,
+  "folds_completed": 5,
+  "artifact_dir": "artifacts/analysis/ensemble_recall_cascade",
+  "report_path": "docs/ensemble_recall_cascade.md"
+}
