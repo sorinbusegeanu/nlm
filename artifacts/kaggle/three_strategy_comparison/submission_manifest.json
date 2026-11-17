@@ -1,0 +1,117 @@
+{
+  "trust_list_version": "trust-list-2-v025",
+  "trust_list_sha256": "c93ae4cc0612ed36b7c126d6d50a5b50456ecfafd4e835369272076442e8cf9b",
+  "inference_kernel": "zodrak/trust-v025-c3-equal-selected-c1",
+  "inference_kernel_version": 1,
+  "inference_runtime_seconds": 1618.38,
+  "candidate_checkpoints": 24,
+  "v0_metrics": {
+    "EQUAL9": {
+      "accuracy": 0.6539459058910708,
+      "balanced_accuracy": 0.6538975888640318
+    },
+    "C3": {
+      "crossfit_accuracy": 0.655057,
+      "crossfit_balanced_accuracy": 0.655006,
+      "full_v0_accuracy": 0.6580214894405335,
+      "full_v0_balanced_accuracy": 0.6579716629381058
+    },
+    "equal_selected": {
+      "crossfit_accuracy": 0.648018,
+      "crossfit_balanced_accuracy": 0.647962,
+      "full_v0_accuracy": 0.650611,
+      "full_v0_balanced_accuracy": 0.650562
+    },
+    "C1": {
+      "crossfit_accuracy": 0.648018,
+      "crossfit_balanced_accuracy": 0.648006,
+      "full_v0_accuracy": 0.661727,
+      "full_v0_balanced_accuracy": 0.661718
+    }
+  },
+  "outputs": {
+    "C3": {
+      "file": "artifacts/kaggle/three_strategy_comparison/kernel-output-v1/submission_c3.parquet",
+      "sha256": "0cc980a510ebb3513dbeb259ca79dd818cd412b119c547ca40a2da13409feaaa",
+      "test_ids": [
+        "00353fb1c541",
+        "005f5a9a6139",
+        "0062a53d5487"
+      ],
+      "predictions": [
+        "glm-5.3",
+        "gpt-5.5",
+        "gemini-3.1-pro-preview"
+      ]
+    },
+    "equal_selected": {
+      "file": "artifacts/kaggle/three_strategy_comparison/kernel-output-v1/submission_equal_selected.parquet",
+      "sha256": "0cc980a510ebb3513dbeb259ca79dd818cd412b119c547ca40a2da13409feaaa",
+      "test_ids": [
+        "00353fb1c541",
+        "005f5a9a6139",
+        "0062a53d5487"
+      ],
+      "predictions": [
+        "glm-5.3",
+        "gpt-5.5",
+        "gemini-3.1-pro-preview"
+      ]
+    },
+    "C1": {
+      "file": "artifacts/kaggle/three_strategy_comparison/kernel-output-v1/submission_c1.parquet",
+      "sha256": "0cc980a510ebb3513dbeb259ca79dd818cd412b119c547ca40a2da13409feaaa",
+      "test_ids": [
+        "00353fb1c541",
+        "005f5a9a6139",
+        "0062a53d5487"
+      ],
+      "predictions": [
+        "glm-5.3",
+        "gpt-5.5",
+        "gemini-3.1-pro-preview"
+      ]
+    }
+  },
+  "submissions": {
+    "C3": {
+      "submission_id": "58446640",
+      "kernel": "zodrak/equal9-v025-plus-c3-cascade",
+      "kernel_version": 2,
+      "status": "complete",
+      "public_score": 0.569
+    },
+    "equal_selected": {
+      "submission_id": "58446713",
+      "kernel": "zodrak/equal-selected-trust-list-2-v025",
+      "kernel_version": 1,
+      "status": "complete",
+      "public_score": null,
+      "score_note": "Kaggle API returned COMPLETE without a publicScore value; completed submission predictions are byte-identical to C3."
+    },
+    "C1": {
+      "submission_id": "58446716",
+      "kernel": "zodrak/c1-precision-trust-list-2-v025",
+      "kernel_version": 1,
+      "status": "complete",
+      "public_score": null,
+      "score_note": "Kaggle API returned COMPLETE without a publicScore value; completed submission predictions are byte-identical to C3."
+    }
+  },
+  "historical_equal9": {
+    "submission_id": "58323239",
+    "public_score": 0.567,
+    "status": "complete"
+  },
+  "recent_v025_equal9_submission_id": "58444305",
+  "recent_v025_equal9_status": "pending",
+  "comparison_baseline": {
+    "strategy": "EQUAL9",
+    "trust_list_version": "trust-list-2-v025",
+    "submission_id": "58444305",
+    "status": "complete",
+    "public_score": 0.567,
+    "output_sha256": "0cc980a510ebb3513dbeb259ca79dd818cd412b119c547ca40a2da13409feaaa"
+  },
+  "score_reconciliation_note": "C3 public score 0.569 and EQUAL9 v025 public score 0.567 were returned by Kaggle. Equal-selected and C1 are complete but their publicScore fields are blank. C3, equal-selected, C1, and the completed EQUAL9 v025 kernel output are byte-identical, SHA-256 0cc980a510ebb3513dbeb259ca79dd818cd412b119c547ca40a2da13409feaaa. The +0.002 returned-score difference is not attributable to predictions; do not impute scores for blank fields."
+}
