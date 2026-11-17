@@ -1,0 +1,828 @@
+{
+  "code_sha256": "14e70655f2ab458686967f0ca26fb0448153dd5f46b27b928e23d76ab61867d1",
+  "input_hashes": {
+    "trust_list_sha256": "c93ae4cc0612ed36b7c126d6d50a5b50456ecfafd4e835369272076442e8cf9b",
+    "probability_cache_sha256": "6aa4becdf1ebc2f9c671ed7a56eba9bc3cb7e4864487f267178e0d5f6297cb33",
+    "fold_assignments_sha256": "9e5e0f3db0a359bf314f904862a22d70db92b27c1d91eeb414d8b554e3556af7",
+    "c3_predictions_sha256": "1921255b22a57a7f4c586f189bdde6d0b664eeb7a3b2d1da5eceb035c95adb34",
+    "v0_ids_sha256": "4bd8228cf04c1afbdc310eb9f858c14fefcb714b47f14d462c62cc990cb5a3e8"
+  },
+  "training_metrics": {
+    "logistic": {
+      "rows": 2159,
+      "correct": 2159,
+      "accuracy": 1.0,
+      "balanced_accuracy": 1.0,
+      "log_loss": 0.0037579396846350215,
+      "per_label": {
+        "claude-fable-5": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 119,
+          "fp": 0,
+          "fn": 0,
+          "support": 119
+        },
+        "claude-opus-4-6": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "claude-opus-4-8": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "claude-opus-5": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "claude-sonnet-5": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "gemini-3.1-pro-preview": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "gemini-3.6-flash": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "gemini-3.7-flash": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "gemini-3.8-flash": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "glm-5.3": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "glm-5.3-flash": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "gpt-5.5": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "gpt-5.6-luna": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "gpt-5.6-sol": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "gpt-5.6-terra": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "gpt-6-astra": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "kimi-k3": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        },
+        "qwen3.8-max": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "tp": 120,
+          "fp": 0,
+          "fn": 0,
+          "support": 120
+        }
+      },
+      "y_pred": null
+    },
+    "catboost": {
+      "rows": 2159,
+      "correct": 1516,
+      "accuracy": 0.7021769337656323,
+      "balanced_accuracy": 0.7020463741051975,
+      "log_loss": 1.2480094789109055,
+      "per_label": {
+        "claude-fable-5": {
+          "precision": 0.5434782608695652,
+          "recall": 0.42016806722689076,
+          "f1": 0.4739336492890995,
+          "tp": 50,
+          "fp": 42,
+          "fn": 69,
+          "support": 119
+        },
+        "claude-opus-4-6": {
+          "precision": 0.8292682926829268,
+          "recall": 0.85,
+          "f1": 0.8395061728395061,
+          "tp": 102,
+          "fp": 21,
+          "fn": 18,
+          "support": 120
+        },
+        "claude-opus-4-8": {
+          "precision": 0.7559055118110236,
+          "recall": 0.8,
+          "f1": 0.7773279352226721,
+          "tp": 96,
+          "fp": 31,
+          "fn": 24,
+          "support": 120
+        },
+        "claude-opus-5": {
+          "precision": 0.8761061946902655,
+          "recall": 0.825,
+          "f1": 0.849785407725322,
+          "tp": 99,
+          "fp": 14,
+          "fn": 21,
+          "support": 120
+        },
+        "claude-sonnet-5": {
+          "precision": 0.7837837837837838,
+          "recall": 0.725,
+          "f1": 0.7532467532467533,
+          "tp": 87,
+          "fp": 24,
+          "fn": 33,
+          "support": 120
+        },
+        "gemini-3.1-pro-preview": {
+          "precision": 0.9181818181818182,
+          "recall": 0.8416666666666667,
+          "f1": 0.8782608695652174,
+          "tp": 101,
+          "fp": 9,
+          "fn": 19,
+          "support": 120
+        },
+        "gemini-3.6-flash": {
+          "precision": 0.7318840579710145,
+          "recall": 0.8416666666666667,
+          "f1": 0.7829457364341085,
+          "tp": 101,
+          "fp": 37,
+          "fn": 19,
+          "support": 120
+        },
+        "gemini-3.7-flash": {
+          "precision": 0.5842696629213483,
+          "recall": 0.43333333333333335,
+          "f1": 0.4976076555023924,
+          "tp": 52,
+          "fp": 37,
+          "fn": 68,
+          "support": 120
+        },
+        "gemini-3.8-flash": {
+          "precision": 0.6319444444444444,
+          "recall": 0.7583333333333333,
+          "f1": 0.6893939393939393,
+          "tp": 91,
+          "fp": 53,
+          "fn": 29,
+          "support": 120
+        },
+        "glm-5.3": {
+          "precision": 0.46540880503144655,
+          "recall": 0.6166666666666667,
+          "f1": 0.5304659498207887,
+          "tp": 74,
+          "fp": 85,
+          "fn": 46,
+          "support": 120
+        },
+        "glm-5.3-flash": {
+          "precision": 0.5337837837837838,
+          "recall": 0.6583333333333333,
+          "f1": 0.5895522388059702,
+          "tp": 79,
+          "fp": 69,
+          "fn": 41,
+          "support": 120
+        },
+        "gpt-5.5": {
+          "precision": 0.635036496350365,
+          "recall": 0.725,
+          "f1": 0.6770428015564203,
+          "tp": 87,
+          "fp": 50,
+          "fn": 33,
+          "support": 120
+        },
+        "gpt-5.6-luna": {
+          "precision": 0.711864406779661,
+          "recall": 0.7,
+          "f1": 0.7058823529411764,
+          "tp": 84,
+          "fp": 34,
+          "fn": 36,
+          "support": 120
+        },
+        "gpt-5.6-sol": {
+          "precision": 0.6702127659574468,
+          "recall": 0.525,
+          "f1": 0.5887850467289719,
+          "tp": 63,
+          "fp": 31,
+          "fn": 57,
+          "support": 120
+        },
+        "gpt-5.6-terra": {
+          "precision": 0.6470588235294118,
+          "recall": 0.7333333333333333,
+          "f1": 0.6875,
+          "tp": 88,
+          "fp": 48,
+          "fn": 32,
+          "support": 120
+        },
+        "gpt-6-astra": {
+          "precision": 0.9152542372881356,
+          "recall": 0.9,
+          "f1": 0.9075630252100839,
+          "tp": 108,
+          "fp": 10,
+          "fn": 12,
+          "support": 120
+        },
+        "kimi-k3": {
+          "precision": 0.7088607594936709,
+          "recall": 0.4666666666666667,
+          "f1": 0.5628140703517589,
+          "tp": 56,
+          "fp": 23,
+          "fn": 64,
+          "support": 120
+        },
+        "qwen3.8-max": {
+          "precision": 0.7967479674796748,
+          "recall": 0.8166666666666667,
+          "f1": 0.8065843621399178,
+          "tp": 98,
+          "fp": 25,
+          "fn": 22,
+          "support": 120
+        }
+      },
+      "y_pred": null
+    },
+    "catboost_equal9_blend": {
+      "rows": 2159,
+      "correct": 1494,
+      "accuracy": 0.6919870310328856,
+      "balanced_accuracy": 0.6919156551509492,
+      "log_loss": 1.1639184980754105,
+      "per_label": {
+        "claude-fable-5": {
+          "precision": 0.423841059602649,
+          "recall": 0.5378151260504201,
+          "f1": 0.47407407407407404,
+          "tp": 64,
+          "fp": 87,
+          "fn": 55,
+          "support": 119
+        },
+        "claude-opus-4-6": {
+          "precision": 0.8571428571428571,
+          "recall": 0.85,
+          "f1": 0.8535564853556485,
+          "tp": 102,
+          "fp": 17,
+          "fn": 18,
+          "support": 120
+        },
+        "claude-opus-4-8": {
+          "precision": 0.782258064516129,
+          "recall": 0.8083333333333333,
+          "f1": 0.7950819672131147,
+          "tp": 97,
+          "fp": 27,
+          "fn": 23,
+          "support": 120
+        },
+        "claude-opus-5": {
+          "precision": 0.8990825688073395,
+          "recall": 0.8166666666666667,
+          "f1": 0.8558951965065502,
+          "tp": 98,
+          "fp": 11,
+          "fn": 22,
+          "support": 120
+        },
+        "claude-sonnet-5": {
+          "precision": 0.7542372881355932,
+          "recall": 0.7416666666666667,
+          "f1": 0.7478991596638657,
+          "tp": 89,
+          "fp": 29,
+          "fn": 31,
+          "support": 120
+        },
+        "gemini-3.1-pro-preview": {
+          "precision": 0.9428571428571428,
+          "recall": 0.825,
+          "f1": 0.88,
+          "tp": 99,
+          "fp": 6,
+          "fn": 21,
+          "support": 120
+        },
+        "gemini-3.6-flash": {
+          "precision": 0.7123287671232876,
+          "recall": 0.8666666666666667,
+          "f1": 0.7819548872180451,
+          "tp": 104,
+          "fp": 42,
+          "fn": 16,
+          "support": 120
+        },
+        "gemini-3.7-flash": {
+          "precision": 0.6666666666666666,
+          "recall": 0.25,
+          "f1": 0.36363636363636365,
+          "tp": 30,
+          "fp": 15,
+          "fn": 90,
+          "support": 120
+        },
+        "gemini-3.8-flash": {
+          "precision": 0.5376344086021505,
+          "recall": 0.8333333333333334,
+          "f1": 0.6535947712418301,
+          "tp": 100,
+          "fp": 86,
+          "fn": 20,
+          "support": 120
+        },
+        "glm-5.3": {
+          "precision": 0.4233576642335766,
+          "recall": 0.48333333333333334,
+          "f1": 0.45136186770428016,
+          "tp": 58,
+          "fp": 79,
+          "fn": 62,
+          "support": 120
+        },
+        "glm-5.3-flash": {
+          "precision": 0.5882352941176471,
+          "recall": 0.5833333333333334,
+          "f1": 0.5857740585774059,
+          "tp": 70,
+          "fp": 49,
+          "fn": 50,
+          "support": 120
+        },
+        "gpt-5.5": {
+          "precision": 0.7064220183486238,
+          "recall": 0.6416666666666667,
+          "f1": 0.6724890829694324,
+          "tp": 77,
+          "fp": 32,
+          "fn": 43,
+          "support": 120
+        },
+        "gpt-5.6-luna": {
+          "precision": 0.7431192660550459,
+          "recall": 0.675,
+          "f1": 0.7074235807860263,
+          "tp": 81,
+          "fp": 28,
+          "fn": 39,
+          "support": 120
+        },
+        "gpt-5.6-sol": {
+          "precision": 0.6914893617021277,
+          "recall": 0.5416666666666666,
+          "f1": 0.6074766355140186,
+          "tp": 65,
+          "fp": 29,
+          "fn": 55,
+          "support": 120
+        },
+        "gpt-5.6-terra": {
+          "precision": 0.6012658227848101,
+          "recall": 0.7916666666666666,
+          "f1": 0.6834532374100719,
+          "tp": 95,
+          "fp": 63,
+          "fn": 25,
+          "support": 120
+        },
+        "gpt-6-astra": {
+          "precision": 0.9298245614035088,
+          "recall": 0.8833333333333333,
+          "f1": 0.905982905982906,
+          "tp": 106,
+          "fp": 8,
+          "fn": 14,
+          "support": 120
+        },
+        "kimi-k3": {
+          "precision": 0.6987951807228916,
+          "recall": 0.48333333333333334,
+          "f1": 0.5714285714285714,
+          "tp": 58,
+          "fp": 25,
+          "fn": 62,
+          "support": 120
+        },
+        "qwen3.8-max": {
+          "precision": 0.7593984962406015,
+          "recall": 0.8416666666666667,
+          "f1": 0.7984189723320158,
+          "tp": 101,
+          "fp": 32,
+          "fn": 19,
+          "support": 120
+        }
+      },
+      "y_pred": null
+    }
+  },
+  "details": {
+    "fold": 1,
+    "train_rows": 2159,
+    "heldout_rows": 540,
+    "train_prompt_groups": [
+      "p000",
+      "p001",
+      "p002",
+      "p003",
+      "p005",
+      "p006",
+      "p007",
+      "p008",
+      "p010",
+      "p011",
+      "p012",
+      "p013",
+      "p015",
+      "p016",
+      "p017",
+      "p018",
+      "p020",
+      "p021",
+      "p022",
+      "p023",
+      "p025",
+      "p026",
+      "p027",
+      "p028",
+      "p030",
+      "p031",
+      "p032",
+      "p033",
+      "p035",
+      "p036",
+      "p037",
+      "p038",
+      "p040",
+      "p041",
+      "p042",
+      "p043",
+      "p045",
+      "p046",
+      "p047",
+      "p048",
+      "p050",
+      "p051",
+      "p052",
+      "p053",
+      "p055",
+      "p056",
+      "p057",
+      "p058",
+      "p060",
+      "p061",
+      "p062",
+      "p063",
+      "p065",
+      "p066",
+      "p067",
+      "p068",
+      "p070",
+      "p071",
+      "p072",
+      "p073",
+      "p075",
+      "p076",
+      "p077",
+      "p078",
+      "p080",
+      "p081",
+      "p082",
+      "p083",
+      "p085",
+      "p086",
+      "p087",
+      "p088",
+      "p090",
+      "p091",
+      "p092",
+      "p093",
+      "p095",
+      "p096",
+      "p097",
+      "p098",
+      "p100",
+      "p101",
+      "p102",
+      "p103",
+      "p105",
+      "p106",
+      "p107",
+      "p108",
+      "p110",
+      "p111",
+      "p112",
+      "p113",
+      "p115",
+      "p116",
+      "p117",
+      "p118",
+      "p120",
+      "p121",
+      "p122",
+      "p123",
+      "p125",
+      "p126",
+      "p127",
+      "p128",
+      "p130",
+      "p131",
+      "p132",
+      "p133",
+      "p135",
+      "p136",
+      "p137",
+      "p138",
+      "p140",
+      "p141",
+      "p142",
+      "p143",
+      "p145",
+      "p146",
+      "p147",
+      "p148"
+    ],
+    "heldout_prompt_groups": [
+      "p004",
+      "p009",
+      "p014",
+      "p019",
+      "p024",
+      "p029",
+      "p034",
+      "p039",
+      "p044",
+      "p049",
+      "p054",
+      "p059",
+      "p064",
+      "p069",
+      "p074",
+      "p079",
+      "p084",
+      "p089",
+      "p094",
+      "p099",
+      "p104",
+      "p109",
+      "p114",
+      "p119",
+      "p124",
+      "p129",
+      "p134",
+      "p139",
+      "p144",
+      "p149"
+    ],
+    "selected_logistic_C": 1.0,
+    "logistic_inner_selection": {
+      "grid": [
+        {
+          "C": 0.1,
+          "balanced_accuracy": 0.6789526921879863,
+          "log_loss": 1.2368780467241398
+        },
+        {
+          "C": 1.0,
+          "balanced_accuracy": 0.6798747276688454,
+          "log_loss": 1.6058363092985735
+        },
+        {
+          "C": 10.0,
+          "balanced_accuracy": 0.674307500778089,
+          "log_loss": 2.395975026587066
+        }
+      ],
+      "selected": {
+        "C": 1.0,
+        "balanced_accuracy": 0.6798747276688454,
+        "log_loss": 1.6058363092985735
+      }
+    },
+    "selected_catboost_config": {
+      "depth": 3,
+      "iterations": 120,
+      "l2_leaf_reg": 10.0,
+      "rsm": 0.25
+    },
+    "catboost_inner_selection": {
+      "grid": [
+        {
+          "depth": 3,
+          "iterations": 120,
+          "l2_leaf_reg": 10.0,
+          "rsm": 0.25,
+          "balanced_accuracy": 0.6381107998755058,
+          "log_loss": 1.385422231642105
+        },
+        {
+          "depth": 4,
+          "iterations": 120,
+          "l2_leaf_reg": 20.0,
+          "rsm": 0.25,
+          "balanced_accuracy": 0.632979302832244,
+          "log_loss": 1.4272430697609146
+        }
+      ],
+      "selected": {
+        "depth": 3,
+        "iterations": 120,
+        "l2_leaf_reg": 10.0,
+        "rsm": 0.25,
+        "balanced_accuracy": 0.6381107998755058,
+        "log_loss": 1.385422231642105
+      },
+      "blend_grid": [
+        {
+          "catboost_weight": 0.0,
+          "equal9_weight": 1.0,
+          "balanced_accuracy": 0.659041394335512,
+          "log_loss": 1.1247964317211068
+        },
+        {
+          "catboost_weight": 0.1,
+          "equal9_weight": 0.9,
+          "balanced_accuracy": 0.6618191721132898,
+          "log_loss": 1.1408039094526976
+        },
+        {
+          "catboost_weight": 0.2,
+          "equal9_weight": 0.8,
+          "balanced_accuracy": 0.6641300964830377,
+          "log_loss": 1.1589214272917054
+        },
+        {
+          "catboost_weight": 0.3,
+          "equal9_weight": 0.7,
+          "balanced_accuracy": 0.6659780578898227,
+          "log_loss": 1.1790011411982662
+        },
+        {
+          "catboost_weight": 0.4,
+          "equal9_weight": 0.6,
+          "balanced_accuracy": 0.6664449112978525,
+          "log_loss": 1.2010413958660404
+        },
+        {
+          "catboost_weight": 0.5,
+          "equal9_weight": 0.5,
+          "balanced_accuracy": 0.6678338001867413,
+          "log_loss": 1.225128567833895
+        },
+        {
+          "catboost_weight": 0.6,
+          "equal9_weight": 0.4,
+          "balanced_accuracy": 0.6659897292250234,
+          "log_loss": 1.251423823447689
+        },
+        {
+          "catboost_weight": 0.7,
+          "equal9_weight": 0.30000000000000004,
+          "balanced_accuracy": 0.6645969498910677,
+          "log_loss": 1.2801694151499183
+        },
+        {
+          "catboost_weight": 0.8,
+          "equal9_weight": 0.19999999999999996,
+          "balanced_accuracy": 0.661807500778089,
+          "log_loss": 1.3117115359393359
+        },
+        {
+          "catboost_weight": 0.9,
+          "equal9_weight": 0.09999999999999998,
+          "balanced_accuracy": 0.6553065670712729,
+          "log_loss": 1.3465474699911602
+        },
+        {
+          "catboost_weight": 1.0,
+          "equal9_weight": 0.0,
+          "balanced_accuracy": 0.6381107998755058,
+          "log_loss": 1.385422231642105
+        }
+      ],
+      "selected_blend": {
+        "catboost_weight": 0.5,
+        "equal9_weight": 0.5,
+        "balanced_accuracy": 0.6678338001867413,
+        "log_loss": 1.225128567833895
+      }
+    },
+    "selected_blend_weights": {
+      "catboost": 0.5,
+      "equal9": 0.5
+    },
+    "model_artifacts": {
+      "logistic_pipeline": "folds/all78/models_outer_1/logistic_pipeline.joblib",
+      "catboost": "folds/all78/models_outer_1/catboost.cbm"
+    }
+  }
+}
