@@ -217,6 +217,26 @@ datasets:
       - docs/v2.14.md
       - docs/openpool_v14_comparison.md
 
+  - id: v2.14HN
+    name: V2.14HN — OOS hard-negative weighted dataset
+    section: Training datasets
+    description: All V2.14 rows retained with per-row hardness metadata and per-label-normalized sampling weights; OOS difficulty scores come from V1.1 SVC and CatBoost only for response texts absent from their training corpus. V1.1-overlapping rows remain unscored, and V0 is not used for mining.
+    artifact: data/processed/dataset_v2.14HN.parquet
+    profile: data/processed/dataset_profile_v2.14HN.json
+    validation: External-only training data; use all 2,699 official V0 rows only for validation and checkpoint selection.
+    reports:
+      - docs/v2.14HN.md
+
+  - id: v2.14HN-resampled
+    name: V2.14HN Resampled — weighted physical rows
+    section: Training datasets
+    description: Deterministic per-label replacement resampling from V2.14HN, with rows sampled in proportion to hardness weights and each class retained at its original V2.14 count.
+    artifact: data/processed/dataset_v2.14HN-resampled.parquet
+    profile: data/processed/dataset_profile_v2.14HN-resampled.json
+    validation: Training-only weighted-resampling export; use all 2,699 official V0 rows for validation.
+    reports:
+      - docs/v2.14HN.md
+
   - id: v2.14.balanced
     name: V2.14 Balanced — quality-filtered V2.14
     section: Training datasets

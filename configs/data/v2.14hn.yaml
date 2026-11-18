@@ -1,0 +1,27 @@
+dataset_version: v2.14HN
+resampled_version: v2.14HN-resampled
+input_dataset: data/processed/dataset_v2.14.parquet
+input_profile: data/processed/dataset_profile_v2.14.json
+input_dataset_sha256: 4b9f3d1efdc28a720526f2c10a3f74df0d6ac5c7c0787a0ac59f19c4bb2e2fff
+mining_training_dataset: data/processed/dataset_v1.1.parquet
+v1_1_dataset_sha256: 72cbc9ee582bbcafa1a29f4c3e7ef36b0ea2aea6d0f734e858370d7eb7013242
+validation_dataset: data/processed/dataset_v0.parquet
+v0_dataset_sha256: 40a22ce8d88c5f46feb4637a099db815bef5f713ffe53e89dbe1b7b21de77707
+output_dataset: data/processed/dataset_v2.14HN.parquet
+output_profile: data/processed/dataset_profile_v2.14HN.json
+resampled_dataset: data/processed/dataset_v2.14HN-resampled.parquet
+resampled_profile: data/processed/dataset_profile_v2.14HN-resampled.json
+artifact_dir: artifacts/analysis/v2.14HN
+report: docs/v2.14HN.md
+seed: 2026
+batch_size: 1024
+high_confidence_threshold: 0.80
+checkpoints:
+  - name: svc_v1_1
+    family: SVC
+    manifest: artifacts/predictions/svc_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfg50e77a40_code1b9bfc2_manifest.json
+    v1_1_sha256: 72cbc9ee582bbcafa1a29f4c3e7ef36b0ea2aea6d0f734e858370d7eb7013242
+  - name: catboost_v1_1
+    family: CatBoost
+    manifest: artifacts/predictions/catboost_stylometry_v1.1_data72cbc9ee_splitb7cd72d7_seed2026_cfg587e4f91_code667e2d0_manifest.json
+    v1_1_sha256: 72cbc9ee582bbcafa1a29f4c3e7ef36b0ea2aea6d0f734e858370d7eb7013242
