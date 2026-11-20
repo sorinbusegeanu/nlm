@@ -14,7 +14,9 @@ from src.checkpoint_catalog import (
     _align_v0_predictions,
     _display_date,
     _next_sequence,
+    _reconcile_catalog,
     _sequence_id,
+    _top500_experiments,
     append_manifest,
     load_catalog,
     refresh_trust_list,
@@ -24,6 +26,66 @@ from src.checkpoint_catalog import (
 
 
 class CheckpointCatalogTests(unittest.TestCase):
+    def test_catalog_reconciliation_uses_selected_checkpoint_and_real_availability(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            best = root / "artifacts" / "runs" / "exp" / "best_checkpoint"
+            manifest_path = root / "artifacts" / "predictions" / "exp_manifest.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(json.dumps({"best_checkpoint_path": str(best)}))
+            row = {column: "" for column in CATALOG_COLUMNS}
+            row.update({"experiment_id": "exp", "checkpoint_path": "artifacts/runs/exp",
+                        "checkpoint": "exp", "checkpoint_available": True})
+            frame = pd.DataFrame([row])
+
+            reconciled = _reconcile_catalog(frame, root=root)
+            self.assertEqual(reconciled.loc[0, "checkpoint_path"],
+                             "artifacts/runs/exp/best_checkpoint")
+            self.assertEqual(reconciled.loc[0, "checkpoint"], "best_checkpoint")
+            self.assertFalse(bool(reconciled.loc[0, "checkpoint_available"]))
+
+            best.mkdir(parents=True)
+            reconciled = _reconcile_catalog(frame, root=root)
+            self.assertTrue(bool(reconciled.loc[0, "checkpoint_available"]))
+
+    def test_top500_membership_uses_experiment_id_not_reused_sequence_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rows = []
+            for number in range(500):
+                rows.append({"experiment_id": f"top-{number}", "sequence_id": f"N{number:04d}",
+                             "precision": 1.0 - number / 1000, "recall": 0.5,
+                             "target_label": f"label-{number:03d}"})
+            rows.append({"experiment_id": "catalog-only", "sequence_id": "N0001",
+                         "precision": -1.0, "recall": 0.0, "target_label": "tail"})
+            list2 = root / "docs" / "trust-list-2-v001.csv"
+            list2.parent.mkdir(parents=True)
+            pd.DataFrame([{"experiment_id": "other-checkpoint", "sequence_id": "N0001"}]).to_csv(list2, index=False)
+            (root / "docs" / "trust-list-2-latest.json").write_text(
+                json.dumps({"csv_path": "docs/trust-list-2-v001.csv"}))
+            (root / "docs" / "trust-list-2.2-latest.json").write_text(json.dumps({"csv_path": "missing.csv"}))
+
+            retained = _top500_experiments(root, pd.DataFrame(rows))
+            self.assertNotIn("catalog-only", retained)
+            self.assertIn("top-1", retained)
+
+    def test_trust_list_reuses_project_catalog_sequence_id_by_experiment(self):
+        from src.v2_checkpoint_trust import _known_checkpoint_id
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            docs = root / "docs"
+            docs.mkdir()
+            pd.DataFrame([{"experiment_id": "shared-run", "sequence_id": "N0105"}]).to_csv(
+                docs / "checkpoint_label_catalog.csv", index=False)
+            active = docs / "v2-ckpt-nov0_active.csv"
+            pd.DataFrame([{"experiment_id": "shared-run", "sequence_id": "N0105"}]).to_csv(
+                active, index=False)
+            self.assertEqual(_known_checkpoint_id("shared-run", root=root), "N0105")
+            pd.DataFrame([{"experiment_id": "other-run", "sequence_id": "N0105"}]).to_csv(
+                active, index=False)
+            with self.assertRaisesRegex(ValueError, "already assigned to another experiment"):
+                _known_checkpoint_id("shared-run", root=root)
+
     def test_versioned_trust_list_has_complete_order_and_bumps_on_source_change(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -79,7 +141,8 @@ class CheckpointCatalogTests(unittest.TestCase):
         function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                         and node.name == "render_prediction_factory")
         source = ast.get_source_segment(app_path.read_text(), function)
-        self.assertIn("checkpoint_label_trust_list.csv", source)
+        self.assertIn("render_trust_list_two(root)", source)
+        self.assertIn("render_trust_list_two_two(root)", source)
         for removed in ("read_ensemble_registry", "active_model_roster.json", "prediction_v0_", "strategy_metrics"):
             self.assertNotIn(removed, source)
 
@@ -166,7 +229,7 @@ class CheckpointCatalogTests(unittest.TestCase):
             manifest_path.write_text(json.dumps(manifest))
 
             outcome = append_manifest(manifest=manifest, manifest_path=manifest_path,
-                                      catalog_path=catalog_path, data_dir=data_dir)
+                                      catalog_path=catalog_path, data_dir=data_dir, root=root)
             self.assertEqual(outcome, {"status": "added", "sequence_id": "N0002", "labels": 18})
             catalog = load_catalog(catalog_path)
             added = catalog.loc[catalog.experiment_id.eq("new-run")]

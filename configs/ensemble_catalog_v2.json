@@ -1,0 +1,169 @@
+{
+  "version": "2.4.0",
+  "folds": 5,
+  "strategies": [
+    {
+      "id": "E01",
+      "name": "Top-10 Mean",
+      "algorithm": "top_mean",
+      "max_checkpoints": 10
+    },
+    {
+      "id": "E02",
+      "name": "Family-Champion Mean",
+      "algorithm": "family_champions",
+      "max_checkpoints": 10
+    },
+    {
+      "id": "E03",
+      "name": "Label-Coverage Blend",
+      "algorithm": "label_coverage",
+      "max_checkpoints": 10
+    },
+    {
+      "id": "E04",
+      "name": "Greedy Mean-10",
+      "algorithm": "greedy_mean",
+      "max_checkpoints": 10
+    },
+    {
+      "id": "E05",
+      "name": "Precision-First Cascade",
+      "algorithm": "top_mean_cascade",
+      "cascade": "C1",
+      "max_checkpoints": 10,
+      "min_support": 10,
+      "candidate_pool": "top_balanced_accuracy"
+    },
+    {
+      "id": "E06",
+      "name": "High-Precision Recall Cascade",
+      "algorithm": "top_mean_cascade",
+      "cascade": "C3",
+      "max_checkpoints": 10,
+      "min_support": 10,
+      "candidate_pool": "top_balanced_accuracy"
+    },
+    {
+      "id": "E07",
+      "name": "Residual F1 Cascade",
+      "algorithm": "top_mean_cascade",
+      "cascade": "C4",
+      "max_checkpoints": 10,
+      "min_support": 10,
+      "candidate_pool": "top_balanced_accuracy"
+    },
+    {
+      "id": "E08",
+      "name": "Shared-Roster Precision Blend",
+      "algorithm": "limited_label_precision_mean",
+      "max_checkpoints": 10,
+      "min_support": 10,
+      "folds": 5
+    },
+    {
+      "id": "E09",
+      "name": "Label F1 Mean-5",
+      "algorithm": "label_f1_mean",
+      "rules_per_label": 5,
+      "min_support": 10,
+      "max_checkpoints": 10,
+      "candidate_pool": "label_coverage"
+    },
+    {
+      "id": "E10",
+      "name": "Top-Two Specialist",
+      "algorithm": "top_two_specialist",
+      "max_checkpoints": 10,
+      "min_support": 10,
+      "candidate_pool": "top_balanced_accuracy"
+    },
+    {
+      "id": "E11",
+      "name": "Confusion-Aware Evidence Ensemble",
+      "algorithm": "confusion_evidence",
+      "max_checkpoints": 15,
+      "inner_folds": 3,
+      "alpha_grid": [
+        0.5,
+        1,
+        2,
+        5
+      ],
+      "gamma_grid": [
+        0,
+        0.5,
+        1,
+        2
+      ],
+      "selection": "greedy_top1_coverage",
+      "prior": "uniform"
+    },
+    {
+      "id": "E12-1",
+      "name": "Error-Aware Specialist Arbitration \u00b7 top 2 \u00b7 15 checkpoints",
+      "algorithm": "pairwise_arbitration",
+      "candidates": 2,
+      "max_checkpoints": 15,
+      "inner_folds": 3,
+      "C_grid": [
+        0.01,
+        0.1,
+        1,
+        10
+      ]
+    },
+    {
+      "id": "E12-2",
+      "name": "Error-Aware Specialist Arbitration \u00b7 top 3 \u00b7 15 checkpoints",
+      "algorithm": "pairwise_arbitration",
+      "candidates": 3,
+      "max_checkpoints": 15,
+      "inner_folds": 3,
+      "C_grid": [
+        0.01,
+        0.1,
+        1,
+        10
+      ]
+    },
+    {
+      "id": "E12-3",
+      "name": "Error-Aware Specialist Arbitration \u00b7 top 3 \u00b7 20 checkpoints",
+      "algorithm": "pairwise_arbitration",
+      "candidates": 3,
+      "max_checkpoints": 20,
+      "inner_folds": 3,
+      "C_grid": [
+        0.01,
+        0.1,
+        1,
+        10
+      ]
+    },
+    {
+      "id": "E13-A",
+      "name": "Learned Reliability Router · checkpoint",
+      "algorithm": "checkpoint_reliability_router",
+      "routing_method": "checkpoint",
+      "max_checkpoints": 15,
+      "inner_folds": 4
+    },
+    {
+      "id": "E13-B",
+      "name": "Learned Reliability Router · family max",
+      "algorithm": "checkpoint_reliability_router",
+      "routing_method": "family_max",
+      "max_checkpoints": 15,
+      "inner_folds": 4
+    },
+    {
+      "id": "E13-C",
+      "name": "Learned Reliability Router · family max · 20 checkpoints",
+      "algorithm": "checkpoint_reliability_router",
+      "routing_method": "family_max",
+      "max_checkpoints": 20,
+      "inner_folds": 4
+    }
+  ]
+}

@@ -99,6 +99,68 @@ def _atomic_csv(frame: pd.DataFrame, path: Path) -> None:
             os.unlink(temporary)
 
 
+def _selected_checkpoint_path(experiment_id: str, root: Path) -> str | None:
+    """Return an explicitly selected checkpoint path when its manifest names one."""
+    manifest_path = root / "artifacts" / "predictions" / f"{experiment_id}_manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    for key in ("best_checkpoint_path", "selected_checkpoint_path"):
+        value = manifest.get(key)
+        if value:
+            candidate = _resolve(value, root)
+            return _portable_path(str(candidate), root)
+    return None
+
+
+def _top500_experiments(root: Path, catalog: pd.DataFrame) -> set[str]:
+    """Collect checkpoint experiments present in the first 500 ranked rows.
+
+    The catalog, Trust List 2 and Trust List 2.2 have historically reused
+    sequence IDs. Match by experiment_id so unrelated checkpoints with the
+    same display ID cannot be treated as the same artifact.
+    """
+    ranked = catalog.copy()
+    for column in ("precision", "recall"):
+        ranked[column] = pd.to_numeric(ranked[column], errors="coerce")
+    ranked["_seq"] = ranked.sequence_id.astype(str).str.extract(r"N(\d+)", expand=False)
+    ranked["_seq"] = pd.to_numeric(ranked["_seq"], errors="coerce")
+    frames = [ranked.sort_values(
+        ["precision", "recall", "_seq", "target_label"],
+        ascending=[False, False, True, True], na_position="last", kind="stable").head(500)]
+    pointers = (root / "docs" / "trust-list-2-latest.json",
+                root / "docs" / "trust-list-2.2-latest.json")
+    for pointer_path in pointers:
+        try:
+            pointer = json.loads(pointer_path.read_text())
+            list_path = _resolve(pointer.get("csv_path"), root)
+            if list_path.is_file():
+                frames.append(pd.read_csv(list_path, dtype=str, keep_default_na=False).head(500))
+        except (OSError, ValueError, json.JSONDecodeError, pd.errors.EmptyDataError):
+            continue
+    return {str(value) for frame in frames if "experiment_id" in frame
+            for value in frame.experiment_id.dropna().astype(str) if value}
+
+
+def _reconcile_catalog(frame: pd.DataFrame, *, root: Path) -> pd.DataFrame:
+    """Repair best-checkpoint paths and make availability reflect local files."""
+    result = frame.copy()
+    for experiment_id, indexes in result.groupby("experiment_id", dropna=False).groups.items():
+        if not experiment_id:
+            continue
+        selected = _selected_checkpoint_path(str(experiment_id), root)
+        if selected:
+            result.loc[indexes, "checkpoint_path"] = selected
+            result.loc[indexes, "checkpoint"] = Path(selected).name
+        paths = result.loc[indexes, "checkpoint_path"].fillna("").astype(str)
+        available = paths.map(lambda value: bool(value) and _resolve(value, root).exists())
+        result.loc[indexes, "checkpoint_available"] = available.to_numpy()
+    return result
+
+
 def load_catalog(path=DEFAULT_CATALOG) -> pd.DataFrame:
     path = Path(path)
     if not path.is_file():
@@ -217,7 +279,6 @@ def _next_sequence(frame: pd.DataFrame, *, root: Path | None = None) -> int:
                if (match := re.fullmatch(r"N(\d+)", value))]
     root = Path(root or Path.cwd())
     paths = [root / "docs" / "checkpoint_label_catalog.csv",
-             root / "docs" / "v2-ckpt-nov0.csv",
              root / "docs" / "v2-ckpt-nov0_active.csv"]
     for pointer_path in (root / "docs" / "trust-list-2-latest.json",
                          root / "docs" / "trust-list-2.2-latest.json"):
@@ -237,6 +298,49 @@ def _next_sequence(frame: pd.DataFrame, *, root: Path | None = None) -> int:
             numbers.extend(int(match.group(1)) for value in ids.sequence_id.dropna().astype(str)
                            if (match := re.fullmatch(r"N(\d+)", value)))
     return max(numbers, default=0) + 1
+
+
+def _known_sequence_id(experiment_id: str, *, root: Path) -> str | None:
+    """Reuse a checkpoint's assigned N-ID when another trust list already has it."""
+    matches = set()
+    paths = [root / "docs" / "checkpoint_label_catalog.csv"]
+    for pointer_name in ("trust-list-2-latest.json", "trust-list-2.2-latest.json"):
+        try:
+            pointer = json.loads((root / "docs" / pointer_name).read_text())
+            paths.append(_resolve(pointer.get("csv_path"), root))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            frame = pd.read_csv(path, dtype=str, keep_default_na=False,
+                                usecols=lambda column: column in {"experiment_id", "sequence_id"})
+        except (OSError, ValueError, pd.errors.EmptyDataError):
+            continue
+        if {"experiment_id", "sequence_id"}.issubset(frame.columns):
+            matches.update(frame.loc[frame.experiment_id.eq(str(experiment_id)),
+                                     "sequence_id"].astype(str))
+    matches.discard("")
+    if len(matches) > 1:
+        raise ValueError(f"conflicting checkpoint sequence IDs for {experiment_id}: {sorted(matches)}")
+    if not matches:
+        return None
+    sequence_id = next(iter(matches))
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            frame = pd.read_csv(path, dtype=str, keep_default_na=False,
+                                usecols=lambda column: column in {"experiment_id", "sequence_id"})
+        except (OSError, ValueError, pd.errors.EmptyDataError):
+            continue
+        if {"experiment_id", "sequence_id"}.issubset(frame.columns):
+            owners = set(frame.loc[frame.sequence_id.eq(sequence_id), "experiment_id"].astype(str))
+            owners.discard("")
+            if owners - {str(experiment_id)}:
+                raise ValueError(f"checkpoint ID {sequence_id} is shared by {sorted(owners)}")
+    return sequence_id
 
 
 def _manifest_fields(manifest: dict, manifest_path: Path, *, sequence_id: str,
@@ -392,11 +496,13 @@ def _align_v0_predictions(frame: pd.DataFrame, validation: pd.DataFrame,
 
 
 def append_manifest(*, manifest: dict, manifest_path, catalog_path=DEFAULT_CATALOG,
-                    data_dir="data/processed") -> dict:
-    """Append 18 per-label records for a completed V1-all run with V0 predictions."""
-    dataset = str(manifest.get("training_dataset") or manifest.get("dataset") or "").lower().replace("-", "_")
-    if dataset != "v1_all":
-        return {"status": "skipped", "reason": "training dataset is not v1_all"}
+                    data_dir="data/processed", root: Path | None = None) -> dict:
+    """Append saved full-V0 model predictions on the frozen 540-row catalog split.
+
+    Full-V0 runs save 2,699 predictions, while this legacy catalog's score
+    columns are defined on the frozen 540-row subset. Select those exact IDs
+    from the saved probabilities; never reload a checkpoint or run inference.
+    """
     catalog_path, manifest_path = Path(catalog_path), Path(manifest_path)
     current = load_catalog(catalog_path)
     if current.empty:
@@ -405,13 +511,26 @@ def append_manifest(*, manifest: dict, manifest_path, catalog_path=DEFAULT_CATAL
     if experiment_id in set(current.experiment_id.astype(str)):
         return {"status": "already_recorded", "sequence_id": current.loc[current.experiment_id.eq(experiment_id), "sequence_id"].iloc[0]}
 
-    root = Path.cwd()
+    root = Path(root or Path.cwd())
+    dataset = str(manifest.get("training_dataset") or manifest.get("dataset") or "")
+    lineage = _dataset_lineage(manifest, manifest_path)
+    if re.search(r"(?<![A-Za-z0-9])v0(?![A-Za-z0-9])", f"{dataset} {lineage}", re.IGNORECASE):
+        return {"status": "skipped", "reason": "training dataset lineage includes V0"}
+    if str(manifest.get("validation_dataset") or "").lower() != "v0":
+        return {"status": "skipped", "reason": "validation dataset is not the full V0 dataset"}
+    validation_rows = int(manifest.get("validation_rows") or 0)
+    if validation_rows not in {540, 2699}:
+        return {"status": "skipped", "reason": f"expected 540 or 2699 saved V0 predictions, got {validation_rows}"}
     checkpoint_path = _resolve(manifest.get("checkpoint_path") or manifest.get("checkpoint"), root)
     prediction_path = _resolve(manifest.get("prediction_path"), root)
     if not prediction_path.is_file():
         return {"status": "skipped", "reason": f"prediction file unavailable: {prediction_path}"}
     frame = pd.read_parquet(prediction_path)
     validation, classes, split_hash = _v0_reference(Path(data_dir))
+    # Training manifests for the newer workflow save predictions for all 2,699
+    # V0 rows. The catalog continues to report its historical 540-row holdout.
+    if len(frame) == 2699 and set(validation.id.astype(str)).issubset(set(frame.id.astype(str))):
+        frame = frame.loc[frame.id.astype(str).isin(set(validation.id.astype(str)))].copy()
     ordered = _align_v0_predictions(frame, validation, experiment_id)
     probability_columns = [f"prob::{label}" for label in classes]
     if not set(probability_columns).issubset(ordered.columns):
@@ -422,7 +541,13 @@ def append_manifest(*, manifest: dict, manifest_path, catalog_path=DEFAULT_CATAL
         raise ValueError(f"{experiment_id}: saved probability matrix is invalid")
     predicted = np.asarray(classes, dtype=object)[probabilities.argmax(axis=1)]
     y_true = validation.model.to_numpy(dtype=object)
-    sequence_id = _sequence_id(_next_sequence(current, root=Path.cwd()))
+    sequence_id = (_known_sequence_id(experiment_id, root=root)
+                   or _sequence_id(_next_sequence(current, root=root)))
+    full_v0_selection = int(manifest.get("validation_rows") or 0) == 2699
+    note = ("Checkpoint selection used all 2,699 V0 rows; this catalog score is on the historical 540-row V0 holdout, which is included in that selection set."
+            if full_v0_selection else "")
+    catalog_source = ("full_v0_prediction_subset_legacy_v0_holdout"
+                      if full_v0_selection else "v1_all_training_refresh")
     new_rows = []
     for label in classes:
         pred_mask = predicted == label
@@ -436,8 +561,8 @@ def append_manifest(*, manifest: dict, manifest_path, catalog_path=DEFAULT_CATAL
             target_label=label, precision=(tp / pred_count if pred_count else np.nan),
             recall=(tp / actual_count if actual_count else np.nan), prediction_count=pred_count,
             true_positive=tp, false_positive=fp, false_negative=fn,
-            validation_training_overlap=0, evaluation_note="",
-            validation_split_sha256=split_hash)
+            validation_training_overlap=0, evaluation_note=note,
+            catalog_source=catalog_source, validation_split_sha256=split_hash)
         row["experiment_id"] = experiment_id
         row["checkpoint_path"] = _portable_path(checkpoint_path, root)
         row["checkpoint_available"] = checkpoint_path.exists()
@@ -450,7 +575,7 @@ def append_manifest(*, manifest: dict, manifest_path, catalog_path=DEFAULT_CATAL
 def refresh_catalog(*, artifact_root=DEFAULT_ARTIFACT_ROOT, data_dir="data/processed",
                     catalog_path=DEFAULT_CATALOG, since_utc=NEW_RUNS_START_UTC,
                     trust_list_path=None, trust_metadata_path=None) -> dict:
-    """Seed the historical snapshot, then append eligible newer V1-all checkpoints."""
+    """Seed the snapshot, then append eligible runs with saved V0 predictions."""
     catalog_path = Path(catalog_path)
     current = load_catalog(catalog_path)
     if current.empty:
@@ -463,8 +588,9 @@ def refresh_catalog(*, artifact_root=DEFAULT_ARTIFACT_ROOT, data_dir="data/proce
             manifest = json.loads(path.read_text())
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        dataset = str(manifest.get("training_dataset") or manifest.get("dataset") or "").lower().replace("-", "_")
-        if dataset != "v1_all":
+        if str(manifest.get("validation_dataset") or "").lower() != "v0":
+            continue
+        if int(manifest.get("validation_rows") or 0) not in {540, 2699}:
             continue
         if _timestamp(manifest, path) < since:
             continue
@@ -478,10 +604,21 @@ def refresh_catalog(*, artifact_root=DEFAULT_ARTIFACT_ROOT, data_dir="data/proce
         if result.get("status") == "added":
             additions.append({"experiment_id": manifest.get("experiment_id"), **result})
     final = load_catalog(catalog_path)
+    final = _reconcile_catalog(final, root=Path.cwd())
+    keep_experiments = _top500_experiments(Path.cwd(), final)
+    before_experiments = set(final.experiment_id.dropna().astype(str))
+    final = final[final.experiment_id.astype(str).isin(keep_experiments)].reset_index(drop=True)
+    _atomic_csv(final, catalog_path)
     trust_update = refresh_trust_list(catalog_path=catalog_path,
         trust_list_path=trust_list_path, metadata_path=trust_metadata_path)
     return {"status": "refreshed", "checkpoint_count": int(final.experiment_id.nunique()),
-            "label_rows": len(final), "added": additions, "catalog_path": str(catalog_path),
+            "label_rows": len(final), "added": additions,
+            "removed_outside_top500": sorted(before_experiments - set(final.experiment_id.dropna().astype(str))),
+            "locally_available_checkpoints": int(final.groupby("experiment_id").checkpoint_available
+                                                 .first().astype(str).str.lower().isin({"true", "1"}).sum()),
+            "missing_checkpoint_paths": int(final.groupby("experiment_id").checkpoint_available
+                                             .first().astype(str).str.lower().isin({"false", "0", ""}).sum()),
+            "catalog_path": str(catalog_path),
             "trust_list": trust_update}
 
 

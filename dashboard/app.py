@@ -1,6 +1,7 @@
 """Streamlit report for the local experiment registry and stored predictions."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import ast
@@ -54,7 +55,7 @@ def canonical_model(name):
 
 def model_display(name):
     name = canonical_model(name)
-    return {"qwen06": "qwen3-0.6B", "qwen17": "qwen3-1.7B", "qwen4": "qwen3-4.0B",
+    return {"qwen06": "qwen3-0.6B", "qwen17": "qwen3-1.7B", "qwen35_08b": "qwen3.5-0.8B", "qwen4": "qwen3-4.0B",
             "ultrabert380": "UltraBERT-380M", "phi35_mini": "Phi-3.5 Mini",
             "embeddinggemma2": "EmbeddingGemma 2",
             "granite4_350m": "Granite 4.0 350M Base",
@@ -223,6 +224,49 @@ def live_progress_details(progress_path, log_path, epoch_limit):
         eta_text = "— (stale)"
     return step_text, eta_text, live_epoch
 
+
+def effective_epoch_limit(config, progress_path):
+    """Resolve the absolute epoch target, including continuation progress.
+
+    Continuation configs store the number of additional epochs, while the
+    trainer's progress file reports absolute epochs from the source run. Prefer
+    the trainer's total-step metadata when available and never hide epochs
+    already reported by the trainer.
+    """
+    try:
+        limit = max(0, int(config.get("epochs", 0) or 0))
+    except (TypeError, ValueError):
+        limit = 0
+    if not progress_path or not Path(progress_path).is_file():
+        return limit
+    try:
+        progress = json.loads(Path(progress_path).read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return limit
+
+    epochs = progress.get("epochs", [])
+    completed = []
+    for item in epochs:
+        if not isinstance(item, dict) or item.get("epoch") is None:
+            continue
+        try:
+            completed.append(int(item["epoch"]))
+        except (TypeError, ValueError):
+            continue
+    live = progress.get("live", {})
+    if live.get("epoch") is not None:
+        try:
+            completed.append(int(live["epoch"]))
+        except (TypeError, ValueError):
+            pass
+    if live.get("total_steps") and live.get("steps_per_epoch"):
+        try:
+            total_epochs = math.ceil(int(live["total_steps"]) / int(live["steps_per_epoch"]))
+            limit = max(limit, total_epochs)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return max([limit, *completed], default=limit)
+
 def training_log_tail(log_path, *, max_lines=100, max_bytes=256_000):
     """Read only the newest bounded section of a live training console log."""
     if not log_path or not log_path.is_file():
@@ -251,7 +295,7 @@ def live_training_banner():
         epoch_text = f" after epoch {epoch}" if epoch is not None else ""
         st.info(f"Training finished{epoch_text}; post-training pipeline work is still running for {title} · {model_display(live['model'])}.")
         return
-    epoch_limit = int(config.get("epochs", 0) or 0)
+    epoch_limit = effective_epoch_limit(config, live.get("progress_path"))
     completed_epochs = 0
     progress_path = live.get("progress_path")
     if progress_path and progress_path.is_file():
@@ -388,7 +432,16 @@ def render_current_training():
                       "v1_all": "V1-all", "v1.3": "V1.3", "v1.5": "V1.5",
                       "v2.0": "V2.0", "v2.1": "V2.1"}
     st.markdown(f"**Training dataset:** {dataset_labels.get(str(dataset_id).lower(), dataset_id)} (`{dataset_id}`)")
-    st.markdown(f"**Epochs:** {config.get('epochs', '—')}")
+    configured_epochs = config.get("epochs", "—")
+    total_epochs = effective_epoch_limit(config, live_training.get("progress_path"))
+    try:
+        configured_epoch_count = int(configured_epochs or 0)
+    except (TypeError, ValueError):
+        configured_epoch_count = 0
+    if str(live_training.get("action", "")).startswith("continue-") and total_epochs > configured_epoch_count:
+        st.markdown(f"**Epochs:** {configured_epochs} additional · {total_epochs} total including source run")
+    else:
+        st.markdown(f"**Epochs:** {total_epochs or configured_epochs}")
     recent_log = training_log_tail(live_training.get("console_log_path") or live_training.get("log_path"))
     with st.expander("Recent training log", expanded=False):
         if recent_log:
@@ -477,7 +530,7 @@ def render_current_training():
         st.dataframe(params_frame, use_container_width=True, hide_index=True)
     else:
         st.caption("No training parameters are available.")
-    epoch_count = int(config.get("epochs", 0) or 0)
+    epoch_count = total_epochs
     learning_rate = config.get("learning_rate")
     decay = float(config.get("learning_rate_decay", 1.0) or 1.0)
     progress_path = live_training.get("progress_path")
@@ -491,24 +544,36 @@ def render_current_training():
             baseline = {}
     if baseline:
         epoch_rows.append({"Epoch": "Baseline", "Learning rate": None,
-                           "Accuracy": baseline.get("accuracy"), "Train error": None,
+                           "Accuracy": baseline.get("accuracy"),
+                           "Accuracy change vs baseline (pp)": None, "Train error": None,
                            "Validation loss (raw)": baseline.get("validation_loss_raw",
                                                                   baseline.get("validation_loss"))})
     for epoch in range(1, epoch_count + 1):
         item = history_by_epoch.get(epoch, {})
+        accuracy = item.get("accuracy", item.get("eval_accuracy"))
+        baseline_accuracy = baseline.get("accuracy")
+        try:
+            accuracy_change = (100.0 * (float(accuracy) - float(baseline_accuracy))
+                               if accuracy is not None and baseline_accuracy is not None else None)
+        except (TypeError, ValueError):
+            accuracy_change = None
         epoch_rows.append({
             "Epoch": epoch,
             "Learning rate": item.get("learning_rate", float(learning_rate) * decay ** (epoch - 1)
                                        if learning_rate is not None else None),
-            "Accuracy": item.get("accuracy", item.get("eval_accuracy")),
+            "Accuracy": accuracy,
+            "Accuracy change vs baseline (pp)": accuracy_change,
             "Train error": item.get("train_loss", item.get("loss")),
             "Validation loss (raw)": item.get("validation_loss_raw",
                                                item.get("validation_loss", item.get("eval_loss"))),
         })
     st.markdown("**Epochs**")
-    st.dataframe(pd.DataFrame(epoch_rows, columns=["Epoch", "Learning rate", "Accuracy", "Train error",
+    st.dataframe(pd.DataFrame(epoch_rows, columns=["Epoch", "Learning rate", "Accuracy",
+                 "Accuracy change vs baseline (pp)", "Train error",
                  "Validation loss (raw)"]),
                  use_container_width=True, hide_index=True)
+    if baseline:
+        st.caption("Baseline accuracy is measured before the first optimizer step. Accuracy can stay unchanged while validation loss improves if no example changes its top-1 label.")
 
 def render_trust_list_table(trust_path, metadata, *, empty_message, caption):
     trust = pd.read_csv(trust_path)
@@ -581,6 +646,94 @@ def render_prediction_factory():
     render_trust_list_two(root)
     render_trust_list_two_two(root)
 
+
+def render_ensemble_catalog(root):
+    from src.ensemble_catalog import CATALOG
+
+    try:
+        catalog_bytes = CATALOG.read_bytes()
+        catalog = json.loads(catalog_bytes)
+    except (OSError, ValueError) as exc:
+        st.error(f"Could not load the ensemble catalog: {exc}")
+        return
+
+    entries = {entry["id"]: entry for entry in catalog["strategies"]}
+    catalog_hash = hashlib.sha256(catalog_bytes).hexdigest()
+    latest_scores = {}
+    results_root = root / "artifacts/analysis/ensemble_catalog"
+    manifest_paths = list(results_root.glob("*/results.json"))
+    manifest_paths.extend((root / "artifacts/analysis/e13").glob("*/catalog_results.json"))
+    for manifest in sorted(manifest_paths, key=lambda path: path.parent.name, reverse=True):
+        try:
+            run = json.loads(manifest.read_text())
+        except (OSError, ValueError):
+            continue
+        if run.get("catalog_sha256") != catalog_hash:
+            continue
+        for result in run.get("results", []):
+            code = result.get("ensemble")
+            if code in entries:
+                latest_scores.setdefault(code, (result, run["trust_list"]["version"], manifest.parent.name))
+        if len(latest_scores) == len(entries):
+            break
+
+    rows = []
+    for code, entry in entries.items():
+        result, trust_version, _ = latest_scores.get(code, ({}, None, None))
+        deployment = result.get("deployment")
+        rows.append({
+            "Code": code, "Ensemble": entry["name"],
+            "Accuracy": result.get("accuracy"), "Balanced accuracy": result.get("balanced_accuracy"),
+            "Trust List 2": trust_version,
+            "Checkpoints used": (len(deployment["checkpoint_ids"]) if deployment else
+                                 len(result.get("checkpoint_ids", [])) or None),
+            "Status": result.get("status", "Awaiting score").replace("_", " ").capitalize(),
+        })
+
+    st.subheader("Ensemble catalog")
+    st.caption(f"Version {catalog['version']}. Saved scores use held-out V0 prompt groups.")
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True,
+                 column_config={
+                     "Accuracy": st.column_config.NumberColumn(format="percent"),
+                     "Balanced accuracy": st.column_config.NumberColumn(format="percent"),
+                     "Checkpoints used": st.column_config.NumberColumn(),
+                 })
+    selected = st.selectbox("Ensemble", list(entries),
+                            format_func=lambda code: f"{code} — {entries[code]['name']}",
+                            key="ensemble_catalog_strategy")
+    result, trust_version, timestamp = latest_scores.get(selected, ({}, None, None))
+    if timestamp:
+        st.caption(f"Scored with {trust_version} · Run {timestamp}")
+    if result.get("reason"):
+        st.warning(result["reason"])
+    if deployment := result.get("deployment"):
+        st.markdown("**Deployment roster**")
+        st.write(", ".join(deployment["checkpoint_ids"]))
+    elif checkpoint_ids := result.get("checkpoint_ids"):
+        st.markdown("**Checkpoints selected across held-out folds**")
+        st.write(", ".join(checkpoint_ids))
+    if "oracle_accuracy" in result:
+        st.metric("Held-out top-1 oracle coverage", f"{result['oracle_accuracy']:.2%}")
+        st.caption("Share of held-out rows where at least one selected checkpoint predicted the true label.")
+    if "candidate_coverage" in result:
+        coverage, arbitration = st.columns(2)
+        coverage.metric("Candidate coverage", f"{result['candidate_coverage']:.2%}")
+        if result.get("arbitration_accuracy_given_covered") is not None:
+            arbitration.metric("Accuracy when candidate is covered", f"{result['arbitration_accuracy_given_covered']:.2%}")
+    if comparison := result.get("comparison_vs_E08"):
+        corrected, lost = st.columns(2)
+        corrected.metric("Corrected vs E08", comparison["corrected"])
+        lost.metric("Lost vs E08", comparison["lost"])
+    if per_label := result.get("per_label"):
+        with st.expander("Per-label held-out results"):
+            st.dataframe(pd.DataFrame.from_dict(per_label, orient="index"), width="stretch",
+                         column_config={
+                             "precision": st.column_config.NumberColumn(format="percent"),
+                             "recall": st.column_config.NumberColumn(format="percent"),
+                         })
+    with st.expander("Selection configuration"):
+        st.json({key: value for key, value in entries[selected].items() if key not in {"id", "name"}})
+
 columns = st.columns(4)
 columns[0].metric("Experiments", len(records))
 columns[1].metric("Models", int(frame.Model.nunique()))
@@ -591,7 +744,7 @@ rows_value = v2_best_validation.get("validation_rows") if v2_best_validation els
 columns[3].metric("Validation rows", int(rows_value) if rows_value is not None and not pd.isna(rows_value) else "—",
                   help="Validation row count from the selected best V2 training run.")
 
-tabs = st.tabs(["Overview", "Experiments", "Prediction factory", "Current training", "Models", "Errors", "Compute", "Data"])
+tabs = st.tabs(["Overview", "Experiments", "Prediction factory", "Current training", "Models", "Errors", "Compute", "Data", "Ensemble catalog"])
 with tabs[0]:
     st.subheader("Experiment comparison")
     st.dataframe(frame, use_container_width=True, hide_index=True)
@@ -601,7 +754,7 @@ with tabs[0]:
     st.download_button("Download experiment table (JSON)", frame.to_json(orient="records", indent=2), "experiments.json", "application/json")
 with tabs[1]:
     experiments = pd.DataFrame([{
-        "ID": 1,
+        "ID": "Analysis 01",
         "Name": "zod_04",
         "Description": (
             "Existing V1-all → V0 best UltraBERT checkpoint; extracts and caches all 24 "
@@ -609,11 +762,47 @@ with tabs[1]:
             "ranks layers using five-fold prompt-grouped CV, and fits 28 final classifiers: "
             "24 individual layers and four multi-layer combinations."
         ),
+        "Training dataset": "—", "Validation": "—", "Accuracy": "—",
+        "Balanced accuracy": "—", "Baseline balanced accuracy": "—", "Change": "—",
         "Report": "?experiment_report=zod_04",
     }])
     st.dataframe(experiments, use_container_width=True, hide_index=True,
         column_config={"Report": st.column_config.LinkColumn(
             "Report", display_text="docs/zod_04.md")})
+
+    hn_experiments = []
+    for row in records:
+        manifest = manifest_for(row)
+        dataset_name = str(manifest.get("training_dataset") or manifest.get("dataset") or "")
+        if dataset_name.lower() != "v2.14hn" or row.get("split") != "validation":
+            continue
+        values = metrics(row)
+        baseline = manifest.get("baseline_validation_metrics") or {}
+        accuracy = manifest.get("selected_validation_accuracy", values.get("accuracy"))
+        balanced_accuracy = manifest.get("selected_validation_balanced_accuracy")
+        if balanced_accuracy is None:
+            balanced_accuracy = values.get("balanced_accuracy")
+        baseline_balanced = baseline.get("balanced_accuracy")
+        change = (100.0 * (float(balanced_accuracy) - float(baseline_balanced))
+                  if balanced_accuracy is not None and baseline_balanced is not None else None)
+        hn_experiments.append({
+            "ID": f"{int(row.get('sequence_number') or 0):04d}",
+            "Name": row.get("description") or row.get("experiment_id"),
+            "Model": model_display(row.get("model", "")),
+            "Training dataset": dataset_name,
+            "Validation": f"{manifest.get('validation_dataset', 'v0')} ({int(manifest.get('validation_rows') or values.get('validation_rows') or 0):,} rows)",
+            "Epochs": int(manifest.get("selected_epoch") or manifest.get("best_epoch") or 0),
+            "Accuracy": f"{100.0 * float(accuracy):.2f}%" if accuracy is not None else "—",
+            "Balanced accuracy": f"{100.0 * float(balanced_accuracy):.2f}%" if balanced_accuracy is not None else "—",
+            "Baseline balanced accuracy": f"{100.0 * float(baseline_balanced):.2f}%" if baseline_balanced is not None else "—",
+            "Change": f"{change:+.2f} pp" if change is not None else "—",
+            "Checkpoint": Path(str(manifest.get("best_checkpoint_path") or manifest.get("checkpoint_path") or "—")).name,
+        })
+    st.subheader("V2.14HN training experiments")
+    if hn_experiments:
+        st.dataframe(pd.DataFrame(hn_experiments), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No V2.14HN training experiments are registered yet.")
 
 with tabs[2]:
     render_prediction_factory()
@@ -629,22 +818,23 @@ with tabs[4]:
         if row.get("split") != "validation" or "ensemble" in model.lower() or "+" in model:
             continue
         run_manifest = manifest_for(row)
-        # For checkpoint-selected runs, the manifest records the best epoch's
-        # validation score. Prefer it when choosing the displayed model maximum;
-        # stale registry scores from older prediction-order bugs can otherwise
-        # hide the selected checkpoint's actual validation result.
-        accuracy = run_manifest.get("selected_validation_accuracy")
-        if accuracy is None:
+        # This column and checkpoint comparison are balanced-accuracy based.
+        # Prefer the selected balanced score, then balanced epoch history, then
+        # historical registry metrics; use ordinary accuracy only for legacy
+        # artifacts that recorded no balanced metric.
+        score = run_manifest.get("selected_validation_balanced_accuracy")
+        if score is None:
             history = run_manifest.get("validation_metrics_by_epoch", [])
-            history_scores = [item.get("eval_balanced_accuracy", item.get("eval_accuracy"))
-                              for item in history]
+            history_scores = [item.get("eval_balanced_accuracy") for item in history]
             history_scores = [float(value) for value in history_scores if value is not None]
-            accuracy = max(history_scores) if history_scores else metrics(row).get("balanced_accuracy")
-        if accuracy is None or pd.isna(accuracy):
+            score = max(history_scores) if history_scores else metrics(row).get("balanced_accuracy")
+        if score is None:
+            score = run_manifest.get("selected_validation_accuracy", metrics(row).get("accuracy"))
+        if score is None or pd.isna(score):
             continue
         # records are newest first, so ties keep the most recent run.
-        if model not in best_runs or float(accuracy) > best_runs[model]["accuracy"]:
-            best_runs[model] = {"row": row, "accuracy": float(accuracy)}
+        if model not in best_runs or float(score) > best_runs[model]["accuracy"]:
+            best_runs[model] = {"row": row, "accuracy": float(score)}
 
     model_rows = []
     for model, best in best_runs.items():
@@ -663,7 +853,7 @@ with tabs[4]:
             selected_history = max(history, key=epoch_accuracy)
         model_rows.append({
             "Model": model_display(model),
-            "Best accuracy (balanced)": best["accuracy"],
+            "Best balanced accuracy": best["accuracy"],
             "Train loss": selected_history.get("train_loss") if selected_history else None,
             "Validation loss (raw)": manifest.get("validation_loss_raw",
                 validation_metrics.get("validation_loss_raw",
@@ -764,17 +954,38 @@ with tabs[6]:
                           f"boosting iteration {selected_iteration}" if selected_iteration is not None else
                           "selected checkpoint")
                 st.caption(f"Selected by highest validation balanced accuracy: {picked} · balanced accuracy {float(selected_balanced_accuracy):.4f}")
-            history_frame = pd.DataFrame([{"Epoch": item.get("epoch"),
-                "Accuracy": item.get("eval_accuracy"), "Balanced accuracy": item.get("eval_balanced_accuracy"),
-                "Validation loss (raw)": item.get("validation_loss_raw", item.get("eval_loss"))}
-                for item in history])
+            run_manifest = manifest_for(chosen_run)
+            baseline = run_manifest.get("baseline_validation_metrics") or {}
+            history_rows = []
+            if baseline:
+                history_rows.append({"Epoch": "Baseline (pre-training)",
+                    "Accuracy": baseline.get("accuracy"),
+                    "Balanced accuracy": baseline.get("balanced_accuracy"),
+                    "Accuracy change vs baseline (pp)": None,
+                    "Validation loss (raw)": baseline.get("validation_loss_raw",
+                                                           baseline.get("validation_loss"))})
+            for item in history:
+                accuracy = item.get("eval_accuracy")
+                try:
+                    accuracy_change = (100.0 * (float(accuracy) - float(baseline["accuracy"]))
+                                       if accuracy is not None and baseline.get("accuracy") is not None else None)
+                except (TypeError, ValueError):
+                    accuracy_change = None
+                history_rows.append({"Epoch": item.get("epoch"),
+                    "Accuracy": accuracy, "Balanced accuracy": item.get("eval_balanced_accuracy"),
+                    "Accuracy change vs baseline (pp)": accuracy_change,
+                    "Validation loss (raw)": item.get("validation_loss_raw", item.get("eval_loss"))})
+            history_frame = pd.DataFrame(history_rows)
             if not history_frame.empty:
-                for column in ("Epoch", "Accuracy", "Balanced accuracy", "Validation loss (raw)"):
+                for column in ("Accuracy", "Balanced accuracy", "Accuracy change vs baseline (pp)",
+                               "Validation loss (raw)"):
                     history_frame[column] = pd.to_numeric(history_frame[column], errors="coerce")
+                epoch_numbers = pd.to_numeric(history_frame["Epoch"], errors="coerce")
                 if selected_epoch is not None:
-                    history_frame["Selected"] = history_frame["Epoch"].round().eq(int(selected_epoch))
+                    history_frame["Selected"] = epoch_numbers.round().eq(int(selected_epoch))
                 st.dataframe(history_frame, use_container_width=True, hide_index=True)
-                st.plotly_chart(px.line(history_frame, x="Epoch", y="Accuracy", markers=True), use_container_width=True)
+                st.plotly_chart(px.line(history_frame.loc[epoch_numbers.notna()],
+                                        x="Epoch", y="Accuracy", markers=True), use_container_width=True)
 
 with tabs[7]:
     try:
@@ -824,3 +1035,7 @@ with tabs[7]:
             if reports:
                 report_links = [f"[{Path(report).name}](../{report})" for report in reports]
                 st.markdown("Reports: " + " · ".join(report_links))
+
+
+with tabs[8]:
+    render_ensemble_catalog(PROJECT_ROOT)

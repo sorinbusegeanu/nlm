@@ -91,8 +91,8 @@ All predictions must use the **same stable class order** and row IDs. Store raw 
 |---|---|---|---|
 | Character + word TF-IDF + LinearSVC | CPU supervised classification | C=0.5, balanced class weights; calibrate using training-only data | CPU |
 | CatBoost + stylometry | CPU multiclass classification over handcrafted row-local style statistics | 800 trees, depth 7, balanced class weights; train-only temperature calibration | CPU |
-| UltraBERT-380M (`dmis-lab/UltraBERT-380M`) | Fine-tune 18-class encoder head | 384 tokens, 3 epochs, LR 8e-6, batch 8, gradient accumulation 2, BF16/FP16 as supported | RTX 5070 Ti 16 GB |
-| Configurable causal LM (default `Qwen/Qwen3-0.6B`) | LoRA + 18-class readout | 384 tokens, 3 epochs, LoRA rank 16 / alpha 32 / LR 1e-4, batch 4–8; target modules configured per architecture | RTX 5070 Ti 16 GB |
+| UltraBERT-380M (`dmis-lab/UltraBERT-380M`) | Fine-tune 18-class encoder head | 384 tokens, 10 epochs, LR 8e-6, batch 8, gradient accumulation 2, BF16/FP16 as supported | RTX 5070 Ti 16 GB |
+| Configurable causal LM (default `Qwen/Qwen3-0.6B`) | LoRA + 18-class readout | 384 tokens, 10 epochs, LoRA rank 16 / alpha 32 / LR 1e-4, batch 4–8; target modules configured per architecture | RTX 5070 Ti 16 GB |
 
 Settings are *initial hypotheses*, not optimized values. UltraBERT-380M is the selected encoder; its model card shows an 8e-6 classification learning rate for the 380M variant. This environment keeps Transformers below 5.20 for vLLM compatibility, so load UltraBERT's custom implementation through `trust_remote_code=True` and a pinned Hugging Face revision. For Qwen, select a deterministic pooling/readout method (e.g. masked mean of specified hidden layers) and log it; early/middle-layer truncation is a **later ablation**, not assumed superior.
 

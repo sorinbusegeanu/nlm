@@ -55,6 +55,13 @@ def create_trust_list_2_2(*, root: str | Path = ".") -> dict:
         raise ValueError("each included checkpoint must have a row for all 18 target labels")
 
     latest_22 = latest_trust_list_2_2_paths(root)
+    source_hash = hashlib.sha256(source_csv.read_bytes()).hexdigest()
+    if latest_22 is not None and latest_22[2].get("parent_csv_sha256") == source_hash:
+        # Training finalization may run after every experiment. Avoid creating
+        # a new immutable 2.2 version when Trust List 2 itself did not change.
+        unchanged = dict(latest_22[2])
+        unchanged["status"] = "unchanged"
+        return unchanged
     if latest_22 is None:
         next_number = 1
     else:
@@ -77,7 +84,6 @@ def create_trust_list_2_2(*, root: str | Path = ".") -> dict:
             "checkpoint_label_rows": int(len(rows)),
             "rule_eligible_rows": int(rows.rule_eligible.astype(str).str.lower().isin({"true", "1"}).sum()),
         }
-    source_hash = hashlib.sha256(source_csv.read_bytes()).hexdigest()
     metadata = {
         "version": version,
         "trust_list_release": "2.2",

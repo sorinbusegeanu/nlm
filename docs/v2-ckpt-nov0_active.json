@@ -1,7 +1,6 @@
 {
   "version": "trust-v2",
   "generated_at_utc": "2026-11-11T05:28:53+00:00",
-  "source_roster": "docs/v2-ckpt-nov0.csv",
   "initial_runs": [
     "ultrabert380_v2.0_valv0_datad12bb8be_split870e47f9_seed2026_cfgfe74ea98_codeab9f6d2",
     "ultrabert380_v2.1_valv0_datac59bc6ca_split6330072d_seed2026_cfgaf9f028b_codeab9f6d2"

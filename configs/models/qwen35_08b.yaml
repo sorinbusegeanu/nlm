@@ -1,0 +1,44 @@
+model: qwen35_08b
+checkpoint: Qwen/Qwen3.5-0.8B-Base
+revision: dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68
+training_mode: lora
+quantization: none
+epochs: 10
+early_stopping_patience: 2
+checkpoint_selection: highest_validation_balanced_accuracy
+checkpoint_selection_metric: balanced_accuracy
+checkpoint_selection_version: 2
+batch_size: 4
+inference_batch_size: 8
+auto_batch_size: true
+max_batch_size: 1024
+batch_probe_safety_fraction: 0.95
+gradient_accumulation_steps: 1
+learning_rate: 5.0e-05
+optimizer: adamw_torch
+weight_decay: 0.0
+lr_scheduler_type: linear
+warmup_ratio: 0.02
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - in_proj_qkv
+  - in_proj_z
+  - in_proj_b
+  - in_proj_a
+  - out_proj
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+text_only_backbone: true
+use_chat_template: true
+chat_template_user_prompt: Identify the source model for the assistant response.
+attention_backend: sdpa
+gradient_checkpointing: false
+local_files_only: true
+trust_remote_code: false

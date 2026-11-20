@@ -1,0 +1,9 @@
+dataset_id: granite4_350m_v214_openpool16_v0w10
+preferred_component_for_duplicates: v0
+components:
+  - dataset_id: v2.14
+    weight: 1
+  - dataset_id: v2.16_openpool16_increment
+    weight: 1
+  - dataset_id: v0
+    weight: 10

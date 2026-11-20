@@ -7,7 +7,7 @@ training_mode: lora
 text_only_backbone: true
 fix_mistral_regex: true
 readout_hidden_size: 4096
-epochs: 20
+epochs: 10
 early_stopping_patience: 2
 quantization: qlora4
 attention_backend: sdpa

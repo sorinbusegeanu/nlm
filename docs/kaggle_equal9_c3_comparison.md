@@ -41,12 +41,12 @@ These are V0 development metrics, not Kaggle leaderboard scores. The cross-fit d
 | Variant | Kernel and version | Submission ID | Public score | Difference vs EQUAL9 | Status |
 |---|---|---:|---:|---:|---|
 | EQUAL9 | `zodrak/equal9-v025-baseline`, v4 | 58444305 | Pending | Pending | Pending |
-| EQUAL9 + C3 | `zodrak/equal9-v025-plus-c3-cascade`, v2 | Pending | Pending | Pending | Not submitted yet |
+| EQUAL9 + C3 | `zodrak/equal9-v025-plus-c3-cascade`, v2 | 58445093 | Pending | Pending | Pending |
 
-Both variants were generated from the competition test rows in the same order: `00353fb1c541`, `005f5a9a6139`, `0062a53d5487`. The schema is exactly `id,model`, with three unique IDs and valid competition labels. The two variants happen to predict the same label for each of these three test rows.
+Both variants were generated from the competition test rows in the same order: `00353fb1c541`, `005f5a9a6139`, `0062a53d5487`. The schema is exactly `id,model`, with three unique IDs and valid competition labels. Both submissions have the same SHA-256 (`0cc980a510ebb3513dbeb259ca79dd818cd412b119c547ca40a2da13409feaaa`) and therefore predict the same label for all three test rows. Their leaderboard scores should match, pending Kaggle scoring confirmation.
 
 ## Checkpoint resolution and artifacts
 
 Checkpoint IDs and experiment identities were resolved against `docs/trust-list-2-v025.csv` (SHA-256 `c93ae4cc0612ed36b7c126d6d50a5b50456ecfafd4e835369272076442e8cf9b`). The N0105 inference files were packaged from its selected checkpoint and the packaged manifest records the source run and file hashes.
 
-Kaggle outputs are saved under `artifacts/kaggle/equal9-v025-kernel/output-v4/` and `artifacts/kaggle/equal9-c3-v025-kernel/`.
+Kaggle outputs are saved under `artifacts/kaggle/equal9-v025-kernel/output-v4/` and `artifacts/kaggle/equal9-c3-v025-kernel/output-v2/`. The two public scores remain pending as of the latest status refresh.

@@ -12,6 +12,8 @@ import gc
 import shutil
 import types
 from collections import deque
+from collections.abc import Mapping
+from numbers import Real
 from functools import wraps
 from contextlib import nullcontext
 from pathlib import Path
@@ -67,6 +69,147 @@ def _selected_epoch_scores(epoch_predictions, selected_epoch, expected_shape):
             return scores
         return None
     return None
+
+
+def _resume_sampler_epoch(checkpoint):
+    """Infer the next replacement-sampling epoch from a Trainer checkpoint."""
+    if not checkpoint:
+        return 0
+    state_path = Path(checkpoint) / "trainer_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        return max(0, int(math.floor(float(state.get("epoch") or 0) + 1e-9)))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
+
+
+def _make_epoch_weighted_sampler(weights, *, seed, initial_epoch=0, labels=None, components=None):
+    """Build deterministic per-epoch WeightedRandomSampler for neural training."""
+    import torch
+    from torch.utils.data import WeightedRandomSampler
+
+    values = np.asarray(weights, dtype=np.float64)
+    if values.ndim != 1 or not len(values):
+        raise ValueError("weighted sampling requires one sampling_weight per training row")
+    if not np.isfinite(values).all() or np.any(values <= 0):
+        raise ValueError("sampling_weight values must be finite and strictly positive")
+    if labels is not None and len(labels) != len(values):
+        raise ValueError("sampling labels must align with sampling weights")
+    if components is not None and len(components) != len(values):
+        raise ValueError("sampling components must align with sampling weights")
+
+    class EpochWeightedRandomSampler(WeightedRandomSampler):
+        def __init__(self):
+            super().__init__(torch.as_tensor(values, dtype=torch.double), num_samples=len(values),
+                             replacement=True, generator=torch.Generator())
+            self.seed = int(seed)
+            self.next_epoch = max(0, int(initial_epoch))
+            self.labels = list(map(str, labels)) if labels is not None else None
+            self.components = list(map(str, components)) if components is not None else None
+            self.epoch_records = []
+
+        def __iter__(self):
+            epoch = self.next_epoch
+            self.next_epoch += 1
+            generator = torch.Generator()
+            generator.manual_seed((self.seed + epoch) % (2**63 - 1))
+            self.generator = generator
+            sampled = list(super().__iter__())
+            counts = {}
+            if self.labels is not None:
+                for index in sampled:
+                    label = self.labels[int(index)]
+                    counts[label] = counts.get(label, 0) + 1
+            component_counts = {}
+            if self.components is not None:
+                for index in sampled:
+                    component = self.components[int(index)]
+                    component_counts[component] = component_counts.get(component, 0) + 1
+            record = {"epoch": epoch + 1, "seed": self.seed + epoch,
+                      "sampled_examples": len(sampled), "sampled_rows_by_class": counts}
+            if self.components is not None:
+                record["sampled_rows_by_component"] = component_counts
+            self.epoch_records.append(record)
+            return iter(sampled)
+
+    return EpochWeightedRandomSampler()
+
+
+def normalize_class_weights(class_weights, classes):
+    """Return a validated label->weight mapping in the requested class order."""
+    if class_weights is None:
+        return None
+    if not isinstance(class_weights, Mapping):
+        raise ValueError("class_weights must be a mapping from label to positive numeric weight")
+    if not class_weights:
+        return None
+    unknown = set(class_weights).difference(classes)
+    if unknown:
+        raise ValueError(f"class_weights contains unknown labels: {sorted(map(str, unknown))}")
+    limits = np.finfo(np.float32)
+    minimum, maximum = float(limits.smallest_subnormal), float(limits.max)
+    for value in class_weights.values():
+        if (isinstance(value, bool) or not isinstance(value, Real)
+                or not minimum <= value <= maximum):
+            raise ValueError("class_weights values must be positive finite float32 weights")
+    return {label: float(class_weights.get(label, 1.0)) for label in classes}
+
+
+def classification_loss_with_optional_weights(logits, labels, class_weight_tensor, *, training):
+    """Compute classification loss on the logits device with float32 weighted CE."""
+    import torch.nn.functional as functional
+    labels = labels.to(logits.device)
+    if training and class_weight_tensor is not None:
+        return functional.cross_entropy(logits.float(), labels, weight=class_weight_tensor.to(logits.device))
+    return functional.cross_entropy(logits, labels)
+
+
+def _rebase_resumed_scheduler_lr(optimizer, scheduler, learning_rate):
+    """Set the next resumed LR while preserving optimizer and scheduler progress."""
+    if scheduler is None or not getattr(scheduler, "lr_lambdas", None):
+        raise ValueError("cannot rebase resumed learning rate without a restorable scheduler")
+    next_step = int(getattr(scheduler, "last_epoch", 0)) + 1
+    factors = [float(schedule(next_step)) for schedule in scheduler.lr_lambdas]
+    if len(factors) != len(optimizer.param_groups) or any(
+            not math.isfinite(value) or value <= 0 for value in factors):
+        raise ValueError("resumed scheduler has invalid factors at the next optimizer step")
+    target = float(learning_rate)
+    base_lrs = [target / factor for factor in factors]
+    scheduler.base_lrs = list(base_lrs)
+    for group, base_lr in zip(optimizer.param_groups, base_lrs):
+        group["initial_lr"] = base_lr
+        group["lr"] = target
+    if hasattr(scheduler, "_last_lr"):
+        scheduler._last_lr = [target] * len(base_lrs)
+    return {"resumed_global_scheduler_step": int(getattr(scheduler, "last_epoch", 0)),
+            "next_step_learning_rate": target, "rebased_scheduler_base_lrs": base_lrs}
+
+
+def _class_weighted_trainer(base, label_map, class_weights):
+    if class_weights is None:
+        return base
+
+    import torch
+    ordered_labels = sorted(label_map, key=label_map.__getitem__)
+    weights = torch.tensor([class_weights[label] for label in ordered_labels], dtype=torch.float32)
+
+    class ClassWeightedTrainer(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Weighted CE returns a minibatch mean. Let Trainer scale it for accumulation.
+            self.model_accepts_loss_kwargs = False
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            if not model.training:
+                return super().compute_loss(model, inputs, return_outputs=return_outputs,
+                                            num_items_in_batch=num_items_in_batch)
+            model_inputs = dict(inputs)
+            labels = model_inputs.pop("labels")
+            outputs = model(**model_inputs)
+            loss = classification_loss_with_optional_weights(outputs.logits, labels, weights, training=True)
+            return (loss, outputs) if return_outputs else loss
+
+    return ClassWeightedTrainer
 
 
 def _snapshot_state_dict_cpu(model):
@@ -916,7 +1059,8 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
                                trust_remote_code=False, fix_mistral_regex=False,
                                local_files_only=True, batch_size=256,
                                code_revision=None, cap_at_context_window=False,
-                               max_length_cap=None):
+                               max_length_cap=None, use_chat_template=False,
+                               chat_template_user_prompt="Identify the source model for the assistant response."):
     """Select the observed maximum token length, optionally capped by model context."""
     _force_huggingface_offline()
     _, tr = _require_neural()
@@ -956,14 +1100,24 @@ def calculate_max_token_length(model_name, texts, *, checkpoint, revision=None,
     context_window = min(context_limits)
 
     prefix = (EMBEDDINGGEMMA2_TASK_PREFIX if use_processor and model_name == "embeddinggemma2"
-              else "" if use_processor else str(task_prefix or ""))
-    all_texts = [prefix + str(text) for text in texts]
+              else "" if use_processor or use_chat_template else str(task_prefix or ""))
+    if use_chat_template:
+        if not callable(getattr(tokenizer, "apply_chat_template", None)) or not getattr(tokenizer, "chat_template", None):
+            raise ValueError(f"{model_name} requested chat-template formatting but its tokenizer has no chat template")
+        all_texts = [tokenizer.apply_chat_template(
+            [{"role": "user", "content": str(chat_template_user_prompt)},
+             {"role": "assistant", "content": str(text)}],
+            tokenize=False, add_generation_prompt=False) for text in texts]
+    else:
+        all_texts = [prefix + str(text) for text in texts]
     cache_payload = json.dumps({"model": model_name, "checkpoint": str(checkpoint),
         "revision": revision, "prefix": prefix, "processor": bool(use_processor),
         "trust_remote_code": bool(trust_remote_code), "fix_mistral_regex": bool(fix_mistral_regex),
         "code_revision": code_revision,
         "cap_at_context_window": bool(cap_at_context_window),
         "max_length_cap": int(max_length_cap) if max_length_cap is not None else None,
+        "use_chat_template": bool(use_chat_template),
+        "chat_template_user_prompt": str(chat_template_user_prompt) if use_chat_template else None,
         "texts_sha256": hashlib.sha256("\0".join(all_texts).encode("utf-8")).hexdigest(),
         "rows": len(all_texts)}, sort_keys=True)
     cache_key = hashlib.sha256(cache_payload.encode()).hexdigest()
@@ -1634,7 +1788,7 @@ def _epoch_decay_lambda(*, decay, steps_per_epoch, warmup_steps=0):
 
 @_with_cuda_oom_recovery
 def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpoint, revision, output_dir,
-                       epochs=20, batch_size=16, inference_batch_size=None, max_length=384, learning_rate=2e-5, seed=2026,
+                       epochs=10, batch_size=16, inference_batch_size=None, max_length=384, learning_rate=2e-5, seed=2026,
                        gradient_accumulation_steps=1, target_effective_batch_size=None,
                        local_files_only=True, validation_labels=None,
                        resume_checkpoint=None, learning_rate_decay=None,
@@ -1647,6 +1801,9 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        checkpoint_selection_metric="balanced_accuracy", save_epoch_checkpoints=False,
                        gradient_checkpointing=False, attention_backend=None, code_revision=None,
                        training_views=None, training_view_ids=None, stop_file=None,
+                       weighted_sampling=False, sampling_weights=None,
+                       class_weights=None,
+                       resume_optimizer_state_with_lr_override=False,
                        _oom_recovery_context=None, _trainer_resume_checkpoint=None,
                        copy_resume_state=True):
     """Fine-tune or continue an encoder after recording its validation baseline."""
@@ -1663,6 +1820,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
     label_map = {label: i for i, label in enumerate(classes)}
     y_indices = np.asarray([label_map[y] for y in y_train], dtype=np.int64)
+    normalized_class_weights = normalize_class_weights(class_weights, classes)
     model_source = str(_trainer_resume_checkpoint or resume_checkpoint or checkpoint)
     model_revision = None if (_trainer_resume_checkpoint or resume_checkpoint) else revision
     tokenizer = tr.AutoTokenizer.from_pretrained(model_source, revision=model_revision, trust_remote_code=True,
@@ -1675,13 +1833,20 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     model = tr.AutoModelForSequenceClassification.from_pretrained(
         model_source, revision=model_revision, num_labels=len(classes),
         id2label=dict(enumerate(classes)), label2id=label_map, trust_remote_code=True,
-        local_files_only=local_files_only, **model_load_kwargs)
+        local_files_only=local_files_only, dtype=torch.float32, **model_load_kwargs)
     if code_revision is not None:
         model = ensure_gte_transformers_compatibility(model)
     if gradient_checkpointing:
         _set_gradient_checkpointing(model, True)
     train = _TextDataset(train_text, y_indices, tokenizer, max_length,
                          training_views=training_views, training_view_ids=training_view_ids, seed=seed)
+    if weighted_sampling and sampling_weights is None:
+        raise ValueError("weighted_sampling requires sampling_weights for every training row")
+    if sampling_weights is not None and len(sampling_weights) != len(train):
+        raise ValueError("sampling_weights must align with the training dataset")
+    weighted_sampler = (_make_epoch_weighted_sampler(
+        sampling_weights, seed=seed, initial_epoch=_resume_sampler_epoch(_trainer_resume_checkpoint),
+        labels=y_train) if weighted_sampling else None)
     val_indices = ([label_map[label] for label in validation_labels]
                    if validation_labels is not None else None)
     val = _TextDataset(validation_text, val_indices, tokenizer, max_length)
@@ -1734,6 +1899,9 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         logits = eval_prediction.predictions[0] if isinstance(eval_prediction.predictions, tuple) else eval_prediction.predictions
         logits = _restore_prediction_order(logits, validation_order)
         labels = _restore_prediction_order(eval_prediction.label_ids, validation_order)
+        logits = np.asarray(logits)
+        if not np.isfinite(logits).all():
+            raise FloatingPointError("encoder validation produced non-finite logits; stopping before checkpoint selection")
         captured_validation_prediction["logits"] = np.asarray(logits, dtype=np.float32).copy()
         predictions = np.asarray(logits).argmax(axis=1)
         return {"accuracy": float(accuracy_score(labels, predictions)),
@@ -1755,6 +1923,43 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     class OrderedValidationTrainer(tr.Trainer):
         validation_seconds = 0.0
         eval_oom_fallbacks = 0
+
+        def _get_train_sampler(self, train_dataset=None):
+            if weighted_sampler is not None:
+                return weighted_sampler
+            return super()._get_train_sampler(train_dataset)
+
+        def _load_optimizer_and_scheduler(self, checkpoint):
+            loaded = super()._load_optimizer_and_scheduler(checkpoint)
+            if resume_optimizer_state_with_lr_override and checkpoint:
+                self.resumed_lr_override = _rebase_resumed_scheduler_lr(
+                    self.optimizer, self.lr_scheduler, learning_rate)
+            return loaded
+
+        def _require_finite(self, name, value):
+            if torch.is_tensor(value):
+                finite = bool(torch.isfinite(value.detach()).all().item())
+            else:
+                try:
+                    finite = math.isfinite(float(value))
+                except (TypeError, ValueError):
+                    finite = True
+            if not finite:
+                raise FloatingPointError(
+                    f"encoder training produced non-finite {name} at optimizer step "
+                    f"{self.state.global_step}; stopping before saving a checkpoint"
+                )
+
+        def training_step(self, model, inputs, *args, **kwargs):
+            loss = super().training_step(model, inputs, *args, **kwargs)
+            self._require_finite("training loss", loss)
+            return loss
+
+        def _get_grad_norm(self, model, grad_norm=None):
+            value = super()._get_grad_norm(model, grad_norm=grad_norm)
+            self._require_finite("gradient norm", value)
+            return value
+
         def _get_eval_sampler(self, eval_dataset):
             # Keep each epoch's saved validation outputs aligned to input rows.
             # Training still uses its configured length-grouped sampler.
@@ -1773,6 +1978,9 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                     empty_cache=torch.cuda.empty_cache if torch.cuda.is_available() else None)
                 self.effective_eval_batch_size = effective
                 self.eval_oom_fallbacks += fallbacks
+                for key, value in (metrics or {}).items():
+                    if key.startswith("eval_") and isinstance(value, (int, float, np.number)):
+                        self._require_finite(key, value)
                 return metrics
             except Exception as exc:
                 if _is_oom_error(exc):
@@ -1932,6 +2140,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             TrainerCallback, early_stopping_patience, metric=checkpoint_selection_metric)
         callbacks.append(early_stopping_callback)
         callbacks.append(best_checkpoint_callback)
+    trainer_type = _class_weighted_trainer(trainer_type, label_map, normalized_class_weights)
     trainer = trainer_type(model=model, args=args, train_dataset=train, data_collator=data_collator,
         eval_dataset=val if validation_labels is not None else None,
         compute_metrics=compute_metrics if validation_labels is not None else None,
@@ -1957,6 +2166,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     baseline_validation_started = time.perf_counter()
     baseline_logits, baseline_inference_stats = predict_cached(val)
     baseline_validation_seconds = time.perf_counter() - baseline_validation_started
+    if not np.isfinite(baseline_logits).all():
+        raise FloatingPointError("encoder baseline validation produced non-finite scores")
     baseline_predictions = np.asarray(classes)[baseline_logits.argmax(axis=1)]
     from sklearn.metrics import accuracy_score, balanced_accuracy_score, log_loss
     baseline_metrics = {
@@ -2004,16 +2215,18 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         logits, final_inference_stats = predict_cached(val)
     inference_seconds = (0.0 if final_validation_reused_epoch_predictions
                          else time.perf_counter() - pred_start)
+    if not np.isfinite(logits).all():
+        raise FloatingPointError("encoder produced non-finite scores; refusing to save the selected checkpoint")
     checkpoint_started = time.perf_counter()
     model.save_pretrained(output_dir, safe_serialization=True)
     tokenizer.save_pretrained(output_dir)
-    if code_revision is not None:
+    if code_revision is not None or normalized_class_weights is not None:
         (Path(output_dir) / "checkpoint_manifest.json").write_text(json.dumps({
             "code_revision": code_revision, "model_revision": revision,
             "trust_remote_code": True,
+            "class_weights": normalized_class_weights,
         }, indent=2) + "\n")
     checkpoint_save_seconds = time.perf_counter() - checkpoint_started
-    if not np.isfinite(logits).all(): raise ValueError("encoder produced non-finite scores")
     probs = softmax(logits, axis=1)
     epoch_history = [dict(entry) for entry in trainer.state.log_history if "eval_accuracy" in entry]
     for entry in epoch_history:
@@ -2045,10 +2258,16 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "batch_size_probe": batch_probe,
             "fit_seconds": time.perf_counter() - start, "inference_seconds": inference_seconds,
             "classes": list(classes),
+            "class_weights": normalized_class_weights,
             "baseline_validation_metrics": baseline_metrics,
             "validation_metrics_by_epoch": epoch_history,
             "validation_predictions_by_epoch": epoch_prediction_callback.predictions,
+            "weighted_sampling": ({"enabled": True, "replacement": True,
+                "num_samples_per_epoch": len(train), "seed": int(seed),
+                "epoch_records": list(weighted_sampler.epoch_records)}
+                if weighted_sampler is not None else {"enabled": False}),
             "validation_loss_raw": float(validation_loss_raw),
+            "resumed_optimizer_lr_override": getattr(trainer, "resumed_lr_override", None),
             "best_epoch": best_state["epoch"],
             "best_validation_accuracy": best_state["accuracy"] if best_state["epoch"] is not None else None,
             "best_validation_balanced_accuracy": best_state["balanced_accuracy"] if best_state["epoch"] is not None else None,
@@ -2240,8 +2459,17 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
                     loss = model(**batch).loss
                 if loss is None:
                     raise RuntimeError("batch size probe needs labeled training examples")
+                if not bool(torch.isfinite(loss.detach()).all().item()):
+                    raise FloatingPointError("batch-size probe produced a non-finite loss")
                 loss.backward()
+                if any(parameter.grad is not None and
+                       not bool(torch.isfinite(parameter.grad.detach()).all().item())
+                       for parameter in trainable):
+                    raise FloatingPointError("batch-size probe produced non-finite gradients")
                 probe_optimizer.step()
+                if any(not bool(torch.isfinite(parameter.detach()).all().item())
+                       for parameter in trainable):
+                    raise FloatingPointError("batch-size probe produced non-finite model parameters")
                 torch.cuda.synchronize(device)
                 durations.append(time.perf_counter() - step_started)
             peak_allocated = int(torch.cuda.max_memory_allocated(device))
@@ -2302,6 +2530,7 @@ def _probe_max_batch_size(model, dataset, *, requested_batch_size, max_batch_siz
         identity = (getattr(model, "_batch_probe_model_id", None) or
                     getattr(config, "_name_or_path", None) or model.__class__.__qualname__)
         cache_payload = {"model": identity, "model_class": model.__class__.__qualname__,
+            "parameter_dtype": str(next(model.parameters()).dtype),
             "gpu": torch.cuda.get_device_name(device), "device": str(device),
             "total_memory_bytes": int(total_bytes),
             "free_memory_bucket_bytes": int(free_bytes // (256 * 1024**2) * (256 * 1024**2)),
@@ -2445,23 +2674,28 @@ def _require_flash_attention_2_runtime(torch):
 
 @_with_cuda_oom_recovery
 def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, checkpoint="Qwen/Qwen3-0.6B",
-                         revision, output_dir="artifacts/checkpoints/qwen", epochs=20, batch_size=4,
+                         revision, output_dir="artifacts/checkpoints/qwen", epochs=10, batch_size=4,
                          inference_batch_size=None,
                          max_length=384, learning_rate=1e-4, seed=2026, gradient_accumulation_steps=1,
                          target_effective_batch_size=None,
-                         lora_rank=16, lora_alpha=32,
+                         lora_rank=16, lora_alpha=32, lora_dropout=0.05,
                          lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
                          resume_checkpoint=None, validation_labels=None, gradient_checkpointing=False,
                          local_files_only=False, learning_rate_decay=1.0, auto_batch_size=False,
                          max_batch_size=1024, batch_probe_safety_fraction=0.95,
                          readout_hidden_size=None, task_prefix="", fix_mistral_regex=False,
                          lora_exclude_modules=None, text_only_backbone=False,
+                         use_chat_template=False,
+                         chat_template_user_prompt="Identify the source model for the assistant response.",
                          lr_scheduler_type=None, warmup_ratio=0.0,
                          warmup_epochs=None, optimizer="adamw_torch", weight_decay=0.0,
                          early_stopping_patience=2, trust_remote_code=False,
                          quantization="none", attention_backend=None,
                          checkpoint_selection_metric="balanced_accuracy", save_epoch_checkpoints=False,
                          training_views=None, training_view_ids=None, stop_file=None,
+                         weighted_sampling=False, sampling_weights=None, class_weights=None,
+                         sampling_components=None,
+                         training_lineage=None, epoch_checkpoint_style="hyphen",
                          _oom_recovery_context=None, _trainer_resume_checkpoint=None):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
     _force_huggingface_offline()
@@ -2487,6 +2721,17 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         tokenizer_kwargs["fix_mistral_regex"] = True
     tokenizer = tr.AutoTokenizer.from_pretrained(checkpoint, **tokenizer_kwargs)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    if use_chat_template and (not callable(getattr(tokenizer, "apply_chat_template", None))
+                              or not getattr(tokenizer, "chat_template", None)):
+        raise ValueError(f"{checkpoint} requires a tokenizer-provided chat template")
+    def format_model_input(text):
+        text = str(text)
+        if use_chat_template:
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": str(chat_template_user_prompt)},
+                 {"role": "assistant", "content": text}],
+                tokenize=False, add_generation_prompt=False)
+        return str(task_prefix) + text
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
     model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16 if torch.cuda.is_available() else torch.float32
     quantization = str(quantization or "none").lower()
@@ -2540,7 +2785,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         backbone = PeftModel.from_pretrained(backbone, resume_checkpoint, is_trainable=True, local_files_only=True)
     else:
         lora = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION, r=lora_rank, lora_alpha=lora_alpha,
-                          lora_dropout=.05, target_modules=list(lora_target_modules),
+                          lora_dropout=float(lora_dropout), target_modules=list(lora_target_modules),
                           exclude_modules=lora_exclude_modules)
         backbone = get_peft_model(backbone, lora)
     backbone.config.use_cache = False
@@ -2549,6 +2794,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         if hasattr(backbone, "enable_input_require_grads"):
             backbone.enable_input_require_grads()
     label_map = {label: i for i, label in enumerate(classes)}
+    normalized_class_weights = normalize_class_weights(class_weights, classes)
     config = backbone.config
     text_config = getattr(config, "text_config", None)
     hidden_size = (int(readout_hidden_size) if readout_hidden_size is not None else
@@ -2593,7 +2839,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             if not force and self.epoch==epoch:return
             selected,counts=select_epoch_view_indices([len(row) for row in self.views],
                 seed=seed,epoch=epoch,view_ids=self.view_ids)
-            prepared=[str(task_prefix)+views[choice] for views,choice in zip(self.views,selected)]
+            prepared=[format_model_input(views[choice]) for views,choice in zip(self.views,selected)]
             encoded=tokenizer(prepared,truncation=True,max_length=max_length,padding=False)
             self.enc={k:v for k,v in encoded.items() if k in {"input_ids","attention_mask"}}
             self.lengths=[len(ids) for ids in self.enc["input_ids"]]
@@ -2602,7 +2848,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             self.epoch_records.append(record);self.epoch_records.sort(key=lambda item:item["epoch"])
             self.epoch=epoch
         def set_probe_views(self):
-            prepared=[str(task_prefix)+views[0] for views in self.views]
+            prepared=[format_model_input(views[0]) for views in self.views]
             encoded=tokenizer(prepared,truncation=True,max_length=max_length,padding=False)
             self.enc={k:v for k,v in encoded.items() if k in {"input_ids","attention_mask"}}
             self.lengths=[len(ids) for ids in self.enc["input_ids"]]
@@ -2638,12 +2884,17 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     checkpoint_metadata = {
         "checkpoint": checkpoint, "revision": revision,
         "max_length": int(max_length), "task_prefix": str(task_prefix),
-        "classes": list(classes), "pooling": "attention-mask mean",
+        "use_chat_template": bool(use_chat_template),
+        "chat_template_user_prompt": (str(chat_template_user_prompt) if use_chat_template else None),
+        "classes": list(classes), "label_to_id": {label: index for index, label in enumerate(classes)},
+        "pooling": "attention-mask mean", "training_lineage": training_lineage,
+        "validation_enabled": validation_labels is not None,
         "quantization": quantization, "quantization_config": quantization_config,
         "attention_backend": attention_backend,
         "lora_rank": int(lora_rank), "lora_alpha": int(lora_alpha),
         "lora_target_modules": list(lora_target_modules),
         "gradient_checkpointing": bool(gradient_checkpointing),
+        "class_weights": normalized_class_weights,
         "training_view_sampling_policy": ("uniform one-view-per-original-response per epoch"
                                            if training_views is not None else None),
     }
@@ -2731,7 +2982,10 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                     "metrics": self.best_state["metrics"], "epoch": self.best_state["epoch"]})
             if save_epoch_checkpoints:
                 save_started = time.perf_counter()
-                epoch_dir=out/f"epoch-{epoch:02d}"
+                if weighted_sampler is not None:
+                    checkpoint_metadata["weighted_sampling"]["epoch_records"] = list(weighted_sampler.epoch_records)
+                epoch_dir=(out/f"epoch_{epoch}" if epoch_checkpoint_style == "underscore"
+                           else out/f"epoch-{epoch:02d}")
                 epoch_dir.mkdir(parents=True,exist_ok=True)
                 model.backbone.save_pretrained(epoch_dir,safe_serialization=True)
                 tokenizer.save_pretrained(epoch_dir)
@@ -2768,6 +3022,27 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     if scheduler not in {"linear", "cosine", "constant", "epoch_decay"}:
         raise ValueError("lr_scheduler_type must be linear, cosine, constant, or epoch_decay")
     train_dataset=Rows(train_text,y_train,training_views,training_view_ids)
+    if weighted_sampling and sampling_weights is None:
+        raise ValueError("weighted_sampling requires sampling_weights for every training row")
+    if sampling_weights is not None and len(sampling_weights) != len(train_dataset):
+        raise ValueError("sampling_weights must align with the training dataset")
+    weighted_sampler = (_make_epoch_weighted_sampler(
+        sampling_weights, seed=seed, initial_epoch=_resume_sampler_epoch(_trainer_resume_checkpoint),
+        labels=y_train, components=sampling_components) if weighted_sampling else None)
+    component_weight_map = {}
+    if sampling_components is not None and sampling_weights is not None:
+        for component, weight in zip(map(str, sampling_components), map(float, sampling_weights)):
+            prior = component_weight_map.setdefault(component, weight)
+            if prior != weight:
+                raise ValueError(f"sampling component {component} has inconsistent row weights")
+    checkpoint_metadata.update({
+        "seed": int(seed), "epochs_configured": int(epochs),
+        "learning_rate": float(learning_rate), "optimizer": str(optimizer),
+        "weighted_sampling": ({"enabled": True, "replacement": True,
+            "num_samples_per_epoch": len(train_dataset), "seed": int(seed),
+            "component_weights": component_weight_map or None}
+            if weighted_sampler is not None else {"enabled": False}),
+    })
     validation_dataset_rows=Rows(validation_text,validation_labels)
     validation_order = _length_order(validation_dataset_rows.lengths)
 
@@ -2831,7 +3106,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         gradient_accumulation_steps=gradient_accumulation_steps,learning_rate=learning_rate,
         lr_scheduler_type="constant" if scheduler == "epoch_decay" else scheduler,
         warmup_steps=warmup_steps, optim=optimizer, weight_decay=float(weight_decay),
-        seed=seed,data_seed=seed,save_strategy="epoch",save_total_limit=2,
+        seed=seed,data_seed=seed,save_strategy="epoch",
+        save_total_limit=None if save_epoch_checkpoints else 2,
         eval_strategy="epoch" if eval_each_epoch else "no",report_to=[],
         logging_strategy="epoch",
         fp16=use_fp16,
@@ -2841,6 +3117,11 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     class OrderedValidationTrainer(tr.Trainer):
         validation_seconds = 0.0
         eval_oom_fallbacks = 0
+
+        def _get_train_sampler(self, train_dataset=None):
+            if weighted_sampler is not None:
+                return weighted_sampler
+            return super()._get_train_sampler(train_dataset)
 
         def _save(self, output_dir=None, state_dict=None):
             # Save only trainable PEFT weights and the classifier head in
@@ -2918,11 +3199,16 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                 return self.lr_scheduler
         trainer_type=EpochDecayTrainer
     cooperative_stop_callback=_cooperative_stop_callback(TrainerCallback,stop_file)
+    trainer_type = _class_weighted_trainer(trainer_type, label_map, normalized_class_weights)
+    callbacks = [progress_callback, cooperative_stop_callback]
+    if eval_each_epoch or save_epoch_checkpoints:
+        callbacks.insert(0, snapshot_callback)
+    if eval_each_epoch:
+        callbacks.insert(-1, early_stopping_callback)
     trainer=trainer_type(model=model,args=args,train_dataset=train_dataset,data_collator=data_collator,
         eval_dataset=validation_dataset_rows if eval_each_epoch else None,
         compute_metrics=compute_metrics if eval_each_epoch else None,
-        callbacks=([snapshot_callback,progress_callback,early_stopping_callback,cooperative_stop_callback]
-                   if eval_each_epoch else [progress_callback,cooperative_stop_callback]))
+        callbacks=callbacks)
     if training_views is not None:
         class EpochTrainingViewCallback(TrainerCallback):
             def on_epoch_begin(self,args,state,control,**kwargs):
@@ -3024,16 +3310,21 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         inference_stats.append(stats)
         return scores, stats
 
-    selected_prediction = _selected_epoch_scores(snapshot_callback.validation_predictions,
-        best_epoch, (len(validation_dataset_rows), len(classes)))
+    selected_prediction = (_selected_epoch_scores(snapshot_callback.validation_predictions,
+        best_epoch, (len(validation_dataset_rows), len(classes))) if eval_each_epoch else None)
     final_validation_reused_epoch_predictions = selected_prediction is not None
-    pred_start = time.perf_counter()
-    if final_validation_reused_epoch_predictions:
-        logits=selected_prediction;final_inference_stats=None
+    if validation_labels is not None:
+        pred_start = time.perf_counter()
+        if final_validation_reused_epoch_predictions:
+            logits=selected_prediction;final_inference_stats=None
+        else:
+            logits,final_inference_stats=predict_cached(validation_dataset_rows)
+        inference_seconds = (0.0 if final_validation_reused_epoch_predictions
+                             else time.perf_counter() - pred_start)
     else:
-        logits,final_inference_stats=predict_cached(validation_dataset_rows)
-    inference_seconds = (0.0 if final_validation_reused_epoch_predictions
-                         else time.perf_counter() - pred_start)
+        logits=np.empty((0, len(classes)), dtype=np.float32)
+        final_inference_stats=None
+        inference_seconds=0.0
     checkpoint_started = time.perf_counter()
     if training_views is not None:
         checkpoint_metadata["training_view_sampling"] = train_dataset.sampling_summary()
@@ -3041,6 +3332,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     torch.save(model.classifier.state_dict(),out/"classifier.pt")
     (out/"checkpoint_manifest.json").write_text(json.dumps(checkpoint_metadata,indent=2)+"\n")
     checkpoint_save_seconds = time.perf_counter() - checkpoint_started
+    if save_epoch_checkpoints and len(snapshot_callback.checkpoints) != int(epochs):
+        raise RuntimeError(f"expected {epochs} complete epoch checkpoints, found {len(snapshot_callback.checkpoints)}")
     if not np.isfinite(logits).all(): raise ValueError("Qwen adapter produced non-finite scores")
     probs=softmax(logits,axis=1)
     validation_loss_raw = (selected.get("eval_loss") if eval_each_epoch else None)
@@ -3080,6 +3373,10 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "checkpoint_scoring_method":"best_epoch_validation_predictions" if final_validation_reused_epoch_predictions else "length_grouped_restored_model_forward",
         "final_validation_reused_epoch_predictions":bool(final_validation_reused_epoch_predictions),
         "training_view_sampling":(train_dataset.sampling_summary() if training_views is not None else None),
+        "weighted_sampling": ({"enabled": True, "replacement": True,
+            "num_samples_per_epoch": len(train_dataset), "seed": int(seed),
+            "epoch_records": list(weighted_sampler.epoch_records)}
+            if weighted_sampler is not None else {"enabled": False}),
         "runtime_breakdown":{"startup_seconds":startup_seconds,
             "baseline_validation_seconds":baseline_validation_seconds,
             "training_including_validation_seconds":training_seconds,

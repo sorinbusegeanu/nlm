@@ -5,7 +5,7 @@ checkpoint: ibm-granite/granite-4.1-3b-base
 revision: dacb9cb9157bec98e99b09f285c92a4d58405c96
 training_mode: lora
 quantization: none
-epochs: 3
+epochs: 10
 early_stopping_patience: 2
 batch_size: 2
 inference_batch_size: 8

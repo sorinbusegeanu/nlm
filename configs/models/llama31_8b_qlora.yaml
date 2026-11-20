@@ -3,7 +3,7 @@ checkpoint_selection: highest_validation_accuracy
 checkpoint_selection_version: 2
 checkpoint: meta-llama/Llama-3.1-8B
 revision: d04e592bb4f6aa9cfee91e2e20afa771667e1d4b
-epochs: 20
+epochs: 10
 early_stopping_patience: 2
 quantization: qlora4
 attention_backend: sdpa

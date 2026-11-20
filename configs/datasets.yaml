@@ -217,6 +217,21 @@ datasets:
       - docs/v2.14.md
       - docs/openpool_v14_comparison.md
 
+  - id: v2.14CW
+    name: V2.14CW — Class-weighted SFT recipe
+    section: Training datasets
+    description: "Uses the exact V2.14 rows and metadata with weighted cross-entropy during training with weights of 2.0 for claude-fable-5, glm-5.3 and gemini-3.7-flash; 1.0 for the other labels. Validation loss and metrics remain unweighted."
+    artifact: data/processed/dataset_v2.14.parquet
+    profile: data/processed/dataset_profile_v2.14.json
+    class_weights:
+      claude-fable-5: 2.0
+      glm-5.3: 2.0
+      gemini-3.7-flash: 2.0
+    validation: External training rows; all 2,699 V0 rows are used for validation by the full-V0 training workflow.
+    reports:
+      - docs/v2.14CW.md
+      - docs/v2.14.md
+
   - id: v2.14HN
     name: V2.14HN — OOS hard-negative weighted dataset
     section: Training datasets
@@ -298,6 +313,24 @@ datasets:
     reports:
       - docs/v2.16_14plus15.md
 
+  - id: v2.16_openpool16_increment
+    name: V2.16 Open Pool 16 increment
+    section: Training datasets
+    description: New Open Pool v16 examples absent from V2.16, quality-filtered and retained as an incremental artifact with source provenance.
+    artifact: data/processed/dataset_v2.16_openpool16_increment.parquet
+    profile: data/processed/dataset_profile_v2.16_openpool16_increment.json
+    validation: Incremental external training rows; this artifact has incomplete label coverage and is intended for combination with a full-label dataset.
+    reports:
+      - docs/openpool_v16_increment.md
+
+  - id: granite4_350m_v214_openpool16_v0w10
+    name: Granite 4 350M V2.14 + Open Pool v16 + V0 weighted mix
+    section: Training datasets
+    description: V2.14 and Open Pool v16 increment at per-row sampling weight 1, plus all V0 responses at weight 10. Normalized-text collisions retain V0. Training has V0 exposure and must not be used for external-only Trust List validation.
+    artifact: data/processed/dataset_granite4_350m_v214_openpool16_v0w10.parquet
+    profile: data/processed/dataset_profile_granite4_350m_v214_openpool16_v0w10.json
+    validation: Disabled; all rows, including V0, are sampled for training. Checkpoints are marked V0-exposed.
+
   - id: v2.14_plus_v2.15_extrato_14
     name: V2.14 + V2.15_extrato_14 — Combined external training corpus
     section: Training datasets
@@ -326,3 +359,20 @@ datasets:
     profile: data/processed/dataset_profile_v2.14-glm.json
     validation: Prompt-grouped 80/20 split for checkpoint selection; full V0 rows for
       these labels are predicted and evaluated after training.
+
+  - id: v0_gemini
+    name: V0 GEMINI specialist validation
+    section: Validation datasets
+    description: All official V0 responses for the gemini-3.6-flash, gemini-3.7-flash,
+      gemini-3.8-flash DeBERTa specialist labels; validation-only, never a training corpus.
+    artifact: data/processed/dataset_v0_gemini.parquet
+    profile: data/processed/dataset_profile_v0_gemini.json
+    validation: Official V0 validation subset; 450 rows across 3 specialist labels.
+  - id: v0_glm
+    name: V0 GLM specialist validation
+    section: Validation datasets
+    description: All official V0 responses for the glm-5.3, glm-5.3-flash DeBERTa specialist
+      labels; validation-only, never a training corpus.
+    artifact: data/processed/dataset_v0_glm.parquet
+    profile: data/processed/dataset_profile_v0_glm.json
+    validation: Official V0 validation subset; 300 rows across 2 specialist labels.

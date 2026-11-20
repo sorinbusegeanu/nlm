@@ -49,7 +49,7 @@ SPECS = {
         "display_name": "DeBERTa-v3-base Gemini specialist",
         "config_path": "configs/models/deberta_gemini.yaml",
         "dataset": "v2.14-gemini",
-        "validation_dataset": "prompt_grouped_80_20",
+        "validation_dataset": "v0_gemini",
         "labels": ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"],
         "required_files": ("config.json", "pytorch_model.bin", "spm.model", "tokenizer_config.json"),
     },
@@ -59,7 +59,7 @@ SPECS = {
         "display_name": "DeBERTa-v3-base GLM specialist",
         "config_path": "configs/models/deberta_glm.yaml",
         "dataset": "v2.14-glm",
-        "validation_dataset": "prompt_grouped_80_20",
+        "validation_dataset": "v0_glm",
         "labels": ["glm-5.3", "glm-5.3-flash"],
         "required_files": ("config.json", "pytorch_model.bin", "spm.model", "tokenizer_config.json"),
     },
@@ -167,9 +167,11 @@ def worker(queue_dir: Path) -> int:
     return code
 
 
-def create_queue(model: str, dependency_path: Path) -> Path:
+def create_queue(model: str, dependency_path: Path, *, dataset_override: str | None = None) -> Path:
     spec = SPECS[model]
-    dataset = spec.get("dataset", DATASET)
+    if dataset_override == "v2.14CW" and "dataset" in spec:
+        raise ValueError("v2.14CW requires a generalist encoder")
+    dataset = dataset_override or spec.get("dataset", DATASET)
     validation_dataset = spec.get("validation_dataset", VALIDATION_DATASET)
     if not dependency_path.is_absolute():
         dependency_path = ROOT / dependency_path
@@ -188,17 +190,31 @@ def create_queue(model: str, dependency_path: Path) -> Path:
         missing_code = [name for name in spec["code_files"] if not (code_snapshot / name).resolve().is_file()]
         if missing_code:
             raise FileNotFoundError(f"pinned local GTE custom code missing under {code_snapshot}: {missing_code}")
-    from src.pipeline import _training_partitions
+    from src.pipeline import (_apply_dataset_training_options, _dataset_rows, _dataset_storage_id,
+                              _profile_path, _training_partitions)
     train, valid = _training_partitions(dataset, validation_dataset, ROOT / "data/processed")
     if model in {"deberta_gemini", "deberta_glm"}:
         expected_labels = set(spec["labels"])
-        total_rows = len(train) + len(valid)
         if set(train.model.astype(str)) != expected_labels or set(valid.model.astype(str)) != expected_labels:
             raise ValueError(f"{dataset} prompt split does not contain all specialist classes on both sides")
-        if not 0.18 <= len(valid) / total_rows <= 0.22:
-            raise ValueError(f"{dataset} validation rows do not form the requested approximate 20 percent")
-        if len(valid) != int(json.loads((ROOT / f"data/processed/dataset_profile_{dataset}.json").read_text())["split_validation_rows"]):
-            raise ValueError(f"{dataset} split rows differ from its dataset profile")
+        if validation_dataset == "prompt_grouped_80_20":
+            total_rows = len(train) + len(valid)
+            if not 0.18 <= len(valid) / total_rows <= 0.22:
+                raise ValueError(f"{dataset} validation rows do not form the requested approximate 20 percent")
+            if len(valid) != int(json.loads((ROOT / f"data/processed/dataset_profile_{dataset}.json").read_text())["split_validation_rows"]):
+                raise ValueError(f"{dataset} split rows differ from its dataset profile")
+        else:
+            validation_profile_path = ROOT / f"data/processed/dataset_profile_{validation_dataset}.json"
+            validation_profile = json.loads(validation_profile_path.read_text(encoding="utf-8"))
+            if (validation_profile.get("validation_only") is not True
+                    or validation_profile.get("parent_dataset") != "v0"
+                    or set(validation_profile.get("classes", [])) != expected_labels
+                    or int(validation_profile.get("rows", -1)) != len(valid)):
+                raise ValueError(f"{validation_dataset} is not the expected V0-only specialist validation artifact")
+            official_v0 = _dataset_rows("v0", ROOT / "data/processed")
+            expected_v0_rows = official_v0.loc[official_v0.model.astype(str).isin(expected_labels)]
+            if set(valid.id.astype(str)) != set(expected_v0_rows.id.astype(str)):
+                raise ValueError(f"{validation_dataset} does not contain every official V0 row for its labels")
     elif len(train) != 231336 or len(valid) != 2699 or train.model.nunique() != 18:
         raise ValueError(f"unexpected V2.14/full-V0 rows/classes: {len(train)}/{len(valid)}/{train.model.nunique()}")
 
@@ -212,7 +228,7 @@ def create_queue(model: str, dependency_path: Path) -> Path:
         raise ValueError(f"{model} model ID or pinned revision differs from its config")
     if config.get("code_revision") != spec.get("code_revision"):
         raise ValueError(f"{model} custom code revision differs from the pinned revision")
-    expected = {"epochs": 3 if model in {"deberta_gemini", "deberta_glm"} else 5,
+    expected = {"epochs": 10 if model in {"deberta_gemini", "deberta_glm"} else 5,
                 "learning_rate": 2e-5 if model in {"deberta_gemini", "deberta_glm"} else 1e-5,
                 "optimizer": "adamw_torch", "weight_decay": 0.01,
                 "lr_scheduler_type": "linear", "warmup_ratio": 0.02, "gradient_accumulation_steps": 1,
@@ -227,6 +243,7 @@ def create_queue(model: str, dependency_path: Path) -> Path:
         raise ValueError("MPNet automatic sequence selection must cap inputs at its supported 512-token limit")
     if model in {"deberta_gemini", "deberta_glm"} and config.get("cap_sequence_length_at_context_window") is not True:
         raise ValueError("DeBERTa specialist sequence selection must respect its model context window")
+    _apply_dataset_training_options(config, dataset)
     config["experiment_name"] = f"{model}_{dataset}_from_scratch_{stamp}"
     config_path = config_dir / f"{model}_{dataset}.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -234,7 +251,7 @@ def create_queue(model: str, dependency_path: Path) -> Path:
                "--dataset", dataset, "--validation-dataset", validation_dataset,
                "--config", str(config_path), "--seed", "2026", "--accept-config-defaults",
                "--refresh-checkpoint-catalog"]
-    profile = json.loads((ROOT / f"data/processed/dataset_profile_{dataset}.json").read_text(encoding="utf-8"))
+    profile = json.loads((_profile_path(ROOT / "data/processed", dataset)).read_text(encoding="utf-8"))
     post_command = None
     if model in {"deberta_gemini", "deberta_glm"}:
         post_command = [PYTHON, "-u", "scripts/evaluate_deberta_specialist_v0.py",
@@ -244,7 +261,7 @@ def create_queue(model: str, dependency_path: Path) -> Path:
     is_specialist = model in {"deberta_gemini", "deberta_glm"}
     job = {"index": 1, "job_id": config["experiment_name"], "model": model,
         "display_name": spec["display_name"], "dataset": dataset,
-        "dataset_path": f"data/processed/dataset_{dataset}.parquet", "dataset_rows": all_dataset_rows,
+        "dataset_path": f"data/processed/dataset_{_dataset_storage_id(dataset)}.parquet", "dataset_rows": all_dataset_rows,
         "selection_train_rows": len(train), "dataset_sha256": profile["dataset_sha256"], "validation_dataset": validation_dataset,
         "validation_rows": len(valid), "training_mode": "full_finetune_from_scratch" if is_specialist else "full_from_scratch",
         "compute_dtype": "bfloat16", "checkpoint": spec["model_id"], "revision": spec["revision"],
@@ -267,7 +284,7 @@ def create_queue(model: str, dependency_path: Path) -> Path:
             f"Train {spec['display_name']} from scratch on all V2.14 rows for 5 epochs; validate on full V0."),
         "execution_policy": "wait for the prior serialized queue to finish, then wait for training processes and GPU compute to be idle",
         "depends_on_queue_json": str(dependency_path.relative_to(ROOT)), "dependency_queue_id": dependency.get("queue_id"),
-        "dataset": dataset, "dataset_path": f"data/processed/dataset_{dataset}.parquet", "dataset_rows": all_dataset_rows,
+        "dataset": dataset, "dataset_path": f"data/processed/dataset_{_dataset_storage_id(dataset)}.parquet", "dataset_rows": all_dataset_rows,
         "dataset_sha256": profile["dataset_sha256"], "validation_dataset": validation_dataset,
         "validation_rows": len(valid), "model": spec["model_id"], "revision": spec["revision"],
         "code_revision": config.get("code_revision"),
@@ -285,6 +302,7 @@ def create_queue(model: str, dependency_path: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=sorted(SPECS))
+    parser.add_argument("--dataset", choices=["v2.14CW"])
     parser.add_argument("--depends-on", type=Path)
     parser.add_argument("--worker", type=Path)
     args = parser.parse_args()
@@ -292,7 +310,7 @@ def main() -> int:
         return worker(args.worker.resolve())
     if not args.model or not args.depends_on:
         parser.error("--model and --depends-on are required when creating a queue entry")
-    path = create_queue(args.model, args.depends_on)
+    path = create_queue(args.model, args.depends_on, dataset_override=args.dataset)
     print(json.dumps({"queue_dir": str(path), "queue_json": str(path / "queue.json"),
                       "status": "queued_waiting_for_previous_queue"}, indent=2))
     return 0

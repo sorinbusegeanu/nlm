@@ -465,6 +465,8 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
             profile = data / "dataset_profile_v1.json"
             profile.write_text(json.dumps({"dataset_sha256": "train-hash"}))
             calls = {}
+            trainer_state = root / "trainer-state"
+            trainer_state.mkdir()
             selected_checkpoint = root / "selected"
             selected_checkpoint.mkdir()
             def fake_result(**extra):
@@ -511,6 +513,8 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                 Path(kwargs["output_dir"]).mkdir(parents=True, exist_ok=True)
                 return fake_result()
             with patch.object(pipeline, "_training_partitions", return_value=(train, valid)), \
+                    patch.object(pipeline, "_continuation_trainer_state",
+                                 return_value=(trainer_state, {"epoch": 1}, 1)), \
                     patch.object(pipeline, "_profile_path", return_value=profile), \
                     patch.object(pipeline, "_continuation_source_matches", return_value=True), \
                     patch.object(pipeline, "_dataset_max_length", return_value=16), \
@@ -521,14 +525,18 @@ class TrainingOptimizationHelperTests(unittest.TestCase):
                     registry_path=str(root / "registry.sqlite"), from_experiment="qwen-source",
                     model="qwen06", epochs=1,
                     config_overrides={"batch_size": 3, "inference_batch_size": 5,
-                                      "calibration_enabled": True})
+                                      "calibration_enabled": True, "class_weights": {"b": 2.0}})
                 pipeline.continue_encoder("v1", data_dir=str(data), artifact_dir=str(artifacts),
                     registry_path=str(root / "registry.sqlite"), from_experiment="encoder-source",
                     epochs=1, config_overrides={"batch_size": 4, "inference_batch_size": 8,
-                                                "calibration_enabled": True},
+                                                "calibration_enabled": True, "class_weights": {"b": 2.0}},
                     allow_cross_dataset_source=True)
-        self.assertEqual(calls["qwen"]["inference_batch_size"], 5)
-        self.assertEqual(calls["qwen"]["batch_size"], 3)
+        for call in calls.values():
+            self.assertEqual(call["class_weights"], {"a": 1.0, "b": 2.0})
+        self.assertEqual(Path(calls["qwen"]["_trainer_resume_checkpoint"]), trainer_state)
+        self.assertEqual(Path(calls["encoder"]["trainer_resume_checkpoint"]), trainer_state)
+        self.assertEqual(calls["qwen"]["inference_batch_size"], 7)
+        self.assertEqual(calls["qwen"]["batch_size"], 1)
         self.assertNotIn("calibration_enabled", calls["qwen"])
         self.assertTrue(calls["qwen"]["auto_batch_size"])
         self.assertTrue(calls["qwen"]["gradient_checkpointing"])

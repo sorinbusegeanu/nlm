@@ -19,7 +19,7 @@ MODEL_ID = "Qwen/Qwen3-1.7B-Base"
 MODEL_REVISION = "ea980cb0a6c2ae4b936e82123acc929f1cec04c1"
 HF_HOME = Path.home() / ".cache/huggingface"
 QUEUE_ROOT = ROOT / "artifacts/training_queues"
-DEPENDENCY_QUEUE = QUEUE_ROOT / "hunyuan_1_8b_v214_qlora_20261115T185727Z/queue.json"
+DEPENDENCY_QUEUE = QUEUE_ROOT / "minicpm5_2b_v214_continue5_from_exp136_20261117T054009Z/queue.json"
 TERMINAL = {"completed", "completed_with_failures", "failed", "stopped", "cancelled", "blocked"}
 
 

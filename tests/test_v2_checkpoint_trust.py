@@ -37,8 +37,6 @@ class V2CheckpointTrustTests(unittest.TestCase):
     def test_append_training_run_creates_new_version_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); (root / "docs").mkdir()
-            roster = pd.DataFrame({"model": ["qwen06"]})
-            roster.to_csv(root / trust.ROSTER_PATH, index=False)
             row = {column: "" for column in trust.TRUST_COLUMNS}
             row.update({"sequence_id": "N0001", "experiment_id": "existing", "target_label": trust.LABELS[0],
                         "precision": 1.0, "recall": 1.0, "prediction_count": 1,
@@ -57,22 +55,19 @@ class V2CheckpointTrustTests(unittest.TestCase):
                 r = dict(row); r.update({"sequence_id": "N0002", "experiment_id": "new", "target_label": label})
                 fake_rows.append(r)
             with patch.object(trust, "_rows_from_training_manifest", return_value=fake_rows):
-                result = trust.append_training_run(manifest, manifest_path, root=root,
-                                                   roster_path=root / trust.ROSTER_PATH)
+                result = trust.append_training_run(manifest, manifest_path, root=root)
                 self.assertEqual(result["status"], "added")
                 self.assertEqual(result["version"], "trust-list-2-v002")
-                duplicate = trust.append_training_run(manifest, manifest_path, root=root,
-                                                      roster_path=root / trust.ROSTER_PATH)
+                duplicate = trust.append_training_run(manifest, manifest_path, root=root)
             self.assertEqual(duplicate["status"], "already_recorded")
             self.assertEqual(trust.latest_trust_paths(root)[2]["version"], "trust-list-2-v002")
             self.assertEqual(pd.read_csv(root / "docs/trust-list-2-v001.csv").experiment_id.unique().tolist(), ["existing"])
 
-    def test_future_updates_wait_for_initial_roster_publication(self):
+    def test_future_updates_wait_for_initial_trust_list_publication(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); (root / trust.ROSTER_PATH).parent.mkdir(parents=True)
-            pd.DataFrame({"model": ["qwen06"]}).to_csv(root / trust.ROSTER_PATH, index=False)
+            root = Path(temporary)
             result = trust.append_training_run({"model": "qwen06", "dataset": "v1"}, "run.json",
-                                               root=root, roster_path=root / trust.ROSTER_PATH)
+                                               root=root)
             self.assertEqual(result["status"], "deferred")
 
     def test_rank_k_metrics_and_saved_probability_csv_generation(self):

@@ -1,6 +1,6 @@
 model: ultrabert380
 experiment_name: ultrabert380_v2_stage2
-epochs: 20
+epochs: 10
 early_stopping_patience: 2
 learning_rate: 8.0e-6
 learning_rate_decay: null

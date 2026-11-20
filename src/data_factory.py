@@ -300,6 +300,115 @@ def _normal_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", str(value)).casefold().split())
 
 
+def build_weighted_dataset_mix(components: list[dict], *, dataset_id: str,
+                               data_dir: str | Path = "data/processed",
+                               preferred_component: str = "v0",
+                               configuration_path: str | Path | None = None) -> dict:
+    """Concatenate registered datasets, deduplicate normalized responses, and persist sampling weights.
+
+    Each component has ``dataset_id`` and positive ``weight`` keys. Rows from
+    ``preferred_component`` win normalized-text collisions; other ties follow
+    component order. Source datasets are never modified.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(dataset_id)):
+        raise ValueError("dataset_id may contain only letters, digits, '.', '_' and '-'")
+    if len(components) < 2:
+        raise ValueError("a weighted mix needs at least two registered datasets")
+    root = Path(data_dir)
+    frames, component_meta = [], []
+    seen_components = set()
+    for order, component in enumerate(components):
+        source_id = str(component["dataset_id"])
+        weight = float(component["weight"])
+        if source_id in seen_components or weight <= 0 or not math.isfinite(weight):
+            raise ValueError("component IDs must be unique and weights finite and positive")
+        seen_components.add(source_id)
+        path = root / f"dataset_{source_id}.parquet"
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        frame = pd.read_parquet(path).drop(columns=["split"], errors="ignore").copy()
+        errors = validate_data(frame, expected_classes=None)
+        if errors:
+            raise ValueError(f"invalid component {source_id}: " + "; ".join(errors))
+        frame["sampling_component"] = source_id
+        frame["sampling_weight"] = weight
+        frame["_component_order"] = order
+        frame["_normalized_response"] = frame.text.astype(str).map(_normal_text)
+        if frame["_normalized_response"].eq("").any():
+            raise ValueError(f"component {source_id} contains empty normalized responses")
+        digest = _hash_file(path)
+        component_meta.append({"dataset_id": source_id, "path": str(path), "sha256": digest,
+                               "rows": int(len(frame)), "sampling_weight": weight})
+        frames.append(frame)
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    if combined.model.isna().any() or not set(combined.model.astype(str)).issubset(
+            {str(label) for frame in frames for label in frame.model.astype(str).unique()}):
+        raise ValueError("combined rows contain invalid labels")
+    if "id" not in combined or combined.id.isna().any():
+        raise ValueError("combined rows need nonempty response IDs")
+    preferred = combined.sampling_component.astype(str).eq(preferred_component)
+    combined["_preference"] = np.where(preferred, 0, 1)
+    duplicated_ids = combined.id.astype(str).duplicated(keep=False)
+    if duplicated_ids.any():
+        id_rows = combined.loc[duplicated_ids].copy()
+        conflicting_ids = id_rows.groupby(id_rows.id.astype(str)).model.nunique()
+        if conflicting_ids.gt(1).any():
+            raise ValueError("component datasets contain duplicate response IDs with conflicting labels")
+        combined = combined.sort_values(["_preference", "_component_order", "id"], kind="stable").drop_duplicates("id", keep="first")
+    # Prefer V0 for normalized response collisions; retain deterministic source ordering otherwise.
+    normalized_duplicates = combined["_normalized_response"].duplicated(keep=False)
+    collisions = combined.loc[normalized_duplicates]
+    conflicting = collisions.groupby("_normalized_response").model.nunique()
+    if conflicting.gt(1).any():
+        examples = collisions.loc[collisions._normalized_response.isin(conflicting[conflicting.gt(1)].index),
+                                  ["id", "model", "sampling_component"]].head(10).to_dict("records")
+        raise ValueError(f"normalized response duplicates have conflicting labels: {examples}")
+    combined = combined.sort_values(["_preference", "_component_order", "id"], kind="stable")
+    before = int(len(combined))
+    combined = combined.drop_duplicates("_normalized_response", keep="first")
+    combined = combined.sort_values(["sampling_component", "id"], kind="stable").reset_index(drop=True)
+    combined = combined.drop(columns=["_component_order", "_preference", "_normalized_response"])
+    if combined.id.astype(str).duplicated().any() or combined.text.astype(str).map(_normal_text).duplicated().any():
+        raise RuntimeError("weighted mix is not unique after deduplication")
+    classes = sorted(combined.model.astype(str).unique().tolist())
+    if len(classes) != 18:
+        raise ValueError(f"weighted mix must contain all 18 canonical labels; found {len(classes)}")
+    artifact = root / f"dataset_{dataset_id}.parquet"
+    profile_path = root / f"dataset_profile_{dataset_id}.json"
+    if artifact.exists() or profile_path.exists():
+        if not artifact.is_file() or not profile_path.is_file():
+            raise FileExistsError(f"weighted mix artifacts are incomplete: {artifact} or {profile_path}")
+        prior = json.loads(profile_path.read_text(encoding="utf-8"))
+        expected_config_hash = (_hash_file(Path(configuration_path)) if configuration_path is not None else None)
+        if (prior.get("dataset_sha256") == _hash_file(artifact)
+                and prior.get("component_hashes") == component_meta
+                and prior.get("configuration_sha256") == expected_config_hash
+                and prior.get("preferred_component_for_duplicates") == preferred_component):
+            return prior
+        raise FileExistsError(f"weighted mix artifacts already exist with different inputs: {artifact} or {profile_path}")
+    root.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(artifact, index=False)
+    output_hash = _hash_file(artifact)
+    component_counts = {str(k): int(v) for k, v in combined.sampling_component.value_counts().sort_index().items()}
+    profile = {"dataset_id": dataset_id, "dataset_sha256": output_hash,
+        "rows": int(len(combined)), "labels": classes,
+        "class_counts": {str(k): int(v) for k, v in combined.model.astype(str).value_counts().sort_index().items()},
+        "sampling_components": component_counts,
+        "sampling_weight_sums": {str(k): float(v) for k, v in combined.groupby("sampling_component").sampling_weight.sum().sort_index().items()},
+        "component_hashes": component_meta, "preferred_component_for_duplicates": preferred_component,
+        "input_rows_before_deduplication": before, "deduplicated_rows": before - int(len(combined)),
+        "deduplication": "NFKC + casefold + collapsed whitespace; punctuation preserved",
+        "sampling_policy": "per-row source weight passed to WeightedRandomSampler",
+        "training_only": True, "validation_dataset_version": None,
+        "v0_exposed": True}
+    if configuration_path is not None:
+        config_path = Path(configuration_path)
+        profile["configuration_path"] = str(config_path)
+        profile["configuration_sha256"] = _hash_file(config_path)
+    profile_path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+    return profile
+
+
 def _external_content_text(value) -> str:
     """Flatten the text-bearing shapes used by the downloaded conversation rows."""
     if value is None:

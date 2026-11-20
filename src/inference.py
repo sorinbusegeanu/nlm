@@ -79,7 +79,9 @@ def predict_catboost_stylometry(checkpoint, texts, classes, *, temperature=1.0):
 def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max_length=384, temperature=1.0,
                     base_checkpoint=None, revision=None, fix_mistral_regex=False,
                     text_only_backbone=False, local_base_model=None, return_scores=False,
-                    quantization=None, attention_backend=None, code_revision=None):
+                    quantization=None, attention_backend=None, code_revision=None,
+                    use_chat_template=False,
+                    chat_template_user_prompt="Identify the source model for the assistant response."):
     try:
         import torch
         from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
@@ -134,7 +136,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
         if model_name == "gte_large":
             from .model_factory import ensure_gte_transformers_compatibility
             network = ensure_gte_transformers_compatibility(network)
-    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}:
+    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen35_08b", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}:
         backbone_path = checkpoint / "merged_backbone"
         if backbone_path.exists() and quantization != "qlora4":
             network = AutoModel.from_pretrained(backbone_path, local_files_only=True, torch_dtype=model_dtype,
@@ -149,15 +151,18 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
             if quantization == "qlora4":
                 if device.type != "cuda":
                     raise RuntimeError("QLoRA checkpoint inference requires a CUDA GPU")
-                if not torch.cuda.is_bf16_supported():
-                    raise RuntimeError("QLoRA checkpoint inference requires BF16-capable CUDA hardware")
                 from transformers import BitsAndBytesConfig
+                # Training may have used BF16, but inference also needs to run
+                # on Kaggle T4 GPUs. 4-bit weights can be loaded with FP16
+                # compute on those GPUs; use BF16 where the device supports it.
+                qlora_compute_dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported()
+                                       else torch.float16)
                 load_kwargs.update({
                     "quantization_config": BitsAndBytesConfig(
                         load_in_4bit=True,
                         bnb_4bit_quant_type="nf4",
                         bnb_4bit_use_double_quant=True,
-                        bnb_4bit_compute_dtype=torch.bfloat16,
+                        bnb_4bit_compute_dtype=qlora_compute_dtype,
                     ),
                     "device_map": {"": torch.cuda.current_device()},
                 })
@@ -203,9 +208,16 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
             text_batch = list(texts[start:start + current_size])
             if model_name == "embeddinggemma2":
                 text_batch = ["task: classification | query: " + str(text) for text in text_batch]
+            if use_chat_template:
+                if not callable(getattr(tokenizer, "apply_chat_template", None)) or not getattr(tokenizer, "chat_template", None):
+                    raise ValueError(f"{model_name} requested chat-template formatting but the tokenizer has no chat template")
+                text_batch = [tokenizer.apply_chat_template(
+                    [{"role": "user", "content": str(chat_template_user_prompt)},
+                     {"role": "assistant", "content": str(text)}],
+                    tokenize=False, add_generation_prompt=False) for text in text_batch]
             try:
                 enc=tokenizer(text_batch,truncation=True,max_length=max_length,padding=True,return_tensors="pt")
-                if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
+                if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen35_08b", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
                 enc={k:v.to(device) for k,v in enc.items()}; logits=network(**enc)
                 if hasattr(logits,"logits"): logits=logits.logits
                 raw_logits = logits.float()
@@ -271,7 +283,9 @@ def export_submission(model, checkpoint, test_path, output_path):
             text_only_backbone=manifest.get("config",{}).get("text_only_backbone",False),
             quantization=manifest.get("config",{}).get("quantization",manifest.get("quantization")),
             attention_backend=manifest.get("config",{}).get("attention_backend",manifest.get("attention_backend")),
-            code_revision=manifest.get("config",{}).get("code_revision"))
+            code_revision=manifest.get("config",{}).get("code_revision"),
+            use_chat_template=manifest.get("config",{}).get("use_chat_template", False),
+            chat_template_user_prompt=manifest.get("config",{}).get("chat_template_user_prompt", "Identify the source model for the assistant response."))
     output = pd.DataFrame({"id": frame.id, "model": np.asarray(classes)[probabilities.argmax(1)]})
     if output.id.astype(str).tolist() != frame.id.astype(str).tolist(): raise RuntimeError("output row order does not match input")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -351,6 +365,8 @@ def predict_candidate(model_spec, texts, classes, bundle_root):
             quantization=config.get("quantization", model_spec.get("quantization")),
             attention_backend=config.get("attention_backend", model_spec.get("attention_backend")),
             code_revision=config.get("code_revision"),
+            use_chat_template=config.get("use_chat_template", False),
+            chat_template_user_prompt=config.get("chat_template_user_prompt", "Identify the source model for the assistant response."),
             local_base_model=(bundle_root / model_spec["base_model"] if model_spec.get("base_model") else None))
     if returned_classes != classes:
         indexes = {label: index for index, label in enumerate(returned_classes)}
@@ -445,7 +461,9 @@ def package_prediction_bundle(selection_manifest, output_zip, *, include_base_mo
             # Training runs keep epoch snapshots beside the selected root
             # checkpoint. Inference loads only the root files; avoid shipping
             # every duplicate adapter and tokenizer in the Kaggle bundle.
-            if any(part.startswith("epoch-") and part[6:].isdigit() for part in relative.parts):
+            if any((part.startswith("epoch-") and part[6:].isdigit()) or
+                   (part.startswith("epoch_") and part[6:].isdigit())
+                   for part in relative.parts):
                 continue
             if any(part in {"onnx", ".git", "__pycache__"} for part in relative.parts):
                 continue

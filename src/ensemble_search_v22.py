@@ -103,7 +103,8 @@ def _blend(matrices: dict[str, np.ndarray], combo: tuple[str, ...], indexes: np.
 
 def _search(matrices: dict[str, np.ndarray], y: np.ndarray, fit_idx: np.ndarray,
             method: str, *, beam_width: int = BEAM_WIDTH,
-            swap_seeds: int = SWAP_SEEDS, swap_passes: int = SWAP_PASSES) -> dict[int, list[dict]]:
+            swap_seeds: int = SWAP_SEEDS, swap_passes: int = SWAP_PASSES,
+            return_diagnostics: bool = False) -> dict[int, list[dict]] | tuple[dict[int, list[dict]], dict]:
     candidates = sorted(matrices, key=lambda x: int(x[1:]))
     score_cache: dict[tuple[str, ...], dict] = {}
     def evaluate(raw_combo: tuple[str, ...]) -> dict:
@@ -164,6 +165,10 @@ def _search(matrices: dict[str, np.ndarray], y: np.ndarray, fit_idx: np.ndarray,
                       key=lambda c: _rank_key(evaluate(c)))[:beam_width]
         top_by_size[size] = [evaluate(c) for c in sorted(
             (c for c in keep if len(c) == size), key=lambda c: _rank_key(evaluate(c)))[:TOP_K]]
+    if return_diagnostics:
+        return top_by_size, {"unique_subsets_scored": len(score_cache),
+            "beam_width": beam_width, "swap_seeds": swap_seeds,
+            "swap_passes": swap_passes, "method": method}
     return top_by_size
 
 

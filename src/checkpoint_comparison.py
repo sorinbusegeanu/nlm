@@ -196,6 +196,8 @@ def _generate_predictions(manifest, manifest_path, validation_rows, classes, art
             revision=manifest.get("model_revision") or config.get("revision"),
             fix_mistral_regex=bool(config.get("fix_mistral_regex", False)),
             text_only_backbone=bool(config.get("text_only_backbone", False)),
+            use_chat_template=bool(config.get("use_chat_template", False)),
+            chat_template_user_prompt=config.get("chat_template_user_prompt", "Identify the source model for the assistant response."),
             quantization=config.get("quantization", manifest.get("quantization")),
             attention_backend=config.get("attention_backend", manifest.get("attention_backend")))
     returned_classes = list(map(str, returned_classes))

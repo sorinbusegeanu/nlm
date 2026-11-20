@@ -29,6 +29,7 @@ from .ensemble_factory import ensemble_probabilities
 from .feature_factory import load_or_fit, stylometry
 from .model_factory import (FROZEN_BACKBONE_MODELS, calculate_max_token_length,
                             _is_complete_trainer_checkpoint,
+                            normalize_class_weights,
                             train_encoder_fold,
                             train_frozen_backbone_fold, train_qwen_lora_fold,
                             train_catboost_stylometry, train_svc,
@@ -38,7 +39,7 @@ from .v2_0_chunks800 import main as build_v2_0_chunks800_dataset
 
 MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert380": "configs/models/ultrabert380.yaml",
     "phi35_mini": "configs/models/phi35_mini.yaml",
-    "qwen06": "configs/models/qwen06.yaml", "qwen17": "configs/models/qwen17.yaml", "qwen4": "configs/models/qwen4.yaml",
+    "qwen06": "configs/models/qwen06.yaml", "qwen17": "configs/models/qwen17.yaml", "qwen35_08b": "configs/models/qwen35_08b.yaml", "qwen4": "configs/models/qwen4.yaml",
     "qwen8": "configs/models/qwen8.yaml",
     "minicpm5_2b": "configs/models/minicpm5_2b.yaml",
     "hunyuan_1_8b": "configs/models/hunyuan_1_8b.yaml",
@@ -60,6 +61,35 @@ MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert380": "configs/mode
     "ministral3_3b": "configs/models/ministral3_3b.yaml",
     "ministral3_8b": "configs/models/ministral3_8b_qlora.yaml",
     "catboost_stylometry": "configs/models/catboost_stylometry.yaml"}
+
+WEIGHTED_SAMPLING_MODELS = ({
+    "ultrabert380", "modernbert_large", "deberta_v3_large", "electra_large", "gte_large",
+    "mpnet_base", "deberta_gemini", "deberta_glm", "qwen06", "qwen17", "qwen35_08b", "qwen4", "qwen8",
+    "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b",
+    "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "phi35_mini",
+} | FROZEN_BACKBONE_MODELS)
+
+# Dataset variants that change the training recipe while reusing immutable rows.
+DATASET_STORAGE_ALIASES = {"v2.14CW": "v2.14"}
+
+
+def _dataset_storage_id(dataset):
+    return DATASET_STORAGE_ALIASES.get(dataset, dataset)
+
+
+def _registered_dataset_training_options(dataset):
+    catalog_path = Path(__file__).resolve().parents[1] / "configs/datasets.yaml"
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8")) or {}
+    return next((entry for entry in catalog.get("datasets", []) if entry.get("id") == dataset), {})
+
+
+def _apply_dataset_training_options(cfg, dataset):
+    if dataset not in DATASET_STORAGE_ALIASES:
+        return cfg
+    options = _registered_dataset_training_options(dataset)
+    if "class_weights" in options and "class_weights" not in cfg:
+        cfg["class_weights"] = options["class_weights"]
+    return cfg
 
 
 class _TeeTextStream:
@@ -130,7 +160,7 @@ def _ensemble_member_labels(members):
     display_names = {"svc": "SVC", "ultrabert380": "UltraBERT-380M", "qwen06": "Qwen3-0.6B",
         "qwen06_best_epoch03": "Qwen3-0.6B best checkpoint (epoch 3)",
         "phi35_mini": "Phi-3.5 Mini",
-        "qwen17": "Qwen3-1.7B", "qwen4": "Qwen3-4B", "qwen8": "Qwen3-8B QLoRA", "llama32_3b": "Llama-3.2-3B", "llama31_8b": "Llama-3.1-8B QLoRA",
+        "qwen17": "Qwen3-1.7B", "qwen35_08b": "Qwen3.5-0.8B", "qwen4": "Qwen3-4B", "qwen8": "Qwen3-8B QLoRA", "llama32_3b": "Llama-3.2-3B", "llama31_8b": "Llama-3.1-8B QLoRA",
         "minicpm5_2b": "MiniCPM5-2B-Base", "hunyuan_1_8b": "Hunyuan-1.8B-Pretrain",
         "smollm3_3b": "SmolLM3-3B",
         "granite4_h_micro": "Granite 4.0 H Micro Base",
@@ -140,7 +170,7 @@ def _ensemble_member_labels(members):
         "deberta_v3_large": "DeBERTa-v3-large",
         "electra_large": "ELECTRA-large-discriminator",
         "gte_large": "GTE-large-en-v1.5",
-        "mpnet_base": "MPNet-base",
+        "mpnet_base": "MPNet-base", "qwen35_08b": "Qwen3.5-0.8B",
         "deberta_gemini": "DeBERTa-v3-base Gemini specialist",
         "deberta_glm": "DeBERTa-v3-base GLM specialist",
         "embeddinggemma2": "EmbeddingGemma 2", "gemma4_e2b": "Gemma 4 E2B", "gemma4_e4b": "Gemma 4 E4B",
@@ -400,6 +430,7 @@ def assemble_training_dataset(config):
 
 
 def _profile_path(data_dir, dataset):
+    dataset = _dataset_storage_id(dataset)
     name = "dataset_profile.json" if dataset == "v0" else f"dataset_profile_{dataset}.json"
     return Path(data_dir) / name
 
@@ -426,7 +457,8 @@ def _effective_profile(data_dir, dataset, rows):
 def _load_dataset(dataset, data_dir):
     """Load the historical split view for analysis utilities."""
     data_dir = Path(data_dir)
-    rows = pd.read_parquet(data_dir / f"dataset_{dataset}.parquet")
+    storage_id = _dataset_storage_id(dataset)
+    rows = pd.read_parquet(data_dir / f"dataset_{storage_id}.parquet")
     if dataset != "v0" and "split" not in rows.columns:
         profile_path = _profile_path(data_dir, dataset)
         if profile_path.is_file():
@@ -449,7 +481,7 @@ def _load_dataset(dataset, data_dir):
                 if set(external.prompt_id.astype(str)) & set(validation.prompt_id.astype(str)):
                     raise ValueError("training dataset and referenced V0 validation prompts overlap")
                 return combined.sort_values("id", kind="stable").reset_index(drop=True), data_dir
-    assignments_path = data_dir / f"splits_{dataset}.parquet"
+    assignments_path = data_dir / f"splits_{storage_id}.parquet"
     if "split" in rows.columns:
         if assignments_path.is_file():
             assignments = pd.read_parquet(assignments_path)
@@ -475,7 +507,7 @@ def _load_dataset(dataset, data_dir):
 
 def _dataset_rows(dataset, data_dir):
     """Load every row in a dataset artifact, ignoring any historical split column."""
-    rows = pd.read_parquet(Path(data_dir) / f"dataset_{dataset}.parquet")
+    rows = pd.read_parquet(Path(data_dir) / f"dataset_{_dataset_storage_id(dataset)}.parquet")
     required = {"id", "prompt_id", "text", "model"}
     missing = required - set(rows.columns)
     if missing:
@@ -488,7 +520,7 @@ def _dataset_rows(dataset, data_dir):
 
 
 def _partition_sha256(rows):
-    content = rows[[column for column in ("id", "prompt_id", "text", "model")
+    content = rows[[column for column in ("id", "prompt_id", "text", "model", "sampling_component", "sampling_weight")
                     if column in rows]].astype(str).to_csv(index=False, lineterminator="\n")
     digest = hashlib.sha256(content.encode("utf-8"))
     if "training_views" in rows:
@@ -586,6 +618,10 @@ def _continuation_source_matches(source, training_dataset, validation_dataset,
 
 def _training_partitions(training_dataset, validation_dataset, data_dir):
     train = _dataset_rows(training_dataset, data_dir)
+    if validation_dataset in {None, "none", "disabled"}:
+        if "view_type" in train:
+            train = _original_response_rows(train, training=True)
+        return train.reset_index(drop=True), train.iloc[0:0].copy().reset_index(drop=True)
     if validation_dataset == "prompt_grouped_80_20":
         assignments_path = Path(data_dir) / f"splits_{training_dataset}.parquet"
         if not assignments_path.is_file():
@@ -698,14 +734,23 @@ def _refresh_ensemble_after_training(manifest, manifest_path, *, artifact_dir, d
 
 
 def _append_v2_checkpoint_trust(manifest, manifest_path):
-    """Append saved full-V0 training metrics to the separate v2 trust list."""
+    """Append saved V0 metrics and keep the V2-only view synchronized."""
+    project_root = Path(__file__).resolve().parents[1]
     try:
         from .v2_checkpoint_trust import append_training_run
         result = append_training_run(manifest, manifest_path,
-                                     root=Path(__file__).resolve().parents[1])
+                                     root=project_root)
     except Exception as exc:
         result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
     manifest["v2_checkpoint_trust_update"] = result
+    try:
+        from .trust_list2_2 import create_trust_list_2_2
+        trust_list_22 = create_trust_list_2_2(root=project_root)
+    except FileNotFoundError as exc:
+        trust_list_22 = {"status": "deferred", "reason": str(exc)}
+    except Exception as exc:
+        trust_list_22 = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    manifest["v2_2_checkpoint_trust_update"] = trust_list_22
     manifest_path = Path(manifest_path)
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
     metrics_path = manifest_path.with_name(
@@ -734,12 +779,50 @@ def _post_training_runtime(result):
     return runtime
 
 
+def _weighted_sampling_dataset_summary(train, *, enabled, seed):
+    """Describe expected per-epoch draw proportions without touching validation."""
+    summary = {"enabled": bool(enabled), "seed": int(seed), "replacement": bool(enabled),
+               "num_samples_per_epoch": int(len(train)),
+               "sampling_weight_column": "sampling_weight" if enabled else None}
+    if not enabled:
+        summary["policy"] = "existing trainer sampling behavior"
+        return summary
+    if "sampling_weight" not in train:
+        raise ValueError("weighted_sampling=true requires a sampling_weight column in the training dataset")
+    weights = pd.to_numeric(train["sampling_weight"], errors="coerce").to_numpy(dtype=np.float64)
+    if (not np.isfinite(weights).all()) or np.any(weights <= 0):
+        raise ValueError("training sampling_weight values must be finite and strictly positive")
+    work = pd.DataFrame({"model": train.model.astype(str).to_numpy(), "weight": weights})
+    totals = work.groupby("model", sort=True).agg(rows=("weight", "size"), weight_sum=("weight", "sum"))
+    total_weight = float(weights.sum())
+    totals["expected_sampling_probability"] = totals.weight_sum / total_weight
+    totals["expected_draws_per_epoch"] = totals.expected_sampling_probability * len(train)
+    summary.update({"policy": "WeightedRandomSampler", "weight_sum": total_weight,
+        "weight_min": float(weights.min()), "weight_median": float(np.median(weights)),
+        "weight_max": float(weights.max()), "class_distribution": {
+            str(label): {"training_rows": int(row.rows), "weight_sum": float(row.weight_sum),
+                        "expected_sampling_probability": float(row.expected_sampling_probability),
+                        "expected_draws_per_epoch": float(row.expected_draws_per_epoch)}
+            for label, row in totals.iterrows()}})
+    if "sampling_component" in train:
+        components = pd.DataFrame({"component": train.sampling_component.astype(str).to_numpy(),
+                                   "weight": weights})
+        component_totals = components.groupby("component", sort=True).agg(
+            rows=("weight", "size"), weight_sum=("weight", "sum"))
+        summary["component_distribution"] = {
+            str(component): {"training_rows": int(row.rows), "weight_sum": float(row.weight_sum),
+                "expected_sampling_probability": float(row.weight_sum / total_weight),
+                "expected_draws_per_epoch": float(row.weight_sum / total_weight * len(train))}
+            for component, row in component_totals.iterrows()}
+    return summary
+
+
 def _register_completed_manifest(manifest, registry_path):
     """Validate published outputs and idempotently make the manifest discoverable."""
-    prediction_path = Path(manifest.get("prediction_path", ""))
-    if not prediction_path.is_file():
+    prediction_path = Path(manifest["prediction_path"]) if manifest.get("prediction_path") else None
+    if not manifest.get("no_validation") and (prediction_path is None or not prediction_path.is_file()):
         raise FileNotFoundError(f"completed experiment prediction artifact is missing: {prediction_path}")
-    if manifest.get("prediction_sha256"):
+    if prediction_path is not None and manifest.get("prediction_sha256"):
         digest = hashlib.sha256(prediction_path.read_bytes()).hexdigest()
         if digest != manifest["prediction_sha256"]:
             raise ValueError("completed experiment prediction artifact does not match its manifest hash")
@@ -757,9 +840,46 @@ def _register_completed_manifest(manifest, registry_path):
         manifest.get("config", {}), metrics, dataset_hash=manifest.get("dataset_sha256"),
         split_hash=manifest.get("split_sha256"), model_revision=manifest.get("model_revision"),
         code_revision=manifest.get("code_revision"), seed=manifest.get("seed"),
-        runtime_seconds=manifest.get("fit_seconds"), artifact_path=str(prediction_path),
+        runtime_seconds=manifest.get("fit_seconds"),
+        artifact_path=str(prediction_path) if prediction_path is not None else manifest.get("checkpoint_path"),
         config_hash=manifest.get("config_sha256"),
         description=manifest.get("description", f"{model} experiment on {manifest.get('training_dataset', manifest.get('dataset'))}."))
+
+
+def _register_no_validation_epoch_checkpoints(manifest, registry_path):
+    """Register every V0-exposed epoch snapshot as its own non-validation registry entry."""
+    checkpoints = list(manifest.get("epoch_checkpoints", []))
+    if len(checkpoints) != int(manifest.get("config", {}).get("epochs", 0)):
+        raise ValueError("no-validation checkpoint registration requires one snapshot per configured epoch")
+    registry = Registry(registry_path)
+    registrations = []
+    for epoch, checkpoint in enumerate(checkpoints, start=1):
+        path = Path(checkpoint)
+        required = ("adapter_config.json", "classifier.pt", "checkpoint_manifest.json", "tokenizer_config.json")
+        missing = [name for name in required if not (path / name).is_file()]
+        adapter_files = (path / "adapter_model.safetensors").is_file() or (path / "adapter_model.bin").is_file()
+        if missing or not adapter_files:
+            raise FileNotFoundError(f"epoch {epoch} checkpoint is incomplete: missing {missing}; adapter={adapter_files}")
+        checkpoint_manifest = json.loads((path / "checkpoint_manifest.json").read_text(encoding="utf-8"))
+        labels = list(checkpoint_manifest.get("classes", []))
+        expected_mapping = {label: index for index, label in enumerate(labels)}
+        if (len(labels) != 18 or checkpoint_manifest.get("label_to_id") != expected_mapping
+                or checkpoint_manifest.get("validation_enabled") is not False
+                or checkpoint_manifest.get("training_lineage") != "V0-exposed"):
+            raise ValueError(f"epoch {epoch} checkpoint manifest has invalid labels or V0-exposure metadata")
+        child_id = f"{manifest['experiment_id']}_epoch_{epoch}"
+        child_config = {**manifest["config"], "checkpoint_path": str(path),
+                        "epoch": epoch, "checkpoint_exposure": "V0-exposed",
+                        "training_lineage": manifest.get("training_lineage")}
+        registry.add(child_id, manifest["model"], "no_validation_epoch_checkpoint", child_config, {},
+            dataset_hash=manifest.get("dataset_sha256"), code_revision=manifest.get("code_revision"),
+            seed=manifest.get("seed"), runtime_seconds=None, artifact_path=str(path),
+            config_hash=manifest.get("config_sha256"), split_hash=manifest.get("split_sha256"),
+            model_revision=manifest.get("model_revision"),
+            description=f"Epoch {epoch} checkpoint; V0-exposed training lineage, not eligible for external-only Trust List validation.")
+        registrations.append({"experiment_id": child_id, "epoch": epoch, "checkpoint_path": str(path),
+                              "checkpoint_exposure": "V0-exposed", "trust_list_eligible": False})
+    return registrations
 
 
 def _model_cfg(model, config_path=None):
@@ -767,6 +887,8 @@ def _model_cfg(model, config_path=None):
     if not path.exists(): raise FileNotFoundError(f"model config not found: {path}")
     cfg = _read_yaml(path)
     _strip_obsolete_calibration_config(cfg)
+    if "weighted_sampling" in cfg and not isinstance(cfg["weighted_sampling"], bool):
+        raise ValueError(f"weighted_sampling in {path} must be a boolean")
     cfg.setdefault("model", model)
     if cfg["model"] != model: raise ValueError(f"model config {path} declares {cfg['model']!r}, expected {model!r}")
     cfg["_config_path"] = str(path)
@@ -792,7 +914,23 @@ def _model_cfg(model, config_path=None):
 
 
 def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache_dir, *,
-                cache_fold=None, checkpoint_selection_metric="balanced_accuracy", stop_file=None):
+                cache_fold=None, checkpoint_selection_metric="balanced_accuracy", stop_file=None,
+                no_validation=False):
+    weighted_sampling = bool(cfg.get("weighted_sampling", False))
+    sampling_weights = None
+    if weighted_sampling:
+        if model not in WEIGHTED_SAMPLING_MODELS or (
+                model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen"):
+            raise ValueError(f"weighted_sampling is supported only for neural SFT models, not {model}")
+        if "sampling_weight" not in train.columns:
+            raise ValueError("weighted_sampling=true requires a sampling_weight column in the training dataset")
+        sampling_weights = pd.to_numeric(train.sampling_weight, errors="coerce").to_numpy(dtype=np.float64)
+        if (len(sampling_weights) != len(train) or not np.isfinite(sampling_weights).all()
+                or np.any(sampling_weights <= 0)):
+            raise ValueError("training sampling_weight values must be finite and strictly positive")
+        print("Weighted sampling enabled: " + json.dumps({"replacement": True,
+            "num_samples_per_epoch": len(train), "seed": int(seed),
+            "sampling_weight_column": "sampling_weight"}, sort_keys=True), flush=True)
     has_views = "training_views" in train.columns
     training_views = train.training_views.tolist() if has_views else None
     training_view_ids = train.training_view_ids.tolist() if has_views else None
@@ -851,7 +989,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_encoder_fold(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
             checkpoint=cfg["checkpoint"], revision=cfg["revision"], output_dir=checkpoint,
-            epochs=cfg.get("epochs", 20), batch_size=cfg.get("batch_size", 16),
+            epochs=cfg.get("epochs", 10), batch_size=cfg.get("batch_size", 16),
             inference_batch_size=cfg.get("inference_batch_size"), max_length=cfg["max_length"],
             learning_rate=cfg.get("learning_rate", 2e-5), seed=seed,
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
@@ -871,12 +1009,14 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             gradient_checkpointing=cfg.get("gradient_checkpointing", False),
             attention_backend=cfg.get("attention_backend"),
             code_revision=cfg.get("code_revision"),
+            class_weights=cfg.get("class_weights"),
             select_best_checkpoint=(checkpoint_selection_metric == "balanced_accuracy"
                 or cfg.get("checkpoint_selection") == "highest_validation_accuracy"),
             checkpoint_selection_metric=checkpoint_selection_metric,
             save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False),
             trainer_resume_checkpoint=cfg.get("trainer_resume_checkpoint"),
             training_views=training_views, training_view_ids=training_view_ids,
+            weighted_sampling=weighted_sampling, sampling_weights=sampling_weights,
             stop_file=stop_file)
         result["checkpoint"] = str(checkpoint)
     elif model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen":
@@ -894,23 +1034,25 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             embedding_cache_dir=Path(cache_dir).parent / "frozen_embeddings",
             trust_remote_code=cfg.get("trust_remote_code", False))
         result["checkpoint"] = str(checkpoint)
-    elif model in ({"qwen06", "qwen17", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "phi35_mini"}
+    elif model in ({"qwen06", "qwen17", "qwen35_08b", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "phi35_mini"}
                    | FROZEN_BACKBONE_MODELS):
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
-        result = train_qwen_lora_fold(train.text.tolist(), train.model.tolist(), valid.text.tolist(), classes,
+        result = train_qwen_lora_fold(train.text.tolist(), train.model.tolist(),
+            [] if no_validation else valid.text.tolist(), classes,
             checkpoint=cfg["checkpoint"], revision=cfg["revision"], output_dir=checkpoint,
-            epochs=cfg.get("epochs", 20), batch_size=cfg.get("batch_size", 4), max_length=cfg["max_length"],
+            epochs=cfg.get("epochs", 10), batch_size=cfg.get("batch_size", 4), max_length=cfg["max_length"],
             learning_rate=cfg.get("learning_rate", 1e-4), seed=seed,
             gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
             target_effective_batch_size=cfg.get("target_effective_batch_size"),
             lora_rank=cfg.get("lora_rank", 16), lora_alpha=cfg.get("lora_alpha", 32),
+            lora_dropout=cfg.get("lora_dropout", 0.05),
             lora_target_modules=cfg.get("lora_target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]),
             learning_rate_decay=cfg.get("learning_rate_decay", 1.0),
             auto_batch_size=cfg.get("auto_batch_size", False),
             max_batch_size=cfg.get("max_batch_size", 1024),
             batch_probe_safety_fraction=cfg.get("batch_probe_safety_fraction", 0.95),
             resume_checkpoint=cfg.get("resume_checkpoint"),
-            validation_labels=valid.model.tolist(),
+            validation_labels=None if no_validation else valid.model.tolist(),
             gradient_checkpointing=cfg.get("gradient_checkpointing", False),
             local_files_only=cfg.get("local_files_only", True),
             readout_hidden_size=cfg.get("readout_hidden_size"),
@@ -919,6 +1061,8 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             lora_exclude_modules=cfg.get("lora_exclude_modules"),
             early_stopping_patience=cfg.get("early_stopping_patience", 2),
             text_only_backbone=cfg.get("text_only_backbone", False),
+            use_chat_template=cfg.get("use_chat_template", False),
+            chat_template_user_prompt=cfg.get("chat_template_user_prompt", "Identify the source model for the assistant response."),
             lr_scheduler_type=cfg.get("lr_scheduler_type"),
             warmup_ratio=cfg.get("warmup_ratio", 0.0),
             warmup_epochs=cfg.get("warmup_epochs"),
@@ -926,9 +1070,15 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             weight_decay=cfg.get("weight_decay", 0.0),
             trust_remote_code=cfg.get("trust_remote_code", False),
             quantization=cfg.get("quantization", "none"),
+            weighted_sampling=weighted_sampling, sampling_weights=sampling_weights,
+            sampling_components=(train.sampling_component.astype(str).tolist()
+                                 if weighted_sampling and "sampling_component" in train else None),
+            training_lineage=cfg.get("training_lineage"),
+            epoch_checkpoint_style=cfg.get("epoch_checkpoint_style", "hyphen"),
             attention_backend=cfg.get("attention_backend"),
             checkpoint_selection_metric=checkpoint_selection_metric,
             save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False),
+            class_weights=cfg.get("class_weights"),
             inference_batch_size=cfg.get("inference_batch_size"),
             training_views=training_views, training_view_ids=training_view_ids,
             stop_file=stop_file)
@@ -960,6 +1110,8 @@ def _dataset_max_length(model, cfg, rows, *, checkpoint=None, revision=None):
         code_revision=cfg.get("code_revision"),
         cap_at_context_window=cfg.get("cap_sequence_length_at_context_window", False),
         max_length_cap=cfg.get("max_sequence_length_cap"),
+        use_chat_template=cfg.get("use_chat_template", False),
+        chat_template_user_prompt=cfg.get("chat_template_user_prompt", "Identify the source model for the assistant response."),
         local_files_only=cfg.get("local_files_only", True))
 
 
@@ -1315,8 +1467,8 @@ def build_features(dataset="v1", data_dir="data/processed", config_path="configs
     return report
 
 
-def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None, refresh_prediction=False, refresh_checkpoint_catalog=False, validation_dataset="v0", max_length=None):
-    """Train on every row in dataset and validate on every row in validation_dataset."""
+def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_dir="artifacts", registry_path="experiments/registry.sqlite", *, config_path=None, feature_config_path=None, seed=2026, folds=None, config_overrides=None, refresh_prediction=False, refresh_checkpoint_catalog=False, validation_dataset="v0", max_length=None, no_validation=False):
+    """Train on every row and optionally disable validation for explicitly exposed training data."""
     if folds is not None:
         raise ValueError("fold selection was removed; specify explicit training and validation datasets")
     cfg = _model_cfg(model, config_path)
@@ -1324,6 +1476,16 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         cfg.update(config_overrides)
         _strip_obsolete_calibration_config(cfg)
         _validate_training_overrides(model, cfg)
+    no_validation = bool(no_validation or cfg.get("no_validation", False))
+    if no_validation:
+        if model not in {"granite4_350m", "granite4_h_micro", "granite41_3b"} or cfg.get("training_mode", "lora") != "lora":
+            raise ValueError("no_validation is currently supported only for LoRA language-model classifiers")
+        if refresh_prediction or refresh_checkpoint_catalog:
+            raise ValueError("no-validation runs cannot refresh V0 predictions or checkpoint catalogs")
+        validation_dataset = "none"
+    elif str(validation_dataset).lower() in {"none", "disabled"}:
+        raise ValueError("validation_dataset none/disabled requires explicit no_validation=true")
+    _apply_dataset_training_options(cfg, dataset)
     if model in {"svc", "catboost_stylometry"} and feature_config_path:
         cfg["features"] = _read_yaml(feature_config_path)
     if max_length is not None:
@@ -1333,8 +1495,22 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         if model in {"svc", "catboost_stylometry"}:
             raise ValueError("--max-length applies to tokenizer-based models, not SVC or CatBoost")
         cfg["max_length"] = max_length
-    train, valid = _training_partitions(dataset, validation_dataset, data_dir)
+    train, valid = _training_partitions(dataset, "none" if no_validation else validation_dataset, data_dir)
+    weighted_sampling_enabled = bool(cfg.get("weighted_sampling", False))
+    if weighted_sampling_enabled:
+        if model not in WEIGHTED_SAMPLING_MODELS or (
+                model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen"):
+            raise ValueError(f"weighted_sampling is supported only for neural SFT models, not {model}")
+        if "sampling_weight" not in train:
+            raise ValueError("weighted_sampling=true requires a sampling_weight column in the training dataset")
+    weighted_sampling_summary = _weighted_sampling_dataset_summary(
+        train, enabled=weighted_sampling_enabled, seed=seed)
     classes = sorted(train.model.astype(str).unique().tolist())
+    if "class_weights" in cfg:
+        cfg["class_weights"] = normalize_class_weights(cfg["class_weights"], classes)
+    if cfg.get("class_weights") is not None:
+        if model in {"svc", "catboost_stylometry"} or (model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen"):
+            raise ValueError(f"class_weights are supported only for encoder and LoRA/QLoRA classifiers, not {model}")
     train_profile = json.loads(_profile_path(Path(data_dir), dataset).read_text())
     if model not in {"svc", "catboost_stylometry"}:
         if max_length is None:
@@ -1361,10 +1537,15 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
     pred_dir = Path(artifact_dir) / "predictions"
     prediction_path = pred_dir / f"{experiment_id}_validation.parquet"
     manifest_path = pred_dir / f"{experiment_id}_manifest.json"
-    if manifest_path.exists() and prediction_path.exists():
+    if manifest_path.exists() and (no_validation or prediction_path.exists()):
         manifest = json.loads(manifest_path.read_text())
         _register_completed_manifest(manifest, registry_path)
-        _append_v2_checkpoint_trust(manifest, manifest_path)
+        if manifest.get("no_validation"):
+            manifest["epoch_checkpoint_registrations"] = _register_no_validation_epoch_checkpoints(
+                manifest, registry_path)
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        else:
+            _append_v2_checkpoint_trust(manifest, manifest_path)
         return manifest
     if run_artifact_dir.exists():
         raise FileExistsError(f"incomplete immutable experiment exists at {run_artifact_dir}; remove that generated run directory to retry")
@@ -1385,9 +1566,10 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             print("TRAINING_RUN " + json.dumps({"pid": os.getpid(),
                 "model": model, "dataset": dataset, "started_at": time.time()}), flush=True)
-            result = _train_fold(model, train, valid, classes, cfg, run_artifact_dir, seed, "validation", Path(artifact_dir)/"features",
+            result = _train_fold(model, train, valid, classes, cfg, run_artifact_dir, seed, "no_validation" if no_validation else "validation", Path(artifact_dir)/"features",
                                  cache_fold=f"{dataset}-{train_hash}-{validation_dataset}-{valid_hash}",
-                                 checkpoint_selection_metric=metric, stop_file=stop_file)
+                                 checkpoint_selection_metric=metric, stop_file=stop_file,
+                                 no_validation=no_validation)
             if stop_file.is_file() and not result.get("stop_requested"):
                 # Single-fit estimators cannot pause at optimizer steps. A stop
                 # requested during their fit still proceeds through this normal
@@ -1399,45 +1581,58 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         sampling_path = run_artifact_dir / "training_view_sampling.json"
         sampling_path.write_text(json.dumps({"training_dataset": dataset,
             "training_dataset_sha256": train_hash, "sampling": training_view_sampling}, indent=2) + "\n")
+    weighted_sampling = {**weighted_sampling_summary, **(result.get("weighted_sampling") or {})}
+    weighted_sampling["enabled"] = bool(cfg.get("weighted_sampling", False))
+    if weighted_sampling["enabled"]:
+        weighted_sampling_path = run_artifact_dir / "weighted_sampling.json"
+        weighted_sampling_path.write_text(json.dumps({"training_dataset": dataset,
+            "training_dataset_sha256": train_hash, "sampling": weighted_sampling}, indent=2) + "\n")
     export_started = time.perf_counter()
     post_training_started = export_started
     runtime_breakdown = _post_training_runtime(result)
-    scores, probabilities = result["scores"], result["probabilities"]
-    if (not np.isfinite(scores).all() or not np.isfinite(probabilities).all()
+    scores = result.get("scores", np.empty((0, len(classes)), dtype=np.float32))
+    probabilities = result.get("probabilities", np.empty((0, len(classes)), dtype=np.float32))
+    if not no_validation and (not np.isfinite(scores).all() or not np.isfinite(probabilities).all()
             or not np.allclose(probabilities.sum(axis=1), 1, atol=1e-5)):
         raise RuntimeError("V0 validation output is incomplete or non-finite")
-    metrics = evaluate(valid.model.astype(str), scores, classes, probabilities)
+    metrics = {} if no_validation else evaluate(valid.model.astype(str), scores, classes, probabilities)
     if result.get("validation_loss_raw") is not None:
         metrics["validation_loss_raw"] = float(result["validation_loss_raw"])
     for key in [name for name in metrics if str(name).startswith("calibrated_")]:
         metrics.pop(key, None)
-    pred = valid[["id", "prompt_id", "model"]].rename(columns={"model": "y_true"}).copy()
-    for i, label in enumerate(classes):
-        pred[f"score::{label}"] = scores[:, i]
-        pred[f"prob::{label}"] = probabilities[:, i]
-    pred_dir.mkdir(parents=True, exist_ok=True)
-    prediction_export_started = time.perf_counter()
-    pred.to_parquet(prediction_path, index=False)
-    epoch_prediction_records = _save_epoch_validation_predictions(
-        result, valid, classes, pred_dir, experiment_id)
-    runtime_breakdown["prediction_export_seconds"] = time.perf_counter() - prediction_export_started
+    epoch_prediction_records = []
+    if not no_validation:
+        pred = valid[["id", "prompt_id", "model"]].rename(columns={"model": "y_true"}).copy()
+        for i, label in enumerate(classes):
+            pred[f"score::{label}"] = scores[:, i]
+            pred[f"prob::{label}"] = probabilities[:, i]
+        pred_dir.mkdir(parents=True, exist_ok=True)
+        prediction_export_started = time.perf_counter()
+        pred.to_parquet(prediction_path, index=False)
+        epoch_prediction_records = _save_epoch_validation_predictions(
+            result, valid, classes, pred_dir, experiment_id)
+        runtime_breakdown["prediction_export_seconds"] = time.perf_counter() - prediction_export_started
     checkpoint = Path(result["checkpoint"])
     artifact_size = sum(f.stat().st_size for f in checkpoint.rglob("*") if f.is_file()) if checkpoint.is_dir() else checkpoint.stat().st_size
     validation_ids = sorted(valid.id.astype(str))
     manifest_export_started = time.perf_counter()
     manifest = {"experiment_id": experiment_id, "experiment_name": config_snapshot.get("experiment_name"),
         "model": model, "dataset": dataset,
-        "split": "validation", "training_dataset": dataset, "validation_dataset": validation_dataset,
+        "split": "no_validation" if no_validation else "validation",
+        "training_dataset": dataset, "validation_dataset": None if no_validation else validation_dataset,
+        "no_validation": bool(no_validation),
+        "training_lineage": cfg.get("training_lineage"),
+        "checkpoint_exposure": "V0-exposed" if no_validation else "V0-validation",
         "training_dataset_rows": len(train), "validation_dataset_rows": len(valid),
         "training_dataset_sha256": train_hash, "validation_dataset_sha256": valid_hash,
-        "checkpoint_selection_scope": validation_dataset,
+        "checkpoint_selection_scope": None if no_validation else validation_dataset,
         "classes": classes, "train_rows": len(train), "validation_rows": len(valid),
         "train_id_sha256": hashlib.sha256("\n".join(train.id.astype(str)).encode()).hexdigest(),
         "id_sha256": hashlib.sha256("\n".join(validation_ids).encode()).hexdigest(),
         "validation_ids_sha256": hashlib.sha256("\n".join(validation_ids).encode()).hexdigest(),
-        "checkpoint_selection_rows": len(valid),
+        "checkpoint_selection_rows": 0 if no_validation else len(valid),
         "checkpoint_selection_ids_sha256": hashlib.sha256("\n".join(validation_ids).encode()).hexdigest(),
-        "checkpoint_selection_prompt_groups": int(valid.prompt_id.nunique()),
+        "checkpoint_selection_prompt_groups": 0 if no_validation else int(valid.prompt_id.nunique()),
         "checkpoint_selection_prompt_ids_sha256": profile.get("validation_prompt_ids_sha256"),
         "checkpoint_selection_normalized_text_sha256": profile.get("validation_normalized_text_sha256"),
         "checkpoint_selection_prompt_content_sha256": profile.get("validation_prompt_content_sha256"),
@@ -1455,6 +1650,14 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         "training_view_sampling": training_view_sampling,
         "training_view_sampling_artifact": (str(run_artifact_dir / "training_view_sampling.json")
                                              if training_view_sampling is not None else None),
+        "class_weights": cfg.get("class_weights"),
+        "loss_config": {
+            "training": "class_weighted_cross_entropy" if cfg.get("class_weights") else "model_default",
+            "validation": "model_default_unweighted" if cfg.get("class_weights") else "model_default",
+        },
+        "weighted_sampling": weighted_sampling,
+        "weighted_sampling_artifact": (str(run_artifact_dir / "weighted_sampling.json")
+                                        if weighted_sampling["enabled"] else None),
         "inference_rows_per_second": (len(valid) / result["inference_seconds"]
             if result.get("inference_seconds") else None),
         "peak_gpu_memory_bytes": result.get("peak_gpu_memory_bytes"),
@@ -1479,13 +1682,13 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         "validation_predictions_by_epoch": epoch_prediction_records,
         "validation_metrics_by_iteration": result.get("validation_metrics_by_iteration", []),
         "validation_metrics": metrics,
-        "checkpoint_selection_metric": result.get("checkpoint_selection_metric") or
+        "checkpoint_selection_metric": (None if no_validation else result.get("checkpoint_selection_metric") or
             ("single_fit_no_epoch_selection" if model in {"svc"} or
              (model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen")
-             else f"validation_{metric}"),
+             else f"validation_{metric}")),
         "selected_validation_balanced_accuracy": result.get("best_validation_balanced_accuracy",
             result.get("selected_validation_balanced_accuracy", metrics.get("balanced_accuracy"))),
-        "early_stopping_scope": validation_dataset,
+        "early_stopping_scope": None if no_validation else validation_dataset,
         "early_stopping": result.get("early_stopping"),
         "stop_requested": bool(result.get("stop_requested", False)),
         "stop_request_path": result.get("stop_request_path"),
@@ -1507,14 +1710,20 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
             result.get("best_checkpoint_path") or str(checkpoint),
         "best_checkpoint_path": result.get("best_checkpoint_path") or
             result.get("selected_checkpoint_path") or str(checkpoint),
-        "prediction_path": str(prediction_path), "prediction_sha256": hashlib.sha256(prediction_path.read_bytes()).hexdigest(),
-        "validation_dataset_provenance": {"name": validation_dataset, "rows": len(valid),
+        "prediction_path": None if no_validation else str(prediction_path),
+        "prediction_sha256": None if no_validation else hashlib.sha256(prediction_path.read_bytes()).hexdigest(),
+        "validation_dataset_provenance": ({"enabled": False,
+            "reason": "validation disabled; V0 examples are part of training"} if no_validation else
+            {"name": validation_dataset, "rows": len(valid),
             "sha256": valid_hash, "ids_sha256": profile.get("validation_ids_sha256"),
-            "prompt_groups": int(valid.prompt_id.nunique())},
+            "prompt_groups": int(valid.prompt_id.nunique())}),
         "metrics": metrics, "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat()}
+    pred_dir.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     experiment_name = config_snapshot.get("experiment_name")
     description = (f"{experiment_name}: " if experiment_name else "") + (
+        f"{model} trained on all {len(train)} {dataset} rows; validation disabled and checkpoint selection not used."
+        if no_validation else
         f"{model} trained on all {len(train)} {dataset} rows; validation and checkpoint selection used all "
         f"{len(valid)} {validation_dataset} rows (balanced accuracy).")
     manifest["description"] = description
@@ -1549,7 +1758,14 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
     manifest["runtime_breakdown"] = runtime_breakdown
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
     (pred_dir / f"{experiment_id}_metrics.json").write_text(json.dumps(manifest, indent=2, default=str) + "\n")
-    _append_v2_checkpoint_trust(manifest, manifest_path)
+    if no_validation:
+        manifest["epoch_checkpoint_registrations"] = _register_no_validation_epoch_checkpoints(
+            manifest, registry_path)
+        manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+        (pred_dir / f"{experiment_id}_metrics.json").write_text(
+            json.dumps(manifest, indent=2, default=str) + "\n")
+    else:
+        _append_v2_checkpoint_trust(manifest, manifest_path)
     return manifest
 
 
@@ -1622,6 +1838,12 @@ TRAINING_OVERRIDE_FIELDS = (
     "iterations", "depth", "l2_leaf_reg", "early_stopping_rounds", "inference_batch_size", "save_epoch_checkpoints",
     "auto_batch_size", "max_batch_size", "batch_probe_safety_fraction", "gradient_checkpointing",
     "trainer_resume_checkpoint",
+    "weighted_sampling",
+    "no_validation",
+    "training_lineage",
+    "epoch_checkpoint_style",
+    "class_weights",
+    "resume_optimizer_state_with_lr_override",
 )
 
 CONTINUATION_CONFIG_FIELDS = set(TRAINING_OVERRIDE_FIELDS) | {
@@ -1633,11 +1855,13 @@ CONTINUATION_CONFIG_FIELDS = set(TRAINING_OVERRIDE_FIELDS) | {
 }
 
 
-def _continuation_config(model, parent_config=None, custom_config_path=None, explicit_overrides=None):
+def _continuation_config(model, parent_config=None, custom_config_path=None, explicit_overrides=None, *, dataset=None):
     """Apply continuation recipe precedence: defaults, parent, explicit YAML, CLI/UI."""
     cfg = _model_cfg(model)
     cfg.update({key: value for key, value in (parent_config or {}).items()
                 if key in CONTINUATION_CONFIG_FIELDS})
+    if dataset in DATASET_STORAGE_ALIASES:
+        cfg.update(_apply_dataset_training_options({}, dataset))
     if custom_config_path:
         custom = _read_yaml(custom_config_path)
         if custom.get("model", model) != model:
@@ -1681,6 +1905,14 @@ def _matching_continuation_source(model, dataset, validation_dataset, data_dir,
 
 
 def _validate_training_overrides(model, cfg):
+    for name in ("weighted_sampling", "no_validation", "save_epoch_checkpoints", "early_stopping"):
+        if name in cfg and not isinstance(cfg[name], bool):
+            raise ValueError(f"{name} must be a boolean")
+    if cfg.get("no_validation") and cfg.get("early_stopping", False):
+        raise ValueError("no_validation runs must disable early_stopping")
+    if ("resume_optimizer_state_with_lr_override" in cfg and
+            not isinstance(cfg["resume_optimizer_state_with_lr_override"], bool)):
+        raise ValueError("resume_optimizer_state_with_lr_override must be a boolean")
     for name in ("learning_rate", "weight_decay", "warmup_ratio", "learning_rate_decay"):
         if name in cfg and cfg[name] is not None and float(cfg[name]) < 0:
             raise ValueError(f"{name} must not be negative")
@@ -1744,11 +1976,12 @@ def _confirm_training_config(model, cfg, *, accept_defaults=False):
 def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifacts",
                   registry_path="experiments/registry.sqlite", *, from_experiment=None, epochs=None, seed=2026,
                   config_path=None, config_overrides=None, model="qwen06", validation_dataset="v0",
-                  refresh_prediction=False, refresh_checkpoint_catalog=False):
+                  refresh_prediction=False, refresh_checkpoint_catalog=False,
+                  allow_cross_dataset_source=False):
     """Continue a saved LoRA model and validate after every additional epoch."""
     from .model_factory import train_qwen_lora_fold
-    if model not in {"qwen06", "qwen17", "qwen4", "qwen8", "granite4_350m"}:
-        raise ValueError("LoRA continuation supports Qwen3 models and granite4_350m")
+    if model not in {"qwen06", "qwen17", "qwen35_08b", "qwen4", "qwen8", "granite4_350m", "granite4_h_micro", "minicpm5_2b", "hunyuan_1_8b"}:
+        raise ValueError("LoRA continuation does not support this model")
     train, valid = _training_partitions(dataset, validation_dataset, data_dir)
     training_views = train.training_views.tolist() if "training_views" in train.columns else None
     training_view_ids = train.training_view_ids.tolist() if "training_view_ids" in train.columns else None
@@ -1758,20 +1991,52 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
     profile = {"dataset_sha256": train_hash, "split_sha256": _sha([dataset, train_hash, validation_dataset, valid_hash])}
     manifests_dir = Path(artifact_dir)/"predictions"
     source_path, source = _matching_continuation_source(
-        model, dataset, validation_dataset, data_dir, artifact_dir, from_experiment)
+        model, dataset, validation_dataset, data_dir, artifact_dir, from_experiment,
+        allow_cross_dataset_source=allow_cross_dataset_source)
     source_checkpoint = _resolve_checkpoint_path(source.get("best_checkpoint_path") or
                                                   source["checkpoint_path"], artifact_dir)
     if not source_checkpoint.is_dir(): raise FileNotFoundError(f"Qwen continuation checkpoint not found: {source_checkpoint}")
-    trainer_resume_checkpoint, _, completed_epochs = _continuation_trainer_state(
-        source, source_checkpoint, artifact_dir)
     explicit = dict(config_overrides or {})
     if epochs is not None:
         explicit["epochs"] = epochs
-    cfg = _continuation_config(model, source.get("config", {}), config_path, explicit)
-    additional_epochs = int(cfg.get("epochs", 4))
+    cfg = _continuation_config(model, source.get("config", {}), config_path, explicit, dataset=dataset)
+    if cfg.get("class_weights") is not None:
+        cfg["class_weights"] = normalize_class_weights(
+            cfg["class_weights"], sorted(train.model.astype(str).unique().tolist()))
+    weighted_sampling_enabled = bool(cfg.get("weighted_sampling", False))
+    weighted_sampling_summary = _weighted_sampling_dataset_summary(
+        train, enabled=weighted_sampling_enabled, seed=int(source.get("seed", seed)))
+    sampling_weights = None
+    if weighted_sampling_enabled:
+        if model not in WEIGHTED_SAMPLING_MODELS:
+            raise ValueError(f"weighted_sampling is not supported for {model}")
+        sampling_weights = pd.to_numeric(train.sampling_weight, errors="coerce").to_numpy(dtype=np.float64)
+        if not np.isfinite(sampling_weights).all() or np.any(sampling_weights <= 0):
+            raise ValueError("training sampling_weight values must be finite and strictly positive")
+    additional_epochs = int(cfg.get("epochs", 10))
     seed = int(source.get("seed", seed))
+    source_learning_rate = float((source.get("config") or {}).get("learning_rate", cfg.get("learning_rate", 0.0)))
+    restart_optimizer_for_lr = ("learning_rate" in explicit and
+        not np.isclose(float(explicit["learning_rate"]), source_learning_rate, rtol=0.0, atol=1e-15))
+    if restart_optimizer_for_lr:
+        trainer_resume_checkpoint = None
+        completed_epochs = int(source["selected_epoch"])
+    else:
+        trainer_resume_checkpoint, _, completed_epochs = _continuation_trainer_state(
+            source, source_checkpoint, artifact_dir)
     _restore_continuation_recipe(cfg, source, completed_epochs=completed_epochs,
                                  additional_epochs=additional_epochs)
+    # Preserve an explicitly requested continuation LR after inheriting the
+    # source run's remaining recipe settings.
+    if "learning_rate" in explicit:
+        cfg["learning_rate"] = float(explicit["learning_rate"])
+    if restart_optimizer_for_lr:
+        # A completed linear scheduler is at zero LR. Continue from the selected
+        # model weights with a fresh optimizer/scheduler when the requested LR
+        # differs, so the explicit continuation LR is the actual first-step LR.
+        cfg["epochs"] = additional_epochs
+        if "early_stopping_patience" in explicit:
+            cfg["early_stopping_patience"] = explicit["early_stopping_patience"]
     target_epochs = int(cfg["epochs"])
     # A continuation must use the exact base model revision that produced its
     # adapter, even if the local model config has since changed.
@@ -1794,6 +2059,8 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
     snapshot["continued_from_experiment"] = source["experiment_id"]
     snapshot["additional_epochs"] = additional_epochs
     snapshot["resume_from_epoch"] = completed_epochs
+    snapshot["optimizer_state_policy"] = ("reinitialized_for_learning_rate_override"
+        if restart_optimizer_for_lr else "restored_from_source_checkpoint")
     config_hash = _sha(snapshot); code_revision = _revision()
     source_key = hashlib.sha256(source["experiment_id"].encode()).hexdigest()[:8]
     experiment_id = f"{model}_{dataset}_continue{additional_epochs}_from{source_key}_seed{seed}_cfg{config_hash[:8]}_code{code_revision[:7]}"
@@ -1808,17 +2075,19 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps",1),
         target_effective_batch_size=cfg.get("target_effective_batch_size"),
         lora_rank=cfg.get("lora_rank",16),lora_alpha=cfg.get("lora_alpha",32),
+        lora_dropout=cfg.get("lora_dropout",0.05),
         lora_target_modules=cfg.get("lora_target_modules",["q_proj","k_proj","v_proj","o_proj"]),
         auto_batch_size=cfg.get("auto_batch_size",False),
         max_batch_size=cfg.get("max_batch_size",cfg.get("batch_size",4)),
         batch_probe_safety_fraction=cfg.get("batch_probe_safety_fraction",0.95),
         resume_checkpoint=source_checkpoint,validation_labels=valid.model.tolist(),
-        _trainer_resume_checkpoint=str(trainer_resume_checkpoint),
+        _trainer_resume_checkpoint=(None if restart_optimizer_for_lr else str(trainer_resume_checkpoint)),
         local_files_only=True,
         gradient_checkpointing=cfg.get("gradient_checkpointing",False),
         learning_rate_decay=cfg.get("learning_rate_decay",1.0),
         lr_scheduler_type=cfg.get("lr_scheduler_type"),
         warmup_ratio=cfg.get("warmup_ratio",0.0),
+        class_weights=cfg.get("class_weights"),
         optimizer=cfg.get("optimizer", "adamw_torch"),
         weight_decay=cfg.get("weight_decay", 0.0),
         early_stopping_patience=cfg.get("early_stopping_patience", 2),
@@ -1830,16 +2099,24 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         fix_mistral_regex=cfg.get("fix_mistral_regex", False),
         lora_exclude_modules=cfg.get("lora_exclude_modules"),
         text_only_backbone=cfg.get("text_only_backbone", False),
+        use_chat_template=cfg.get("use_chat_template", False),
+        chat_template_user_prompt=cfg.get("chat_template_user_prompt", "Identify the source model for the assistant response."),
         trust_remote_code=cfg.get("trust_remote_code", False),
         checkpoint_selection_metric=cfg["checkpoint_selection_metric"],
         save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False),
-        training_views=training_views, training_view_ids=training_view_ids)
+        training_views=training_views, training_view_ids=training_view_ids,
+        weighted_sampling=weighted_sampling_enabled, sampling_weights=sampling_weights)
     training_view_sampling = result.get("training_view_sampling")
     sampling_path = None
     if training_view_sampling is not None:
         sampling_path = run_dir / "training_view_sampling.json"
         sampling_path.write_text(json.dumps({"training_dataset": dataset,
             "training_dataset_sha256": train_hash, "sampling": training_view_sampling}, indent=2) + "\n")
+    weighted_sampling = {**weighted_sampling_summary, **(result.get("weighted_sampling") or {})}
+    weighted_sampling["enabled"] = weighted_sampling_enabled
+    if weighted_sampling_enabled:
+        (run_dir / "weighted_sampling.json").write_text(json.dumps({"training_dataset": dataset,
+            "training_dataset_sha256": train_hash, "sampling": weighted_sampling}, indent=2) + "\n")
     classes=sorted(rows.model.astype(str).unique())
     metrics=evaluate(valid.model.astype(str),result["scores"],classes,result["probabilities"])
     if result.get("validation_loss_raw") is not None:
@@ -1862,7 +2139,9 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
     manifest={"experiment_id":experiment_id,"model":model,"dataset":dataset,"training_dataset":dataset,
         "validation_dataset":validation_dataset,"split":"validation",
         "continued_from_experiment":source["experiment_id"],"continued_from_checkpoint":str(source_checkpoint),
-        "continued_from_trainer_state":str(trainer_resume_checkpoint),
+        "continued_from_trainer_state":(None if restart_optimizer_for_lr else str(trainer_resume_checkpoint)),
+        "source_trainer_state":str(trainer_resume_checkpoint) if trainer_resume_checkpoint else None,
+        "optimizer_state_policy":snapshot["optimizer_state_policy"],
         "additional_epochs":additional_epochs,"total_epochs":target_epochs,
         "resume_from_epoch":completed_epochs,
         "baseline_validation_metrics":result.get("baseline_validation_metrics"),
@@ -1880,6 +2159,14 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
         "runtime_breakdown":runtime_breakdown,
         "training_view_sampling": training_view_sampling,
         "training_view_sampling_artifact": str(sampling_path) if sampling_path else None,
+        "class_weights": cfg.get("class_weights"),
+        "loss_config": {
+            "training": "class_weighted_cross_entropy" if cfg.get("class_weights") else "model_default",
+            "validation": "model_default_unweighted" if cfg.get("class_weights") else "model_default",
+        },
+        "weighted_sampling": weighted_sampling,
+        "weighted_sampling_artifact": (str(run_dir / "weighted_sampling.json")
+                                        if weighted_sampling_enabled else None),
         "training_rows_per_second": (len(train) / float(runtime_breakdown.get(
             "training_excluding_validation_seconds") or result.get("fit_seconds") or 1.0)),
         "checkpoint_scoring_method":result.get("checkpoint_scoring_method"),
@@ -1958,8 +2245,10 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
     Baseline validation runs before the first optimizer step and is included in the
     run manifest. This path currently supports full-finetuned sequence encoders.
     """
-    if model != "ultrabert380":
-        raise ValueError("continue-encoder currently supports only ultrabert380; use the model-specific continuation path for LoRA models")
+    encoder_models = {"ultrabert380", "modernbert_large", "deberta_v3_large", "electra_large",
+                      "gte_large", "mpnet_base", "deberta_gemini", "deberta_glm"}
+    if model not in encoder_models:
+        raise ValueError("continue-encoder supports full-finetuned encoder models; use the LoRA continuation path for adapter models")
     manifests_dir = Path(artifact_dir) / "predictions"
     source_path = manifests_dir / f"{from_experiment}_manifest.json"
     if not source_path.is_file():
@@ -2005,11 +2294,46 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
                        ("weight_decay", weight_decay)):
         if value is not None:
             explicit[key] = value
-    cfg = _continuation_config(model, source.get("config", {}), config_path, explicit)
-    additional_epochs = int(cfg.get("epochs", 20))
+    cfg = _continuation_config(model, source.get("config", {}), config_path, explicit, dataset=dataset)
+    if cfg.get("class_weights") is not None:
+        cfg["class_weights"] = normalize_class_weights(cfg["class_weights"], classes)
+    additional_epochs = int(cfg.get("epochs", 10))
     seed = int(source.get("seed", seed))
+    source_learning_rate = float((source.get("config") or {}).get(
+        "learning_rate", cfg.get("learning_rate", learning_rate or 0.0)))
+    weighted_sampling_enabled = bool(cfg.get("weighted_sampling", False))
+    if weighted_sampling_enabled and (model not in WEIGHTED_SAMPLING_MODELS or
+            (model in FROZEN_BACKBONE_MODELS and cfg.get("training_mode", "frozen") == "frozen")):
+        raise ValueError(f"weighted_sampling is not supported for this {model} training mode")
+    weighted_sampling_summary = _weighted_sampling_dataset_summary(
+        train, enabled=weighted_sampling_enabled, seed=seed)
+    sampling_weights = (pd.to_numeric(train.sampling_weight, errors="coerce").to_numpy(dtype=np.float64)
+                        if weighted_sampling_enabled else None)
+    if weighted_sampling_enabled and (not np.isfinite(sampling_weights).all()
+                                      or np.any(sampling_weights <= 0)):
+        raise ValueError("training sampling_weight values must be finite and strictly positive")
     _restore_continuation_recipe(cfg, source, completed_epochs=completed_epochs,
                                  additional_epochs=additional_epochs)
+    # A requested LR change starts from the selected model weights with a fresh
+    # optimizer/scheduler. The saved Trainer state contains the old LR schedule.
+    resume_state_with_lr_override = bool(cfg.get("resume_optimizer_state_with_lr_override", False))
+    restart_optimizer_for_lr = ("learning_rate" in explicit and
+        not np.isclose(float(explicit["learning_rate"]), source_learning_rate,
+                       rtol=0.0, atol=1e-15) and not resume_state_with_lr_override)
+    if restart_optimizer_for_lr:
+        cfg["learning_rate"] = float(explicit["learning_rate"])
+        cfg["epochs"] = additional_epochs
+    elif resume_state_with_lr_override and "learning_rate" in explicit:
+        cfg["learning_rate"] = float(explicit["learning_rate"])
+    # Explicit continuation configuration is allowed to preserve/reprobe the
+    # source batch and memory recipe instead of freezing its last physical batch.
+    for key in ("batch_size", "inference_batch_size", "gradient_accumulation_steps",
+                "target_effective_batch_size", "auto_batch_size", "max_batch_size",
+                "batch_probe_safety_fraction", "gradient_checkpointing", "attention_backend",
+                "max_length", "lr_scheduler_type", "warmup_ratio", "warmup_epochs",
+                "optimizer", "weight_decay", "weighted_sampling"):
+        if key in explicit:
+            cfg[key] = explicit[key]
     target_epochs = int(cfg["epochs"])
     cfg["checkpoint_selection_metric"] = str(source.get("checkpoint_selection_metric") or
         cfg.get("checkpoint_selection_metric") or "validation_balanced_accuracy").removeprefix("validation_")
@@ -2035,7 +2359,11 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "resume_from_epoch": int(completed_epochs), "learning_rate": float(learning_rate),
         "learning_rate_decay": (float(learning_rate_decay)
                                 if learning_rate_decay is not None else None),
-        "seed": int(seed),
+        "seed": int(seed), "weighted_sampling": weighted_sampling_enabled,
+        "optimizer_state_policy": ("reinitialized_for_learning_rate_override"
+                                   if restart_optimizer_for_lr else
+                                   "restored_with_learning_rate_override" if resume_state_with_lr_override
+                                   else "restored_from_source_checkpoint"),
         "optimizer": optimizer, "weight_decay": float(weight_decay),
         "early_stopping_patience": cfg.get("early_stopping_patience", 2),
         "batch_size": int(cfg.get("batch_size", 8)),
@@ -2054,6 +2382,8 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "save_epoch_checkpoints": bool(cfg.get("save_epoch_checkpoints", False)),
         "inference_batch_size": int(cfg.get("inference_batch_size", max(8, int(cfg.get("batch_size", 8))))),
     }
+    if "class_weights" in cfg:
+        config_snapshot["class_weights"] = cfg["class_weights"]
     if training_views is not None:
         config_snapshot["training_view_sampling_policy"] = "one random view per original response per epoch"
     config_hash = _sha(config_snapshot)
@@ -2089,19 +2419,29 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         batch_probe_safety_fraction=config_snapshot["batch_probe_safety_fraction"],
         gradient_checkpointing=config_snapshot["gradient_checkpointing"],
         validation_labels=valid.model.tolist(),
-        trainer_resume_checkpoint=str(trainer_resume_checkpoint),
+        trainer_resume_checkpoint=(None if restart_optimizer_for_lr else str(trainer_resume_checkpoint)),
         select_best_checkpoint=True, local_files_only=True,
+        attention_backend=config_snapshot.get("attention_backend"),
+        code_revision=config_snapshot.get("code_revision"),
         stop_file=run_dir/"stop_requested.json",
         early_stopping_patience=cfg.get("early_stopping_patience", 2),
         checkpoint_selection_metric=config_snapshot["checkpoint_selection_metric"],
+        class_weights=config_snapshot.get("class_weights"),
+        resume_optimizer_state_with_lr_override=resume_state_with_lr_override,
         save_epoch_checkpoints=config_snapshot["save_epoch_checkpoints"],
-        training_views=training_views, training_view_ids=training_view_ids)
+        training_views=training_views, training_view_ids=training_view_ids,
+        weighted_sampling=weighted_sampling_enabled, sampling_weights=sampling_weights)
     training_view_sampling = result.get("training_view_sampling")
     sampling_path = None
     if training_view_sampling is not None:
         sampling_path = run_dir / "training_view_sampling.json"
         sampling_path.write_text(json.dumps({"training_dataset": dataset,
             "training_dataset_sha256": train_hash, "sampling": training_view_sampling}, indent=2) + "\n")
+    weighted_sampling = {**weighted_sampling_summary, **(result.get("weighted_sampling") or {})}
+    weighted_sampling["enabled"] = weighted_sampling_enabled
+    if weighted_sampling_enabled:
+        (run_dir / "weighted_sampling.json").write_text(json.dumps({"training_dataset": dataset,
+            "training_dataset_sha256": train_hash, "sampling": weighted_sampling}, indent=2) + "\n")
     metrics = evaluate(valid.model.astype(str), result["scores"], classes, result["probabilities"])
     if result.get("validation_loss_raw") is not None:
         metrics["validation_loss_raw"] = float(result["validation_loss_raw"])
@@ -2127,7 +2467,10 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "training_dataset": dataset, "validation_dataset": validation_dataset, "split": "validation",
         "continued_from_experiment": from_experiment,
         "continued_from_checkpoint": str(source_checkpoint),
-        "continued_from_trainer_state": str(trainer_resume_checkpoint),
+        "continued_from_trainer_state": (None if restart_optimizer_for_lr else str(trainer_resume_checkpoint)),
+        "source_trainer_state": str(trainer_resume_checkpoint),
+        "optimizer_state_policy": config_snapshot["optimizer_state_policy"],
+        "resumed_optimizer_lr_override": result.get("resumed_optimizer_lr_override"),
         "resume_from_epoch": completed_epochs,
         "total_epochs": target_epochs,
         "baseline_validation_metrics": result["baseline_validation_metrics"],
@@ -2157,6 +2500,14 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "runtime_breakdown": runtime_breakdown,
         "training_view_sampling": training_view_sampling,
         "training_view_sampling_artifact": str(sampling_path) if sampling_path else None,
+        "class_weights": cfg.get("class_weights"),
+        "loss_config": {
+            "training": "class_weighted_cross_entropy" if cfg.get("class_weights") else "model_default",
+            "validation": "model_default_unweighted" if cfg.get("class_weights") else "model_default",
+        },
+        "weighted_sampling": weighted_sampling,
+        "weighted_sampling_artifact": (str(run_dir / "weighted_sampling.json")
+                                        if weighted_sampling_enabled else None),
         "training_rows_per_second": (len(train) / float(runtime_breakdown.get(
             "training_excluding_validation_seconds") or result.get("fit_seconds") or 1.0)),
         "requested_batch_size": result.get("requested_batch_size"),
@@ -2269,6 +2620,8 @@ def _load_training_predictions(dataset, artifact_dir, manifests):
                 base_checkpoint=manifest.get("config", {}).get("checkpoint"), revision=manifest.get("model_revision"),
                 fix_mistral_regex=manifest.get("config", {}).get("fix_mistral_regex", False),
                 text_only_backbone=manifest.get("config", {}).get("text_only_backbone", False),
+                use_chat_template=manifest.get("config", {}).get("use_chat_template", False),
+                chat_template_user_prompt=manifest.get("config", {}).get("chat_template_user_prompt", "Identify the source model for the assistant response."),
                 quantization=manifest.get("config", {}).get("quantization", manifest.get("quantization")),
                 attention_backend=manifest.get("config", {}).get("attention_backend", manifest.get("attention_backend")))
         if probabilities.shape != (len(train), len(classes)) or not np.isfinite(probabilities).all():
@@ -2491,7 +2844,7 @@ def main(argv=None):
     mix=d.add_parser("assemble");mix.add_argument("--config",default="configs/data/mixed_v1_5.yaml")
     f=sub.add_parser("features").add_subparsers(dest="action",required=True);b=f.add_parser("build");b.add_argument("--dataset",default="v1");b.add_argument("--validation-dataset",default="v0");b.add_argument("--data-dir",default="data/processed");b.add_argument("--config",default="configs/features/default.yaml")
     m=sub.add_parser("models").add_subparsers(dest="action",required=True)
-    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v1");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--validation-dataset",default="v0",help="dataset artifact used in full for validation (default: v0)");t.add_argument("--max-length",type=int,help="maximum tokenizer sequence length in tokens for training and validation");t.add_argument("--refresh-prediction",action="store_true",help="refresh the active prediction roster if its inputs changed");t.add_argument("--refresh-checkpoint-catalog",action="store_true",help="refresh the checkpoint-label catalog after training");t.add_argument("--skip-prediction-refresh",action="store_true",help=argparse.SUPPRESS);t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
+    t=m.add_parser("train");t.add_argument("--model",choices=MODEL_CONFIGS,default="svc");t.add_argument("--dataset",default="v1");t.add_argument("--data-dir",default="data/processed");t.add_argument("--artifact-dir",default="artifacts");t.add_argument("--config");t.add_argument("--features-config");t.add_argument("--seed",type=int,default=2026);t.add_argument("--validation-dataset",default="v0",help="dataset artifact used in full for validation (default: v0)");t.add_argument("--no-validation",action="store_true",help="explicitly disable validation; supported by selected LoRA recipes");t.add_argument("--max-length",type=int,help="maximum tokenizer sequence length in tokens for training and validation");t.add_argument("--refresh-prediction",action="store_true",help="refresh the active prediction roster if its inputs changed");t.add_argument("--refresh-checkpoint-catalog",action="store_true",help="refresh the checkpoint-label catalog after training");t.add_argument("--skip-prediction-refresh",action="store_true",help=argparse.SUPPRESS);t.add_argument("--accept-config-defaults",action="store_true",help="noninteractive confirmation to use the model config values")
     stop=m.add_parser("stop",help="request a cooperative stop and wait for normal experiment finalization")
     stop.add_argument("--run-id",required=True,help="training run directory/experiment ID")
     stop.add_argument("--artifact-dir",default="artifacts")
@@ -2499,16 +2852,18 @@ def main(argv=None):
     stop.add_argument("--no-wait",action="store_true",help="write the stop request and return immediately")
     cq=m.add_parser("continue-qwen",help="continue the latest Qwen LoRA checkpoint and validate after every epoch")
     cq.add_argument("--dataset",default="v1");cq.add_argument("--validation-dataset",default="v0");cq.add_argument("--epochs",type=int);cq.add_argument("--seed",type=int,default=2026)
-    cq.add_argument("--model",choices=["qwen06","qwen17","qwen4","qwen8"],default="qwen06")
+    cq.add_argument("--model",choices=["qwen06","qwen17","qwen35_08b","qwen4","qwen8","hunyuan_1_8b"],default="qwen06")
     cq.add_argument("--from-experiment");cq.add_argument("--config");cq.add_argument("--accept-config-defaults",action="store_true")
     cq.add_argument("--refresh-prediction",action="store_true");cq.add_argument("--refresh-checkpoint-catalog",action="store_true")
-    cl=m.add_parser("continue-lora",help="continue a saved Granite or Qwen LoRA checkpoint")
+    cl=m.add_parser("continue-lora",help="continue a saved Qwen, Granite, or MiniCPM LoRA checkpoint")
     cl.add_argument("--dataset",default="v1");cl.add_argument("--validation-dataset",default="v0");cl.add_argument("--epochs",type=int);cl.add_argument("--seed",type=int,default=2026)
-    cl.add_argument("--model",choices=["granite4_350m","qwen06","qwen17","qwen4","qwen8"],required=True)
+    cl.add_argument("--model",choices=["granite4_350m","granite4_h_micro","minicpm5_2b","qwen06","qwen17","qwen35_08b","qwen4","qwen8","hunyuan_1_8b"],required=True)
+    cl.add_argument("--allow-cross-dataset-source",action="store_true")
+    cl.add_argument("--learning-rate",type=float)
     cl.add_argument("--from-experiment",required=True);cl.add_argument("--config");cl.add_argument("--accept-config-defaults",action="store_true")
     cl.add_argument("--refresh-prediction",action="store_true");cl.add_argument("--refresh-checkpoint-catalog",action="store_true")
-    ce=m.add_parser("continue-encoder",help="baseline-validate and continue a saved UltraBERT checkpoint")
-    ce.add_argument("--model",choices=["ultrabert380"],default="ultrabert380")
+    ce=m.add_parser("continue-encoder",help="continue a saved full-finetuned encoder checkpoint")
+    ce.add_argument("--model",choices=["ultrabert380","modernbert_large","deberta_v3_large","electra_large","gte_large","mpnet_base","deberta_gemini","deberta_glm"],default="ultrabert380")
     ce.add_argument("--dataset",default="v1");ce.add_argument("--validation-dataset",default="v0");ce.add_argument("--from-experiment",required=True)
     ce.add_argument("--epochs",type=int);ce.add_argument("--learning-rate",type=float)
     ce.add_argument("--learning-rate-decay",type=float);ce.add_argument("--seed",type=int,default=2026)
@@ -2672,7 +3027,7 @@ def main(argv=None):
     elif a.command=="data" and a.action=="assemble": result=assemble_training_dataset(a.config)
     elif a.command=="features": result=build_features(a.dataset,a.data_dir,a.config,validation_dataset=a.validation_dataset)
     elif a.command=="models" and a.action=="train":
-        cfg = _model_cfg(a.model, a.config)
+        cfg = _apply_dataset_training_options(_model_cfg(a.model, a.config), a.dataset)
         if a.model == "svc" and a.features_config:
             cfg["features"] = _read_yaml(a.features_config)
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
@@ -2680,7 +3035,8 @@ def main(argv=None):
             feature_config_path=a.features_config,seed=a.seed,config_overrides=overrides,
             refresh_prediction=a.refresh_prediction and not a.skip_prediction_refresh,
             refresh_checkpoint_catalog=a.refresh_checkpoint_catalog,
-            validation_dataset=a.validation_dataset,max_length=a.max_length)
+            validation_dataset=a.validation_dataset,max_length=a.max_length,
+            no_validation=a.no_validation)
     elif a.command=="models" and a.action=="stop":
         result=request_training_stop(a.run_id,artifact_dir=a.artifact_dir,
             wait=not a.no_wait,timeout_seconds=a.timeout_seconds)
@@ -2760,31 +3116,34 @@ def main(argv=None):
             cache_dir=a.predictions_dir,artifact_dir=a.artifact_dir,
             output_dir=a.output_dir,report_path=a.report,n_splits=a.folds)
     elif a.command=="models" and a.action in {"continue-qwen", "continue-lora"}:
+        allow_cross_dataset_source = getattr(a, "allow_cross_dataset_source", False)
         _, parent = _matching_continuation_source(a.model, a.dataset, a.validation_dataset,
-            "data/processed", "artifacts", a.from_experiment)
-        explicit = {"epochs": a.epochs} if a.epochs is not None else {}
-        cfg = _continuation_config(a.model, parent.get("config", {}), a.config, explicit)
+            "data/processed", "artifacts", a.from_experiment,
+            allow_cross_dataset_source=allow_cross_dataset_source)
+        explicit = {key: value for key, value in (("epochs", a.epochs), ("learning_rate", getattr(a, "learning_rate", None))) if value is not None}
+        cfg = _continuation_config(a.model, parent.get("config", {}), a.config, explicit, dataset=a.dataset)
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
         effective = {**cfg, **overrides}
         result=continue_qwen(a.dataset,validation_dataset=a.validation_dataset,from_experiment=a.from_experiment,
             epochs=int(effective["epochs"]),seed=a.seed,config_path=a.config,
             config_overrides=effective,model=a.model,
             refresh_prediction=a.refresh_prediction,
-            refresh_checkpoint_catalog=a.refresh_checkpoint_catalog)
+            refresh_checkpoint_catalog=a.refresh_checkpoint_catalog,
+            allow_cross_dataset_source=allow_cross_dataset_source)
     elif a.command=="models" and a.action=="continue-encoder":
         _, parent = _matching_continuation_source(a.model, a.dataset, a.validation_dataset,
             a.data_dir, a.artifact_dir, a.from_experiment,
             allow_cross_dataset_source=a.allow_cross_dataset_source)
         explicit={key:value for key,value in (("epochs",a.epochs),("learning_rate",a.learning_rate),
             ("learning_rate_decay",a.learning_rate_decay)) if value is not None}
-        cfg = _continuation_config(a.model, parent.get("config", {}), a.config, explicit)
+        cfg = _continuation_config(a.model, parent.get("config", {}), a.config, explicit, dataset=a.dataset)
         overrides = _confirm_training_config(a.model, cfg, accept_defaults=a.accept_config_defaults)
         effective = {**cfg, **overrides}
         result=continue_encoder(a.dataset,a.model,a.data_dir,a.artifact_dir,a.registry,
             validation_dataset=a.validation_dataset,from_experiment=a.from_experiment,
-            epochs=int(effective.get("epochs",20)),
+            epochs=int(effective.get("epochs",10)),
             learning_rate=float(effective.get("learning_rate",5e-5)),
-            learning_rate_decay=effective.get("learning_rate_decay",0.9),seed=a.seed,
+            learning_rate_decay=effective.get("learning_rate_decay"),seed=a.seed,
             optimizer=effective.get("optimizer","adamw_torch"),
             weight_decay=float(effective.get("weight_decay",0.0)),config_path=a.config,
             config_overrides=effective,

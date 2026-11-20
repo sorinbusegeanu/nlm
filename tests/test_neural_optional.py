@@ -41,6 +41,16 @@ class NeuralAdapterTests(unittest.TestCase):
                 validation_labels=["a"],training_views=training_views,
                 training_view_ids=[["full","chunk-01"] for _ in texts])
             self.assertEqual(result["scores"].shape,(1,3));self.assertTrue(np.isfinite(result["probabilities"]).all())
+            self.assertFalse(result["weighted_sampling"]["enabled"])
+            weighted_result=train_encoder_fold(texts,labels,["alpha common"],["a","b","c"],checkpoint=str(root),revision=None,
+                output_dir=Path(td)/"out_weighted",epochs=1,batch_size=3,max_length=8,learning_rate=1e-3,
+                validation_labels=["a"],training_views=training_views,
+                training_view_ids=[["full","chunk-01"] for _ in texts],
+                weighted_sampling=True,sampling_weights=[1,1,1,1,1,1,1,1,9])
+            weighted=weighted_result["weighted_sampling"]
+            self.assertTrue(weighted["enabled"])
+            self.assertEqual(weighted["num_samples_per_epoch"],len(texts))
+            self.assertEqual(weighted["epoch_records"][0]["sampled_examples"],len(texts))
             sampling=result["training_view_sampling"]
             self.assertEqual(sampling["epoch_records"][0]["original_responses"],len(texts))
             self.assertEqual(sum(sampling["epoch_records"][0]["selected_view_counts"].values()),len(texts))
@@ -65,6 +75,16 @@ class NeuralAdapterTests(unittest.TestCase):
                 validation_labels=["a"],training_views=training_views,
                 training_view_ids=[["full","chunk-01"] for _ in texts])
             self.assertEqual(result["scores"].shape,(1,3));self.assertTrue(np.isfinite(result["probabilities"]).all())
+            self.assertFalse(result["weighted_sampling"]["enabled"])
+            weighted_result=train_qwen_lora_fold(texts,labels,["alpha common"],["a","b","c"],checkpoint=str(root),revision=None,
+                output_dir=Path(td)/"out_weighted",epochs=1,batch_size=3,max_length=8,learning_rate=1e-3,
+                lora_rank=2,lora_alpha=4,validation_labels=["a"],training_views=training_views,
+                training_view_ids=[["full","chunk-01"] for _ in texts],
+                weighted_sampling=True,sampling_weights=[1,1,1,1,1,1,1,1,9])
+            weighted=weighted_result["weighted_sampling"]
+            self.assertTrue(weighted["enabled"])
+            self.assertEqual(weighted["num_samples_per_epoch"],len(texts))
+            self.assertEqual(weighted["epoch_records"][0]["sampled_examples"],len(texts))
             sampling=result["training_view_sampling"]
             self.assertEqual(sampling["epoch_records"][0]["original_responses"],len(texts))
             self.assertEqual(sum(sampling["epoch_records"][0]["selected_view_counts"].values()),len(texts))

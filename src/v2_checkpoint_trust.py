@@ -1,12 +1,7 @@
-"""Versioned V0 trust lists for the eligible external-only checkpoint roster.
-
-The initial version scores the frozen roster once. Later versions are immutable
-snapshots and are updated from completed training manifests by the pipeline.
-"""
+"""Versioned full-V0 trust lists updated from completed training manifests."""
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import os
 import re
@@ -19,7 +14,6 @@ import numpy as np
 import pandas as pd
 
 
-ROSTER_PATH = Path("docs/v2-ckpt-nov0.csv")
 TRUST_PATH = Path("docs/v2-ckpt-nov0_active.csv")
 METADATA_PATH = Path("docs/v2-ckpt-nov0_active.json")
 VERSION_PREFIX = "trust-list-2-v"
@@ -78,15 +72,6 @@ def _lineage(manifest: dict, manifest_path: Path) -> str:
     return str(value or manifest.get("training_dataset") or manifest.get("dataset") or "")
 
 
-def _eligible_models(roster_path: Path) -> set[str]:
-    if not roster_path.is_file():
-        raise FileNotFoundError(f"V2 checkpoint roster is missing: {roster_path}")
-    roster = pd.read_csv(roster_path, dtype=str, keep_default_na=False)
-    if "model" not in roster:
-        raise ValueError(f"V2 checkpoint roster has no model column: {roster_path}")
-    return set(roster.model.astype(str))
-
-
 def _next_checkpoint_id(frame: pd.DataFrame, *, root: Path | None = None) -> str:
     """Allocate checkpoint IDs from the shared project-wide sequence namespace."""
     numbers = [int(m.group(1)) for value in frame.get("sequence_id", pd.Series(dtype=str)).dropna().astype(str)
@@ -96,7 +81,6 @@ def _next_checkpoint_id(frame: pd.DataFrame, *, root: Path | None = None) -> str
     # dashboard/catalog workflows. Its shorter eligible roster must not cause
     # an older sequence ID to be reused for a different checkpoint.
     for path in (root / "docs" / "checkpoint_label_catalog.csv",
-                 root / "docs" / "v2-ckpt-nov0.csv",
                  root / "docs" / "v2-ckpt-nov0_active.csv"):
         if not path.is_file():
             continue
@@ -108,6 +92,40 @@ def _next_checkpoint_id(frame: pd.DataFrame, *, root: Path | None = None) -> str
             numbers.extend(int(match.group(1)) for value in ids.sequence_id.dropna().astype(str)
                            if (match := re.fullmatch(r"N(\d+)", value)))
     return f"N{max(numbers, default=0) + 1:04d}"
+
+
+def _known_checkpoint_id(experiment_id: str, *, root: Path) -> str | None:
+    """Reuse the project-wide checkpoint ID when this run is already cataloged."""
+    matches = set()
+    for path in (root / "docs" / "checkpoint_label_catalog.csv",
+                 root / "docs" / "v2-ckpt-nov0_active.csv"):
+        if not path.is_file():
+            continue
+        try:
+            frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+        except (OSError, ValueError, pd.errors.EmptyDataError):
+            continue
+        if not {"experiment_id", "sequence_id"}.issubset(frame.columns):
+            continue
+        matches.update(frame.loc[frame.experiment_id.eq(str(experiment_id)), "sequence_id"].astype(str))
+    matches.discard("")
+    if len(matches) > 1:
+        raise ValueError(f"conflicting project-wide checkpoint IDs for {experiment_id}: {sorted(matches)}")
+    if not matches:
+        return None
+    candidate = next(iter(matches))
+    for path in (root / "docs" / "checkpoint_label_catalog.csv",
+                 root / "docs" / "v2-ckpt-nov0_active.csv"):
+        if not path.is_file():
+            continue
+        frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+        if not {"experiment_id", "sequence_id"}.issubset(frame.columns):
+            continue
+        owners = set(frame.loc[frame.sequence_id.eq(candidate), "experiment_id"].astype(str))
+        owners.discard("")
+        if owners - {str(experiment_id)}:
+            raise ValueError(f"checkpoint ID {candidate} is already assigned to another experiment: {sorted(owners)}")
+    return candidate
 
 
 def _rows_from_training_manifest(manifest: dict, manifest_path: Path, *, sequence_id: str,
@@ -404,111 +422,6 @@ def _score_rows(ids, y_true, probabilities, *, manifest, manifest_path: Path,
     return rows
 
 
-def build_roster_trust_list(*, root: str | Path = ".", batch_size: int = 4) -> dict:
-    """Run and cache predictions for every unique checkpoint in the roster."""
-    root = Path(root).resolve()
-    roster_path = root / ROSTER_PATH
-    roster = pd.read_csv(roster_path, dtype=str, keep_default_na=False).drop_duplicates("experiment_id")
-    if len(roster) != 63:
-        raise ValueError(f"expected 63 unique roster checkpoints, found {len(roster)}")
-    from .pipeline import _dataset_rows, _partition_sha256
-    v0 = _dataset_rows("v0", root / "data" / "processed")
-    if len(v0) != V0_ROWS or set(v0.model.astype(str)) != set(LABELS):
-        raise ValueError("V0 reference is not the expected complete 2,699-row, 18-label dataset")
-    v0_sha = _partition_sha256(v0)
-    ids, texts, y_true = v0.id.astype(str).tolist(), v0.text.astype(str).tolist(), v0.model.astype(str).tolist()
-    output_dir = root / PREDICTION_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
-    prediction_rows, run_info = [], []
-    for position, record in enumerate(roster.to_dict("records"), start=1):
-        experiment_id = record["experiment_id"]
-        manifest_path = _find_manifest(root, experiment_id)
-        manifest = json.loads(manifest_path.read_text())
-        checkpoint = Path(manifest.get("checkpoint_path") or record.get("checkpoint_path") or "")
-        if not checkpoint.is_absolute(): checkpoint = root / checkpoint
-        if not checkpoint.exists(): raise FileNotFoundError(f"checkpoint missing for {experiment_id}: {checkpoint}")
-        checkpoint_sha = _file_sha256(checkpoint)
-        cache_path = output_dir / f"{experiment_id}.parquet"
-        cache_manifest = output_dir / f"{experiment_id}.json"
-        cache_key = {"experiment_id": experiment_id, "checkpoint_sha256": checkpoint_sha,
-                     "v0_sha256": v0_sha, "rows": len(v0), "labels": list(LABELS),
-                     "model": manifest.get("model"), "config": manifest.get("config"),
-                     "calibration_temperature": manifest.get("calibration_temperature", 1.0)}
-        if cache_path.is_file() and cache_manifest.is_file():
-            cached_meta = json.loads(cache_manifest.read_text())
-        else: cached_meta = {}
-        if cached_meta.get("cache_key") == cache_key:
-            pred_frame = pd.read_parquet(cache_path)
-            cache_aligned = (pred_frame.id.astype(str).tolist() == ids and
-                             all(f"prob::{label}" in pred_frame for label in LABELS))
-        else:
-            pred_frame, cache_aligned = None, False
-        if cache_aligned:
-            probabilities = pred_frame[[f"prob::{label}" for label in LABELS]].to_numpy(dtype=float)
-            source = "roster_cached_full_v0_predictions"
-        else:
-            try:
-                probabilities = _predict_checkpoint(manifest, checkpoint, texts, root, batch_size=batch_size)
-            except Exception as exc:
-                progress = {"completed": position - 1, "total": len(roster), "failed": experiment_id,
-                            "error": f"{type(exc).__name__}: {exc}", "updated_at_utc": _utc_now(),
-                            "runs": run_info}
-                _atomic_json(progress, output_dir / "progress.json")
-                raise RuntimeError(f"full-V0 prediction failed for {experiment_id} ({manifest.get('model')}): {exc}") from exc
-            columns = {"id": ids, "y_true": y_true,
-                       "y_pred": np.asarray(LABELS)[probabilities.argmax(axis=1)]}
-            columns.update({f"prob::{label}": probabilities[:, i] for i, label in enumerate(LABELS)})
-            pd.DataFrame(columns).to_parquet(cache_path, index=False)
-            cache_manifest.write_text(json.dumps({"cache_key": cache_key, "prediction_path": str(cache_path.relative_to(root)),
-                                                  "checkpoint_sha256": checkpoint_sha, "v0_sha256": v0_sha,
-                                                  "rows": len(v0)}, indent=2)+"\n")
-            source = "roster_inference_full_v0"
-        sequence_id = str(record.get("sequence_id") or "")
-        prediction_rows.extend(_score_rows(ids, y_true, probabilities, manifest=manifest,
-                                           manifest_path=manifest_path, checkpoint=checkpoint,
-                                           checkpoint_sha=checkpoint_sha, sequence_id=sequence_id,
-                                           root=root, source=source))
-        # HF/PEFT modules can form reference cycles. Collect them and release
-        # unused allocator blocks before the next checkpoint load.
-        gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
-        from sklearn.metrics import balanced_accuracy_score
-        run_info.append({"experiment_id": experiment_id, "sequence_id": sequence_id,
-                         "checkpoint_sha256": checkpoint_sha, "prediction_path": str(cache_path.relative_to(root)),
-                         "balanced_accuracy": float(balanced_accuracy_score(
-                             y_true, np.asarray(LABELS)[probabilities.argmax(1)]))})
-        progress = {"completed": position, "total": len(roster), "current": experiment_id,
-                    "updated_at_utc": _utc_now(), "runs": run_info}
-        _atomic_json(progress, output_dir / "progress.json")
-
-    # Preserve the two already evaluated V2 dataset checkpoints in the initial list.
-    legacy_path = root / TRUST_PATH
-    if not legacy_path.is_file():
-        raise FileNotFoundError(f"existing V2.0/V2.1 trust rows missing: {legacy_path}")
-    legacy = pd.read_csv(legacy_path)
-    initial_rows = pd.DataFrame(prediction_rows)
-    initial_rows = initial_rows[~initial_rows.experiment_id.isin(INITIAL_EXPERIMENTS)]
-    existing_rows = legacy[legacy.experiment_id.isin(INITIAL_EXPERIMENTS)].copy()
-    combined = pd.concat([initial_rows, existing_rows], ignore_index=True, sort=False)
-    if combined.experiment_id.nunique() != 65 or len(combined) != 65 * len(LABELS):
-        raise ValueError(f"initial trust list must contain 65 complete checkpoints; got {combined.experiment_id.nunique()} checkpoints / {len(combined)} rows")
-    generated_at = _utc_now()
-    combined.attrs["trust_list_version"] = "trust-list-2-v001"
-    ranked = _sort_and_rank(combined, generated_at=generated_at)
-    metadata = {"generated_at_utc": generated_at, "source_roster": str(ROSTER_PATH),
-                "initial_runs": list(INITIAL_EXPERIMENTS), "roster_checkpoints": len(roster),
-                "validation_scope": "full_v0", "validation_rows": len(v0), "validation_sha256": v0_sha,
-                "inference_runs": run_info, "method": "one-time inference of unique roster checkpoints; V2.0/V2.1 rows retained from saved full-V0 metrics"}
-    _publish_version(root, ranked, metadata, "trust-list-2-v001")
-    return {"status": "published", "version": "trust-list-2-v001", "checkpoints": 65,
-            "rows": len(ranked), "roster_predictions": len(roster), "prediction_dir": str(output_dir)}
-
-
 def _read_saved_probabilities(root: Path, experiment_id: str, expected_ids: list[str],
                               expected_y: list[str]) -> tuple[np.ndarray, Path]:
     """Read aligned probabilities from a cache or the run's saved V0 prediction file."""
@@ -681,28 +594,28 @@ def _atomic_write(frame: pd.DataFrame, path: Path) -> None:
 
 
 def initialize_v2_trust_list(*, root: str | Path = ".",
-                             roster_path: str | Path = ROSTER_PATH,
                              output_path: str | Path = TRUST_PATH,
                              metadata_path: str | Path = METADATA_PATH) -> dict:
     """Initialize the separate list from the two explicitly selected V2 runs."""
     root = Path(root).resolve()
-    roster_path = Path(roster_path)
-    if not roster_path.is_absolute():
-        roster_path = root / roster_path
     output_path, metadata_path = Path(output_path), Path(metadata_path)
     if not output_path.is_absolute():
         output_path = root / output_path
     if not metadata_path.is_absolute():
         metadata_path = root / metadata_path
-    allowed_models = _eligible_models(roster_path)
     rows = []
     for experiment_id in INITIAL_EXPERIMENTS:
         manifest_path = root / "artifacts" / "predictions" / f"{experiment_id}_manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(f"required initial V2 run manifest missing: {manifest_path}")
         manifest = json.loads(manifest_path.read_text())
-        if str(manifest.get("model")) not in allowed_models:
-            raise ValueError(f"initial V2 checkpoint model is outside the v2-ckpt-nov0 roster: {manifest.get('model')}")
+        try:
+            from .pipeline import MODEL_CONFIGS
+            registered_models = set(MODEL_CONFIGS)
+        except (ImportError, AttributeError):
+            registered_models = set()
+        if str(manifest.get("model")) not in registered_models:
+            raise ValueError(f"initial V2 checkpoint model is not registered: {manifest.get('model')}")
         sequence_id = "N0103" if experiment_id == INITIAL_EXPERIMENTS[0] else "N0104"
         new_rows = _rows_from_training_manifest(manifest, manifest_path, sequence_id=sequence_id, root=root)
         if len(new_rows) != len(LABELS):
@@ -714,7 +627,6 @@ def initialize_v2_trust_list(*, root: str | Path = ".",
     metadata = {
         "version": "trust-v2",
         "generated_at_utc": generated_at,
-        "source_roster": str(roster_path.relative_to(root)),
         "initial_runs": list(INITIAL_EXPERIMENTS),
         "rows": int(len(frame)),
         "checkpoints": int(frame.experiment_id.nunique()),
@@ -731,7 +643,6 @@ def initialize_v2_trust_list(*, root: str | Path = ".",
 
 def append_training_run(manifest: dict, manifest_path: str | Path, *,
                         root: str | Path = ".",
-                        roster_path: str | Path = ROSTER_PATH,
                         output_path: str | Path = TRUST_PATH,
                         metadata_path: str | Path = METADATA_PATH) -> dict:
     """Append one completed, eligible run using metrics already saved by training."""
@@ -739,30 +650,35 @@ def append_training_run(manifest: dict, manifest_path: str | Path, *,
     manifest_path = Path(manifest_path)
     if not manifest_path.is_absolute():
         manifest_path = root / manifest_path
-    roster_path = Path(roster_path)
-    if not roster_path.is_absolute():
-        roster_path = root / roster_path
     output_path, metadata_path = Path(output_path), Path(metadata_path)
     if not output_path.is_absolute():
         output_path = root / output_path
     if not metadata_path.is_absolute():
         metadata_path = root / metadata_path
-    allowed_models = _eligible_models(roster_path)
-    if str(manifest.get("model") or "") not in allowed_models:
-        return {"status": "skipped", "reason": "model is outside the v2-ckpt-nov0 roster"}
+    # Append registered model runs from their saved full-V0 metrics. This path
+    # does not load a model or run inference.
+    model = str(manifest.get("model") or "")
+    try:
+        from .pipeline import MODEL_CONFIGS
+        registered_models = set(MODEL_CONFIGS)
+    except (ImportError, AttributeError):
+        registered_models = set()
+    if model not in registered_models:
+        return {"status": "skipped", "reason": "model is not registered for training"}
     training_dataset = str(manifest.get("training_dataset") or manifest.get("dataset") or "")
     lineage = _lineage(manifest, manifest_path)
     if V0_TOKEN.search(training_dataset) or V0_TOKEN.search(lineage):
         return {"status": "skipped", "reason": "training lineage includes V0"}
     latest = _latest_version(root)
     if latest is None:
-        return {"status": "deferred", "reason": "trust-list-2-v001 roster evaluation is not published yet"}
+        return {"status": "deferred", "reason": "initial Trust List 2 has not been published yet"}
     current_version, current_path, current_metadata_path = latest
     current = pd.read_csv(current_path)
     experiment_id = str(manifest.get("experiment_id") or manifest_path.stem.removesuffix("_manifest"))
     if experiment_id in set(current.experiment_id.astype(str)):
         return {"status": "already_recorded", "experiment_id": experiment_id}
-    sequence_id = _next_checkpoint_id(current, root=root)
+    sequence_id = (_known_checkpoint_id(experiment_id, root=root)
+                   or _next_checkpoint_id(current, root=root))
     rows = _rows_from_training_manifest(manifest, manifest_path, sequence_id=sequence_id, root=root)
     if len(rows) != len(LABELS):
         return {"status": "skipped", "reason": "complete full-V0 training metrics are unavailable"}
@@ -782,12 +698,9 @@ def append_training_run(manifest: dict, manifest_path: str | Path, *,
 def _cli() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".")
-    parser.add_argument("action", nargs="?", choices=("initialize", "build-roster", "generate-topk"), default="initialize")
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("action", nargs="?", choices=("initialize", "generate-topk"), default="initialize")
     args = parser.parse_args()
-    if args.action == "build-roster":
-        result = build_roster_trust_list(root=args.root, batch_size=args.batch_size)
-    elif args.action == "generate-topk":
+    if args.action == "generate-topk":
         result = generate_topk_trust_lists(root=args.root)
     else:
         result = initialize_v2_trust_list(root=args.root)
