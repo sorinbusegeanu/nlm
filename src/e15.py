@@ -314,9 +314,11 @@ def _fit_e13_predict(matrices, ids, families, truth, groups, fit_rows,
         raise ValueError("E13 prediction could not be reconstructed consistently")
     x, chosen, alternative, names = build_features(
         matrices[:, target_rows], ids, families, roster, hard, reliability, ensemble)
+    label_scores = _pair_scores(hard, reliability, ensemble, selected_families)
     return {"x": x, "base": chosen, "alternative": alternative,
             "roster": roster, "roster_ids": selected_ids,
             "feature_names": names, "metrics": metrics,
+            "label_scores": label_scores,
             "reliability": reliability, "hard": hard, "ensemble": ensemble,
             "model": model}
 
@@ -440,10 +442,12 @@ def _predict_saved_e13_outer(matrices, ids, families, truth, row_ids,
     pred, _ = e13.route_predictions("family_max", hard, reliability, ensemble, roster_families)
     x15, selected, alternative, names = build_features(
         matrices[:, held_rows], ids, families, roster, hard, reliability, ensemble)
+    label_scores = _pair_scores(hard, reliability, ensemble, roster_families)
     if not np.array_equal(pred, selected):
         raise ValueError("Reconstructed E13-B held predictions disagree with saved model route")
     return {"rows": held_rows, "x": x15, "base": selected,
             "alternative": alternative, "roster": roster_ids,
+            "label_scores": label_scores,
             "reliability": reliability, "hard": hard, "ensemble": ensemble,
             "feature_names": names}
 
