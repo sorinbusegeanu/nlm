@@ -1,0 +1,5 @@
+minimum_distinct_labels,eligible_groups,eligible_responses,excluded_groups,excluded_responses,eligible_response_pct_of_reliable_grouped,eligible_response_pct_of_all_v16,ranking_items_per_epoch,pairwise_label_comparisons_per_epoch,groups_with_repeated_same_model_rows,groups_with_same_label_duplicate_responses
+2,26347,219294,11532,11742,94.91767516750636,94.91767516750636,170233,812835,3772,0
+3,18295,202983,19584,28053,87.8577364566561,87.8577364566561,154129,804783,3602,0
+4,14812,192398,23067,38638,83.27619938018317,83.27619938018317,143680,794334,3533,0
+5,12163,181670,25716,49366,78.63276718779757,78.63276718779757,133084,778440,3490,0

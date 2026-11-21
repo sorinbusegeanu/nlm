@@ -1,0 +1,3 @@
+key_basis,groups,responses,multi_label_groups,multi_label_responses,ranking_items_per_epoch,pairwise_label_comparisons_per_epoch,groups_with_repeated_model_rows,groups_with_exact_same_model_response_duplicates
+prompt_canon,36068,225110,25339,214171,165409,801399,3863,0
+source_dataset+source_file+prompt_group,1811,5926,1008,5123,4824,11436,112,0

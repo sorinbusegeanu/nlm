@@ -1,0 +1,6 @@
+source_dataset,groups,responses,multi_label_groups,eligible_responses
+aitahmednasser/ntl-kaggle-ai-gen,66,593,65,592
+elliotthankinson/ntl-tells-v4,1005,4393,921,4309
+nimithashreea/ntl-proxy-candidate-generations-20261110,20,218,20,218
+nuridudak/ntl-130k-clean-passages,672,672,0,0
+tamerlanomralinov/ntl-matched-bench-gen-r1,48,50,2,4

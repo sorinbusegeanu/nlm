@@ -1,0 +1,15 @@
+{
+  "classification_responses":231336.0,
+  "rows_with_reliable_prompt_key":230664.0,
+  "groups":38324.0,
+  "multi_label_groups":26466.0,
+  "multi_label_responses":218589.0,
+  "multi_label_response_pct_of_all":94.4898329702,
+  "ranking_items_per_epoch":169814.0,
+  "pairwise_comparisons_per_epoch":804628.0,
+  "groups_with_repeated_same_model_responses":3894.0,
+  "distinct_labels_coverage":18.0,
+  "unkeyed_rows":672.0,
+  "source_namespaced_B2M_key_count":2256.0,
+  "source_id_values_shared_across_datasets_as_reported":267.0
+}

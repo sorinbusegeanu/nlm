@@ -1,0 +1,62 @@
+dataset,metric,value
+V2.14,min_2_distinct_labels_groups,26466.0
+V2.14,min_2_distinct_labels_responses,218589.0
+V2.14,min_2_distinct_labels_pairwise_comparisons_per_epoch,804628.0
+V2.14,min_3_distinct_labels_groups,18404.0
+V2.14,min_3_distinct_labels_responses,202256.0
+V2.14,min_3_distinct_labels_pairwise_comparisons_per_epoch,796566.0
+V2.14,min_4_distinct_labels_groups,14614.0
+V2.14,min_4_distinct_labels_responses,190755.0
+V2.14,min_4_distinct_labels_pairwise_comparisons_per_epoch,785196.0
+V2.14,min_5_distinct_labels_groups,11971.0
+V2.14,min_5_distinct_labels_responses,180049.0
+V2.14,min_5_distinct_labels_pairwise_comparisons_per_epoch,769338.0
+V2.14 strict source namespacing,classification_responses,231336.0
+V2.14 strict source namespacing,rows_with_reliable_prompt_key,230664.0
+V2.14 strict source namespacing,groups,38324.0
+V2.14 strict source namespacing,multi_label_groups,26466.0
+V2.14 strict source namespacing,multi_label_responses,218589.0
+V2.14 strict source namespacing,multi_label_response_pct_of_all,94.48983297022512
+V2.14 strict source namespacing,ranking_items_per_epoch,169814.0
+V2.14 strict source namespacing,pairwise_comparisons_per_epoch,804628.0
+V2.14 strict source namespacing,groups_with_repeated_same_model_responses,3894.0
+V2.14 strict source namespacing,distinct_labels_coverage,18.0
+V2.14 strict source namespacing,unkeyed_rows,672.0
+V2.14 strict source namespacing,source_namespaced_B2M_key_count,2256.0
+V2.14 strict source namespacing,source_id_values_shared_across_datasets_as_reported,267.0
+Open Pool v16,classification_responses,231036.0
+Open Pool v16,rows_with_reliable_prompt_key,231036.0
+Open Pool v16,groups,37879.0
+Open Pool v16,multi_label_groups,26347.0
+Open Pool v16,multi_label_responses,219294.0
+Open Pool v16,multi_label_response_pct_of_all,94.91767516750636
+Open Pool v16,ranking_items_per_epoch,170233.0
+Open Pool v16,pairwise_comparisons_per_epoch,812835.0
+Open Pool v16,groups_with_repeated_same_model_responses,3975.0
+Open Pool v16,distinct_labels_coverage,18.0
+Open Pool v16,unkeyed_rows,0.0
+Open Pool v16,source_namespaced_B2M_key_count,1811.0
+Open Pool v16,min_2_distinct_labels_eligible_groups,26347.0
+Open Pool v16,min_2_distinct_labels_eligible_responses,219294.0
+Open Pool v16,min_2_distinct_labels_pairwise_label_comparisons_per_epoch,812835.0
+Open Pool v16,min_3_distinct_labels_eligible_groups,18295.0
+Open Pool v16,min_3_distinct_labels_eligible_responses,202983.0
+Open Pool v16,min_3_distinct_labels_pairwise_label_comparisons_per_epoch,804783.0
+Open Pool v16,min_4_distinct_labels_eligible_groups,14812.0
+Open Pool v16,min_4_distinct_labels_eligible_responses,192398.0
+Open Pool v16,min_4_distinct_labels_pairwise_label_comparisons_per_epoch,794334.0
+Open Pool v16,min_5_distinct_labels_eligible_groups,12163.0
+Open Pool v16,min_5_distinct_labels_eligible_responses,181670.0
+Open Pool v16,min_5_distinct_labels_pairwise_label_comparisons_per_epoch,778440.0
+Difference (v16 - V2.14 strict),classification_responses,-300.0
+Difference (v16 - V2.14 strict),rows_with_reliable_prompt_key,372.0
+Difference (v16 - V2.14 strict),groups,-445.0
+Difference (v16 - V2.14 strict),multi_label_groups,-119.0
+Difference (v16 - V2.14 strict),multi_label_responses,705.0
+Difference (v16 - V2.14 strict),multi_label_response_pct_of_all,0.42784219728123674
+Difference (v16 - V2.14 strict),ranking_items_per_epoch,419.0
+Difference (v16 - V2.14 strict),pairwise_comparisons_per_epoch,8207.0
+Difference (v16 - V2.14 strict),groups_with_repeated_same_model_responses,81.0
+Difference (v16 - V2.14 strict),distinct_labels_coverage,0.0
+Difference (v16 - V2.14 strict),unkeyed_rows,-672.0
+Difference (v16 - V2.14 strict),source_namespaced_B2M_key_count,-445.0
