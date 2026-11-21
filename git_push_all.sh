@@ -3,7 +3,7 @@ set -euo pipefail
 
 allowed_path() {
     case "$1" in
-        .gitignore|git_push_all.sh|docs/*|src/*|tests/*) return 0 ;;
+        .gitignore|git_push_all.sh|docs/*|src/*|tests/*|scripts/*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -26,12 +26,12 @@ check_outgoing_history() {
 check_outgoing_history
 
 # Only stage the explicitly approved project content.
-git add -- .gitignore docs/ src/ tests/
+git add -- .gitignore docs/ src/ tests/ scripts/
 
 # Do not accidentally commit already-staged files outside the allowlist.
 while IFS= read -r path; do
     if ! allowed_path "$path"; then
-        printf 'Refusing to commit: staged path is outside docs/, src/, tests/, .gitignore, and git_push_all.sh: %s\n' "$path" >&2
+        printf 'Refusing to commit: staged path is outside docs/, src/, tests/, scripts/, .gitignore, and git_push_all.sh: %s\n' "$path" >&2
         exit 1
     fi
 done < <(git diff --cached --name-only)
