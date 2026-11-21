@@ -1,0 +1,11 @@
+metric,value,definition
+V2.14 response rows,231336.0,All rows in the dataset artifact.
+Rows with usable prompt key,230664.0,V14 rows use prompt_canon; B2M additions use their source prompt_id in a separate namespace.
+Observed keyed prompt groups,38055.0,V14 canonical groups plus separately keyed B2M prompt IDs; cross-pool matches cannot be merged.
+Groups containing at least two model labels,26383.0,Distinct labels within each observed keyed prompt group.
+Groups with multiple rows for at least one model,4107.0,Any model occurs more than once in the observed keyed prompt group.
+Groups with an identical normalized response repeated for the same model,0.0,NFKC + case-fold + collapsed-whitespace response equality within a group and model.
+Excess identical-response rows,0.0,Rows beyond the first for each repeated group/model/normalized-response tuple.
+Mean responses per observed keyed group,6.061332282223098,Rows per canonical V14 or source-keyed B2M group.
+Median responses per observed keyed group,2.0,Rows per canonical V14 or source-keyed B2M group.
+Maximum group size,98.0,Rows for one observed keyed prompt group.

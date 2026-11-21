@@ -1,0 +1,8 @@
+check,count,interpretation
+Unique prompt_id values in V2.14,53164,prompt_id values; source-local and file-level fallbacks are included.
+prompt_id values mapped to at least one prompt_canon,50505,Only rows with a non-empty prompt_canon are used.
+prompt_id values mapping to multiple canonical prompts,752,Of 50505 mapped IDs; maximum distinct prompt_canon values for one ID is 2914.
+V14 prompt_id values reused across source_dataset values,0,Among rows with prompt_canon; none are shared across source datasets.
+prompt_canon groups present in multiple source datasets,5342,Of 36068 V14 canonical prompt groups; all 5342 have multiple prompt_id values.
+B2M prompt_id values reused across source_dataset values,267,"Of 1987 B2M IDs; prompt text/canonical keys are absent, so reused IDs cannot be verified against content."
+V14 rows lacking a usable prompt key,672,These rows lack prompt_canon and are not B2M rows with source-provided prompt IDs.
