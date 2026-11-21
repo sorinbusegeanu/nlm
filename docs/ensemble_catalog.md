@@ -1,6 +1,6 @@
 # Dynamic ensemble catalog
 
-The [active E-series catalog](../configs/ensemble_catalog_v2.json) reads the latest Trust List 2 and scores cached probabilities on all 2,699 V0 rows using five prompt-group folds. It saves predictions, resolved checkpoints, rules, and input hashes in a new output directory. The dashboard’s **Ensemble catalog** tab shows the latest saved score for each entry.
+The [active E-series catalog](../configs/ensemble_catalog_v2.json) reads the latest Trust List 2 and scores cached probabilities on all 2,699 V0 rows using five prompt-group folds. It saves predictions, resolved checkpoints, rules, and input hashes in a new output directory. The same JSON documents the later E14-E21 experiments under `experiments`; the dashboard’s **Ensemble catalog** tab loads and displays both the executable strategies and these research runs, including live E21 queue status.
 
 ```bash
 python -m src.ensemble_catalog --list

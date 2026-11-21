@@ -203,7 +203,14 @@ def score_pairs(model_bundle, features):
     features = np.asarray(features, dtype=np.float32)
     if features.ndim != 2 or features.shape[1] != len(FEATURE_NAMES):
         raise ValueError("E19-B score feature matrix has invalid shape")
-    return model_bundle["model"].predict_proba(
+    model = model_bundle["model"]
+    # Joblib models saved by newer scikit-learn releases may omit this
+    # deprecated attribute, while Kaggle's older LogisticRegression
+    # predict_proba implementation still reads it. Restoring the historical
+    # default keeps the binary OVR probability path compatible.
+    if not hasattr(model, "multi_class"):
+        model.multi_class = "auto"
+    return model.predict_proba(
         model_bundle["scaler"].transform(features))[:, 1].astype(np.float32)
 
 

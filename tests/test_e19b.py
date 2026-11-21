@@ -155,6 +155,11 @@ def test_unlabeled_inference_reuses_saved_grouping_bundle(tmp_path):
         embeddings,topics,details,constraints)
     targets=(groups[pairs[:,0]]==groups[pairs[:,1]]).astype(np.int8)
     scorer=e19b_group.fit_pair_scorer(features,targets)
+    expected=e19b_group.score_pairs(scorer,features)
+    if hasattr(scorer["model"], "multi_class"):
+        del scorer["model"].multi_class
+    compatible=e19b_group.score_pairs(scorer,features)
+    assert np.allclose(expected,compatible)
     bundle={"pair_scorer":scorer,"vectorizers":{name:spaces[name+"_vectorizer"] for name in
         ("reconstruction_char","reconstruction_word","response_char","response_word")},
         "threshold":.5}

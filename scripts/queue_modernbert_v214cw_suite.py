@@ -200,6 +200,10 @@ def worker(queue_dir: Path) -> int:
     env = {**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
            "TOKENIZERS_PARALLELISM": "false", "OMP_NUM_THREADS": "1"}
     for job in state["results"]:
+        # Resuming a stopped suite must leave completed/stopped jobs untouched
+        # and run only the jobs that are explicitly queued again.
+        if job.get("status") != "queued":
+            continue
         while True:
             try:
                 processes, gpu = resource_state()

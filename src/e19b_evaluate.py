@@ -220,17 +220,18 @@ def predict_groups(row_ids, responses, reconstructions, semantic_embeddings, *,
 
 
 def run(root=ROOT, *, reconstruct_path=None, embeddings_path=None, output_dir=OUT,
-        threshold_grid=THRESHOLDS, c_values=C_VALUES):
+        threshold_grid=THRESHOLDS, c_values=C_VALUES, experiment="E19-B",
+        docs_path=None):
     started = time.time()
     if not threshold_grid or any(not np.isfinite(x) or not 0<=float(x)<=1 for x in threshold_grid):
-        raise ValueError("E19-B threshold grid must contain values in [0, 1]")
+        raise ValueError(f"{experiment} threshold grid must contain values in [0, 1]")
     ctx = e16_common.load_context(root)
     output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     reconstructed = pd.read_parquet(reconstruct_path or output_dir/"reconstructed_prompts.parquet")
     if reconstructed.id.astype(str).tolist() != ctx["row_ids"].astype(str).tolist():
-        raise ValueError("E19-B reconstruction rows do not exactly align to V0 IDs")
+        raise ValueError(f"{experiment} reconstruction rows do not exactly align to V0 IDs")
     if not reconstructed.status.eq("ok").all():
-        raise ValueError("E19-B requires successful reconstructions for all V0 rows")
+        raise ValueError(f"{experiment} requires successful reconstructions for all V0 rows")
     recon = reconstructed.reconstructed_prompt.fillna("").astype(str).to_numpy()
     responses = ctx["texts"]
     details = reconstructed.distinctive_details.map(lambda x: json.loads(x) if isinstance(x,str) else x).tolist()
@@ -244,7 +245,7 @@ def run(root=ROOT, *, reconstruct_path=None, embeddings_path=None, output_dir=OU
     reconstruction_manifest_path=Path(reconstruct_path or output_dir/"reconstructed_prompts.parquet").parent/"reconstruction_manifest.json"
     reconstruction_manifest=(json.loads(reconstruction_manifest_path.read_text())
         if reconstruction_manifest_path.is_file() else {})
-    configuration={"experiment":"E19-B","seed":SEED,"outer_folds":5,
+    configuration={"experiment":experiment,"seed":SEED,"outer_folds":5,
         "inner_folds":4,"threshold_grid":[float(x) for x in threshold_grid],"C_grid":list(c_values),
         "neighbors":e19b_group.DEFAULT_NEIGHBORS,"max_cluster_size":18,
         "semantic_model":EMBEDDING_MODEL,"semantic_revision":EMBEDDING_REVISION,
@@ -284,9 +285,9 @@ def run(root=ROOT, *, reconstruct_path=None, embeddings_path=None, output_dir=OU
                 "right_id":ids[held_rows[b]],"left_true_prompt_id":groups[held_rows[a]],
                 "right_true_prompt_id":groups[held_rows[b]],"same_true_group":bool(groups[held_rows[a]]==groups[held_rows[b]]),
                 "similarity":float(scores[pi])})
-        print(f"E19-B outer fold {outer['fold']}: pair-F1={fm['pairwise_f1']:.4f}, "
+        print(f"{experiment} outer fold {outer['fold']}: pair-F1={fm['pairwise_f1']:.4f}, "
               f"precision={fm['pairwise_precision']:.4f}, threshold={selected['threshold']}",flush=True)
-    if not np.all(seen==1): raise ValueError("E19-B held-out rows not covered exactly once")
+    if not np.all(seen==1): raise ValueError(f"{experiment} held-out rows not covered exactly once")
     aggregate=grouping_metrics(groups,held_prediction)
     fold_mean={k:float(np.mean([x["metrics"][k] for x in folds])) for k in
         ("pairwise_precision","pairwise_recall","pairwise_f1","cluster_purity","bcubed_precision","bcubed_recall","bcubed_f1")}
@@ -308,9 +309,10 @@ def run(root=ROOT, *, reconstruct_path=None, embeddings_path=None, output_dir=OU
         "threshold":full_selection["threshold"],"max_cluster_size":18,
         "neighbors":e19b_group.DEFAULT_NEIGHBORS,"semantic_model":EMBEDDING_MODEL,
         "semantic_revision":EMBEDDING_REVISION,"configuration":full_selection}
-    tmp_bundle=output_dir/"e19b_grouper.joblib.tmp"
+    slug=experiment.lower().replace("-", "")
+    tmp_bundle=output_dir/f"{slug}_grouper.joblib.tmp"
     joblib.dump(deploy_bundle,tmp_bundle,compress=3)
-    tmp_bundle.replace(output_dir/"e19b_grouper.joblib")
+    tmp_bundle.replace(output_dir/f"{slug}_grouper.joblib")
     pred_frame=pd.DataFrame({"id":ids,"true_prompt_id":groups,"predicted_group_id":held_prediction,
         "reconstructed_prompt":recon,"topic":topics,"distinctive_details":details,"constraints":constraints,
         "generation_repaired":repair_mask,
@@ -332,18 +334,23 @@ def run(root=ROOT, *, reconstruct_path=None, embeddings_path=None, output_dir=OU
     (output_dir/"metrics.json").write_text(json.dumps(metrics,indent=2))
     examples=_diagnostic_examples(pred_frame,pd.DataFrame(diagnostics))
     (output_dir/"diagnostic_examples.json").write_text(json.dumps(examples,indent=2,ensure_ascii=False))
-    report_path=output_dir/"e19b.md"
-    _write_report(metrics, pred_frame, pd.DataFrame(diagnostics), output_dir/"diagnostics.json", report_path)
-    (Path(root)/"docs/e19b.md").write_text(report_path.read_text())
+    report_path=output_dir/f"{slug}.md"
+    _write_report(metrics, pred_frame, pd.DataFrame(diagnostics), output_dir/"diagnostics.json",
+                  report_path, experiment=experiment)
+    if docs_path is None and experiment == "E19-B":
+        docs_path=Path(root)/"docs/e19b.md"
+    if docs_path is not None:
+        Path(docs_path).parent.mkdir(parents=True,exist_ok=True)
+        Path(docs_path).write_text(report_path.read_text())
     return metrics
 
 
-def _write_report(metrics, predictions, pair_df, diagnostics_path, report_path):
+def _write_report(metrics, predictions, pair_df, diagnostics_path, report_path, *, experiment="E19-B"):
     m=metrics["aggregate_oof"]
     correct_groups=m["exact_groups"]; total_groups=m["true_group_count"]
     correct_responses=m["exact_responses"]; rows=m["rows"]
     if m["pairwise_precision"]>=0.95:
-        conclusion=(f"Proceed with E19-B Hungarian-assignment evaluation: held-out pairwise precision is "
+        conclusion=(f"Proceed with {experiment} Hungarian-assignment evaluation: held-out pairwise precision is "
             f"{100*m['pairwise_precision']:.2f}% (at the 95% conservative gate), with "
             f"{100*m['pairwise_recall']:.2f}% pairwise recall. Treat E19-A's +10.26pp as an oracle upper bound, not an expected gain.")
     else:
@@ -372,7 +379,7 @@ def _write_report(metrics, predictions, pair_df, diagnostics_path, report_path):
       "## Method and rerun commands","",
       "Qwen3.5-2B reconstructs each response independently with greedy deterministic generation and a resumable response-hash/model-revision/prompt-version cache. Grouping combines E16 word/character lexical similarities on reconstructed prompts and original responses with frozen EmbeddingGemma2 semantic similarity, topic overlap, distinctive-detail/entity/number overlap, and constraint overlap. A regularized logistic pair scorer supplies edge probabilities; complete-link agglomeration rejects weak transitive bridges and caps clusters at 18.","",
       "Each saved E13-B outer fold remains untouched for final scoring. Within its training partition, four prompt-group inner folds select the logistic regularization and threshold by mean pairwise F1, then precision. The full-V0 grouping is a separately marked diagnostic.","",
-      "Run with `/home/zodrak/cuda13.x/bin/python -m src.e19b_reconstruct --limit 100`, then `... -m src.e19b_reconstruct`, then `/home/zodrak/cuda13.x/bin/python -m src.e19b_evaluate`. For new unlabeled rows use `reconstruct_rows` with separate cache/output paths and `predict_groups` with the saved `e19b_grouper.joblib`."]
+      f"Run with `/home/zodrak/cuda13.x/bin/python -m src.{experiment.lower().replace('-', '')}_reconstruct --limit 100`, then `/home/zodrak/cuda13.x/bin/python -m src.{experiment.lower().replace('-', '')}_reconstruct`, then `/home/zodrak/cuda13.x/bin/python -m src.{experiment.lower().replace('-', '')}_evaluate`. For new unlabeled rows use `reconstruct_rows` with separate cache/output paths and `predict_groups` with the saved {experiment.lower().replace('-', '')}_grouper.joblib."]
     report_path.write_text("\n".join(lines)+"\n")
 
 

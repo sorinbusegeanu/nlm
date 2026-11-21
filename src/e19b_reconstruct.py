@@ -216,13 +216,17 @@ def parse_reconstruction(raw: str) -> dict:
     prompt = parsed.get("reconstructed_prompt")
     topic = parsed.get("topic")
     details = parsed.get("distinctive_details")
-    constraints = parsed.get("constraints")
+    # Older or overlong generations sometimes omit the optional constraints
+    # field; the reconstruction remains usable and is normalized to [].
+    constraints = parsed.get("constraints", [])
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("reconstructed_prompt must be a nonempty string")
     if not isinstance(topic, str):
         raise ValueError("topic must be a string")
     if not isinstance(details, list) or not all(isinstance(x, str) for x in details):
         raise ValueError("distinctive_details must be a list of strings")
+    if isinstance(constraints, str):
+        constraints = [constraints]
     if not isinstance(constraints, list) or not all(isinstance(x, str) for x in constraints):
         raise ValueError("constraints must be a list of strings")
     def unique_strings(values):
@@ -294,16 +298,17 @@ class ReconstructionCache:
             (key, int(attempt), status, error, raw_output, now))
         self.connection.commit()
 
-    def export(self, output_path: Path, row_ids, texts, model_revision):
+    def export(self, output_path: Path, row_ids, texts, model_revision, *,
+               model_id=MODEL_ID, prompt_version=RECONSTRUCTION_PROMPT_VERSION):
         records = []
         for index, (row_id, text) in enumerate(zip(row_ids, texts)):
-            key = cache_key(text, model_revision)
+            key = cache_key(text, model_revision, prompt_version)
             entry = self.entry(key)
             payload = json.loads(entry["output_json"]) if entry and entry["output_json"] else {}
             records.append({"id": str(row_id), "row_index": index,
                 "response_sha256": response_hash(text), "cache_key": key,
-                "model_id": MODEL_ID, "model_revision": model_revision,
-                "prompt_version": RECONSTRUCTION_PROMPT_VERSION,
+                "model_id": model_id, "model_revision": model_revision,
+                "prompt_version": prompt_version,
                 "status": entry["status"] if entry else "missing",
                 "attempts": int(entry["attempts"]) if entry else 0,
                 "last_error": entry["last_error"] if entry else None,
@@ -360,7 +365,8 @@ def _generation_inputs(processor, responses):
 def reconstruct_rows(*, row_ids, texts, model_id=MODEL_ID, revision=MODEL_REVISION,
                      cache_path=None, output_path=None, limit=None,
                      max_attempts=RETRY_ATTEMPTS, batch_size=40, max_new_tokens=MAX_NEW_TOKENS,
-                     retry_truncated=False, seed=2026, context=None):
+                     retry_truncated=False, seed=2026,
+                     prompt_version=RECONSTRUCTION_PROMPT_VERSION, context=None):
     """Reconstruct selected input rows and export current status for every row."""
     import torch
 
@@ -385,7 +391,7 @@ def reconstruct_rows(*, row_ids, texts, model_id=MODEL_ID, revision=MODEL_REVISI
         ordered = sorted(range(len(row_ids)), key=lambda i: str(row_ids[i]))
         selected = ordered if limit is None else ordered[:max(0, int(limit))]
         for index, row_id in enumerate(row_ids):
-            key = cache_key(texts[index], resolved_revision)
+            key = cache_key(texts[index], resolved_revision, prompt_version)
             cache.bind_row(row_id, index, key)
         def generate_raw(responses):
             inputs=_generation_inputs(processor,responses)
@@ -400,7 +406,7 @@ def reconstruct_rows(*, row_ids, texts, model_id=MODEL_ID, revision=MODEL_REVISI
 
         def retry_one(index,retry_budget):
             response=str(texts[index]); row_id=str(row_ids[index])
-            key=cache_key(response,resolved_revision)
+            key=cache_key(response,resolved_revision,prompt_version)
             prior=cache.entry(key); start_attempt=int(prior["attempts"]) if prior else 0
             last_attempt=start_attempt+int(retry_budget)
             for attempt in range(start_attempt+1,last_attempt+1):
@@ -409,19 +415,19 @@ def reconstruct_rows(*, row_ids, texts, model_id=MODEL_ID, revision=MODEL_REVISI
                     raw=generate_raw([response])[0]
                     parsed=parse_reconstruction(raw)
                     cache.save_attempt(key,response,model_id,resolved_revision,
-                        RECONSTRUCTION_PROMPT_VERSION,attempt,parsed=parsed,raw_output=raw)
+                        prompt_version,attempt,parsed=parsed,raw_output=raw)
                     return
                 except Exception as exc:
                     error=f"{type(exc).__name__}: {exc}"
                     cache.save_attempt(key,response,model_id,resolved_revision,
-                        RECONSTRUCTION_PROMPT_VERSION,attempt,raw_output=raw,error=error)
+                        prompt_version,attempt,raw_output=raw,error=error)
                     if torch.cuda.is_available(): torch.cuda.empty_cache()
                     if attempt==last_attempt:
                         print(f"E19-B failed id={row_id} after {attempt} attempts: {error}",flush=True)
 
         pending=[]
         for index in selected:
-            prior=cache.entry(cache_key(texts[index],resolved_revision))
+            prior=cache.entry(cache_key(texts[index],resolved_revision,prompt_version))
             retry_cutoff=False
             if retry_truncated and prior and prior["status"]=="ok" and prior.get("raw_output"):
                 payload=json.loads(prior.get("output_json") or "{}")
@@ -437,15 +443,15 @@ def reconstruct_rows(*, row_ids, texts, model_id=MODEL_ID, revision=MODEL_REVISI
                 if len(raws)!=len(indices):raise RuntimeError("batched generation returned a wrong row count")
                 retry=[]
                 for index,raw in zip(indices,raws):
-                    key=cache_key(texts[index],resolved_revision)
+                    key=cache_key(texts[index],resolved_revision,prompt_version)
                     prior=cache.entry(key); attempt=(int(prior["attempts"]) if prior else 0)+1
                     try:
                         parsed=parse_reconstruction(raw)
                         cache.save_attempt(key,texts[index],model_id,resolved_revision,
-                            RECONSTRUCTION_PROMPT_VERSION,attempt,parsed=parsed,raw_output=raw)
+                            prompt_version,attempt,parsed=parsed,raw_output=raw)
                     except Exception as exc:
                         cache.save_attempt(key,texts[index],model_id,resolved_revision,
-                            RECONSTRUCTION_PROMPT_VERSION,attempt,raw_output=raw,
+                            prompt_version,attempt,raw_output=raw,
                             error=f"{type(exc).__name__}: {exc}")
                         retry.append(index)
                 completed+=len(indices)
@@ -464,7 +470,8 @@ def reconstruct_rows(*, row_ids, texts, model_id=MODEL_ID, revision=MODEL_REVISI
                         print(f"E19-B reconstruction {completed}/{len(pending)} selected rows",flush=True)
         batch=int(batch_size)
         for start in range(0,len(pending),batch):process_batch(pending[start:start+batch])
-        frame = cache.export(output_path, row_ids, texts, resolved_revision)
+        frame = cache.export(output_path, row_ids, texts, resolved_revision,
+                             model_id=model_id,prompt_version=prompt_version)
     finally:
         cache.close()
         del model, processor
@@ -477,7 +484,7 @@ def reconstruct_rows(*, row_ids, texts, model_id=MODEL_ID, revision=MODEL_REVISI
             "failures": int(frame.status.eq("failed").sum()),
             "missing_or_not_yet_selected": int(frame.status.eq("missing").sum()),
             "model_id": model_id, "model_revision": resolved_revision,
-            "prompt_version": RECONSTRUCTION_PROMPT_VERSION,
+            "prompt_version": prompt_version,
             "cache_path": str(cache_path), "output_path": str(output_path)}
     output_path.parent.mkdir(parents=True, exist_ok=True)
     (output_path.parent / "reconstruction_manifest.json").write_text(json.dumps(result, indent=2))
@@ -498,6 +505,7 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument("--revision", default=MODEL_REVISION)
+    parser.add_argument("--prompt-version", default=RECONSTRUCTION_PROMPT_VERSION)
     parser.add_argument("--limit", type=int, help="deterministic prefix by sorted response ID")
     parser.add_argument("--max-attempts", type=int, default=RETRY_ATTEMPTS)
     parser.add_argument("--batch-size", type=int, default=40)
@@ -511,7 +519,8 @@ def main(argv=None):
     result = reconstruct_v0(args.root, model_id=args.model_id, revision=args.revision,
         cache_path=args.cache, output_path=args.output, limit=args.limit,
         max_attempts=args.max_attempts, batch_size=args.batch_size,
-        max_new_tokens=args.max_new_tokens,retry_truncated=args.retry_truncated,seed=args.seed)
+        max_new_tokens=args.max_new_tokens,retry_truncated=args.retry_truncated,seed=args.seed,
+        prompt_version=args.prompt_version)
     print(json.dumps(result, indent=2))
     return 0 if result["failures"] == 0 else 2
 

@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -917,6 +918,19 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
                 cache_fold=None, checkpoint_selection_metric="balanced_accuracy", stop_file=None,
                 no_validation=False):
     weighted_sampling = bool(cfg.get("weighted_sampling", False))
+    group_aware_sampling = bool(cfg.get("group_aware_sampling", False))
+    if group_aware_sampling:
+        required_group_columns = {"prompt_id", "group_label_count", "group_model_count",
+                                  "ranking_eligible", "ranking_rotation_index"}
+        missing_group_columns = required_group_columns - set(train.columns)
+        if missing_group_columns:
+            raise ValueError("group-aware training dataset is missing: " +
+                             ", ".join(sorted(missing_group_columns)))
+        observed_labels = train.groupby("prompt_id", sort=False).model.transform("nunique")
+        if not observed_labels.astype(int).equals(train.group_label_count.astype(int)):
+            raise ValueError("dataset group_label_count does not match observed training labels")
+        if not train.ranking_eligible.astype(bool).equals(observed_labels.ge(2)):
+            raise ValueError("dataset ranking_eligible does not match observed group labels")
     sampling_weights = None
     if weighted_sampling:
         if model not in WEIGHTED_SAMPLING_MODELS or (
@@ -1010,6 +1024,12 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             attention_backend=cfg.get("attention_backend"),
             code_revision=cfg.get("code_revision"),
             class_weights=cfg.get("class_weights"),
+            group_aware_sampling=bool(cfg.get("group_aware_sampling", False)),
+            group_ranking_lambda=cfg.get("group_ranking_lambda", 0.0),
+            group_prompt_ids=(train.prompt_id.astype(str).tolist()
+                              if cfg.get("group_aware_sampling") and "prompt_id" in train else None),
+            ranking_rotation_indices=(pd.to_numeric(train.ranking_rotation_index, errors="coerce").tolist()
+                                      if cfg.get("group_aware_sampling") and "ranking_rotation_index" in train else None),
             select_best_checkpoint=(checkpoint_selection_metric == "balanced_accuracy"
                 or cfg.get("checkpoint_selection") == "highest_validation_accuracy"),
             checkpoint_selection_metric=checkpoint_selection_metric,
@@ -1587,6 +1607,13 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         weighted_sampling_path = run_artifact_dir / "weighted_sampling.json"
         weighted_sampling_path.write_text(json.dumps({"training_dataset": dataset,
             "training_dataset_sha256": train_hash, "sampling": weighted_sampling}, indent=2) + "\n")
+    group_aware_sampling_result = result.get("group_aware_sampling")
+    if group_aware_sampling_result is not None:
+        group_sampling_path = run_artifact_dir / "group_aware_sampling.json"
+        group_sampling_path.write_text(json.dumps({"training_dataset": dataset,
+            "training_dataset_sha256": train_hash, "sampling": group_aware_sampling_result}, indent=2) + "\n")
+    else:
+        group_sampling_path = None
     export_started = time.perf_counter()
     post_training_started = export_started
     runtime_breakdown = _post_training_runtime(result)
@@ -1652,9 +1679,18 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
                                              if training_view_sampling is not None else None),
         "class_weights": cfg.get("class_weights"),
         "loss_config": {
-            "training": "class_weighted_cross_entropy" if cfg.get("class_weights") else "model_default",
-            "validation": "model_default_unweighted" if cfg.get("class_weights") else "model_default",
+            "training": ("cross_entropy_plus_group_ranking" if group_aware_sampling_result is not None else
+                         "class_weighted_cross_entropy" if cfg.get("class_weights") else "model_default"),
+            "validation": ("unweighted_cross_entropy" if group_aware_sampling_result is not None else
+                           "model_default_unweighted" if cfg.get("class_weights") else "model_default"),
+            **({"classification_loss": "cross_entropy",
+                "group_ranking_loss": {"enabled": True,
+                                       "lambda": float(cfg.get("group_ranking_lambda", 0.0))}}
+               if group_aware_sampling_result is not None else {}),
         },
+        "group_aware_sampling": group_aware_sampling_result,
+        "group_aware_sampling_artifact": str(group_sampling_path) if group_sampling_path else None,
+        "training_loss_components_by_epoch": result.get("training_loss_components_by_epoch", []),
         "weighted_sampling": weighted_sampling,
         "weighted_sampling_artifact": (str(run_artifact_dir / "weighted_sampling.json")
                                         if weighted_sampling["enabled"] else None),
@@ -1844,6 +1880,7 @@ TRAINING_OVERRIDE_FIELDS = (
     "epoch_checkpoint_style",
     "class_weights",
     "resume_optimizer_state_with_lr_override",
+    "group_aware_sampling", "group_ranking_lambda",
 )
 
 CONTINUATION_CONFIG_FIELDS = set(TRAINING_OVERRIDE_FIELDS) | {
@@ -1905,17 +1942,26 @@ def _matching_continuation_source(model, dataset, validation_dataset, data_dir,
 
 
 def _validate_training_overrides(model, cfg):
-    for name in ("weighted_sampling", "no_validation", "save_epoch_checkpoints", "early_stopping"):
+    for name in ("weighted_sampling", "no_validation", "save_epoch_checkpoints", "early_stopping",
+                 "group_aware_sampling"):
         if name in cfg and not isinstance(cfg[name], bool):
             raise ValueError(f"{name} must be a boolean")
     if cfg.get("no_validation") and cfg.get("early_stopping", False):
         raise ValueError("no_validation runs must disable early_stopping")
+    if cfg.get("group_aware_sampling") and cfg.get("weighted_sampling"):
+        raise ValueError("group-aware sampling and WeightedRandomSampler cannot be combined")
     if ("resume_optimizer_state_with_lr_override" in cfg and
             not isinstance(cfg["resume_optimizer_state_with_lr_override"], bool)):
         raise ValueError("resume_optimizer_state_with_lr_override must be a boolean")
     for name in ("learning_rate", "weight_decay", "warmup_ratio", "learning_rate_decay"):
         if name in cfg and cfg[name] is not None and float(cfg[name]) < 0:
             raise ValueError(f"{name} must not be negative")
+    if "group_ranking_lambda" in cfg:
+        value = float(cfg["group_ranking_lambda"])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("group_ranking_lambda must be a finite nonnegative number")
+        if value and not cfg.get("group_aware_sampling", False):
+            raise ValueError("group_ranking_lambda requires group_aware_sampling=true")
     for name in ("epochs", "early_stopping_patience", "batch_size", "gradient_accumulation_steps", "lora_rank", "lora_alpha", "max_length"):
         if name in cfg and int(cfg[name]) < 1:
             raise ValueError(f"{name} must be positive")

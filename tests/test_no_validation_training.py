@@ -7,6 +7,7 @@ from src.pipeline import (_register_no_validation_epoch_checkpoints,
                          _training_partitions, _train_fold)
 from src.registry import Registry
 from src.data_factory import _normal_text
+from src.model_factory import _save_lora_epoch_checkpoint
 
 
 def test_no_validation_partition_uses_every_combined_row(tmp_path):
@@ -98,6 +99,40 @@ def test_epoch_checkpoint_registration_is_separate_and_v0_exposed(tmp_path):
     assert all(row["split"] == "no_validation_epoch_checkpoint" for row in rows)
     assert all(json.loads(row["config_json"])["checkpoint_exposure"] == "V0-exposed" for row in rows)
     assert all("not eligible" in row["description"] for row in rows)
+
+
+def test_no_validation_epoch_writer_saves_four_complete_inference_bundles(tmp_path):
+    import torch
+
+    class Adapter:
+        def save_pretrained(self, path, safe_serialization=True):
+            assert safe_serialization
+            (path / "adapter_config.json").write_text("{}")
+            (path / "adapter_model.safetensors").write_bytes(b"adapter")
+
+    class Tokenizer:
+        def save_pretrained(self, path):
+            (path / "tokenizer_config.json").write_text("{}")
+
+    classifier = torch.nn.Linear(2, 18)
+    labels = [f"label-{index}" for index in range(18)]
+    metadata = {"classes": labels,
+        "label_to_id": {label: index for index, label in enumerate(labels)},
+        "validation_enabled": False, "training_lineage": "V0-exposed"}
+
+    for epoch in range(1, 5):
+        checkpoint = _save_lora_epoch_checkpoint(
+            Adapter(), Tokenizer(), classifier, tmp_path / f"epoch_{epoch}", metadata)
+        assert {"adapter_config.json", "adapter_model.safetensors", "classifier.pt",
+                "tokenizer_config.json", "checkpoint_manifest.json",
+                "validation_metrics.json"}.issubset({path.name for path in checkpoint.iterdir()})
+        saved_classifier = torch.load(checkpoint / "classifier.pt", map_location="cpu",
+                                       weights_only=True)
+        assert set(saved_classifier) == set(classifier.state_dict())
+        manifest = json.loads((checkpoint / "checkpoint_manifest.json").read_text())
+        assert manifest["validation_enabled"] is False
+        assert manifest["label_to_id"] == metadata["label_to_id"]
+        assert json.loads((checkpoint / "validation_metrics.json").read_text()) == {}
 
 
 def test_experiment_is_queued_without_starting_worker():

@@ -11,6 +11,7 @@ import hashlib
 import gc
 import shutil
 import types
+import random
 from collections import deque
 from collections.abc import Mapping
 from numbers import Real
@@ -133,6 +134,234 @@ def _make_epoch_weighted_sampler(weights, *, seed, initial_epoch=0, labels=None,
             return iter(sampled)
 
     return EpochWeightedRandomSampler()
+
+
+class GroupAwareBatchSampler:
+    """Expose every row once while keeping each epoch's rank candidates atomic."""
+    def __init__(self, prompt_ids, labels, rotation_indices, *, batch_size, seed=2026,
+                 initial_epoch=0):
+        self.prompt_ids = list(map(str, prompt_ids))
+        self.labels = list(map(str, labels))
+        self.rotation_indices = np.asarray(rotation_indices, dtype=np.int64)
+        if not (len(self.prompt_ids) == len(self.labels) == len(self.rotation_indices)):
+            raise ValueError("group-ranking metadata must align with all training rows")
+        if not self.prompt_ids:
+            raise ValueError("group-aware sampling requires at least one training row")
+        if np.any(self.rotation_indices < 0):
+            raise ValueError("ranking rotation indices must be nonnegative")
+        self.batch_size = int(batch_size)
+        if self.batch_size < 1:
+            raise ValueError("group-aware batch size must be positive")
+        self.seed = int(seed)
+        self.next_epoch = max(0, int(initial_epoch))
+        self.rank_group_by_index = [-1] * len(self.prompt_ids)
+        self.epoch_records = []
+
+    def _make_epoch(self, epoch):
+        by_group_label = {}
+        for index, (group, label) in enumerate(zip(self.prompt_ids, self.labels)):
+            by_group_label.setdefault((group, label), []).append(index)
+        by_group = {}
+        for (group, label), indices in by_group_label.items():
+            by_group.setdefault(group, []).append((label, indices))
+        rank_units, ranked_indices = [], set()
+        rank_map = [-1] * len(self.prompt_ids)
+        for rank_id, group in enumerate(sorted(by_group)):
+            label_rows = by_group[group]
+            if len(label_rows) < 2:
+                continue
+            selected = []
+            for label, indices in sorted(label_rows, key=lambda item: item[0]):
+                indices = sorted(indices, key=lambda idx: self.rotation_indices[idx])
+                chosen = next((idx for idx in indices
+                               if self.rotation_indices[idx] == epoch % len(indices)), None)
+                if chosen is None:
+                    raise ValueError(f"group {group!r}, label {label!r} has invalid rotation metadata")
+                selected.append(chosen)
+                ranked_indices.add(chosen)
+                rank_map[chosen] = rank_id
+            rank_units.append(selected)
+        rng = random.Random(self.seed + int(epoch))
+        units = list(rank_units)
+        units.extend([[index] for index in range(len(self.prompt_ids)) if index not in ranked_indices])
+        # First-fit decreasing keeps the number of optimizer batches constant
+        # across rotation epochs; random tie order and batch order retain SGD
+        # variation without changing total scheduler steps.
+        tie_break = {id(unit): rng.random() for unit in units}
+        units.sort(key=lambda unit: (-len(unit), tie_break[id(unit)]))
+        batches, batch = [], []
+        for unit in units:
+            if batch and len(batch) + len(unit) > self.batch_size:
+                batches.append(batch); batch = []
+            # A complete ranking group is never split. The forward pass in the
+            # trainer subdivides oversized atomic groups into probed microbatches.
+            if len(unit) > self.batch_size:
+                if batch:
+                    batches.append(batch); batch = []
+                batches.append(unit)
+            else:
+                batch.extend(unit)
+        if batch:
+            batches.append(batch)
+        rng.shuffle(batches)
+        for batch in batches:
+            rng.shuffle(batch)
+        return batches, rank_map, len(rank_units), len(ranked_indices)
+
+    def __iter__(self):
+        epoch = self.next_epoch
+        self.next_epoch += 1
+        batches, self.rank_group_by_index, rank_groups, ranked_rows = self._make_epoch(epoch)
+        self.epoch_records.append({"epoch": epoch + 1, "seed": self.seed + epoch,
+                                   "sampled_examples": sum(map(len, batches)),
+                                   "rank_groups": rank_groups, "rank_candidate_rows": ranked_rows,
+                                   "batch_count": len(batches), "each_row_once": True})
+        return iter(batches)
+
+    def __len__(self):
+        batches, _, _, _ = self._make_epoch(self.next_epoch)
+        return len(batches)
+
+
+def _make_group_training_collator(data_collator, group_batch_sampler):
+    """Attach the current epoch's rank-group IDs to a normal model batch."""
+    import torch
+
+    def collate(rows):
+        has_indices = ["row_index" in row for row in rows]
+        if not any(has_indices):
+            # Evaluation rows have labels but no sampler metadata; preserve the
+            # standard tokenizer collator for the validation path.
+            return data_collator(rows)
+        if not all(has_indices):
+            raise ValueError("a group-aware training batch must include row_index for every row")
+        model_rows = [{key: value for key, value in row.items()
+                       if key not in {"labels", "row_index"}} for row in rows]
+        result = data_collator(model_rows)
+        result["labels"] = torch.stack([row["labels"] for row in rows])
+        row_indices = [int(row["row_index"].item()) for row in rows]
+        result["rank_group_ids"] = torch.tensor(
+            [group_batch_sampler.rank_group_by_index[index] for index in row_indices],
+            dtype=torch.long)
+        return result
+
+    return collate
+
+
+def group_ranking_loss(logits, labels, rank_group_ids):
+    """Mean within-group softmax ranking loss across represented true labels."""
+    import torch
+    import torch.nn.functional as functional
+
+    if logits.ndim != 2 or labels.ndim != 1 or rank_group_ids.ndim != 1:
+        raise ValueError("ranking loss expects logits [rows, classes] and aligned vectors")
+    if len(logits) != len(labels) or len(labels) != len(rank_group_ids):
+        raise ValueError("ranking loss inputs must have the same row count")
+    group_ids = torch.unique(rank_group_ids[rank_group_ids.ge(0)], sorted=True)
+    losses = []
+    for group_id in group_ids:
+        rows = torch.nonzero(rank_group_ids.eq(group_id), as_tuple=False).flatten()
+        group_labels = labels.index_select(0, rows)
+        represented = torch.unique(group_labels, sorted=True)
+        if len(represented) < 2 or len(represented) != len(rows):
+            raise ValueError("each ranking group must contain one row for each of at least two labels")
+        # Each row owns one distinct true class. For each represented class,
+        # normalize that class logit over the group's candidate responses.
+        targets = torch.stack([torch.nonzero(group_labels.eq(label), as_tuple=False)[0, 0]
+                               for label in represented]).long()
+        candidate_scores = logits.index_select(0, rows).index_select(1, represented).transpose(0, 1)
+        losses.append(functional.cross_entropy(candidate_scores.float(), targets, reduction="mean"))
+    if not losses:
+        return logits.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def group_aware_loss(logits, labels, rank_group_ids, *, group_ranking_lambda=0.0,
+                     class_weight_tensor=None):
+    """Return total, classification and ranking losses with shared classifier logits."""
+    import torch.nn.functional as functional
+
+    ce = functional.cross_entropy(logits.float(), labels,
+                                  weight=(class_weight_tensor.to(logits.device)
+                                          if class_weight_tensor is not None else None))
+    ranking = group_ranking_loss(logits, labels, rank_group_ids)
+    return ce + float(group_ranking_lambda) * ranking, ce, ranking
+
+
+def _group_ranking_trainer(base, class_weights, group_ranking_lambda, group_batch_sampler):
+    import torch
+
+    ordered_weights = (torch.tensor(list(class_weights.values()), dtype=torch.float32)
+                       if class_weights is not None else None)
+
+    class GroupRankingTrainer(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.model_accepts_loss_kwargs = False
+            self._e21_loss_accumulator = {"ce": 0.0, "ranking": 0.0, "batches": 0}
+
+        def get_train_dataloader(self):
+            from torch.utils.data import DataLoader
+            loader = DataLoader(self.train_dataset, batch_sampler=group_batch_sampler,
+                                collate_fn=self.data_collator, num_workers=0,
+                                pin_memory=bool(self.args.dataloader_pin_memory))
+            return self.accelerator.prepare(loader)
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            if not model.training:
+                clean = {key: value for key, value in inputs.items() if key != "rank_group_ids"}
+                return super().compute_loss(model, clean, return_outputs=return_outputs,
+                                            num_items_in_batch=num_items_in_batch)
+            batch = dict(inputs)
+            labels = batch.pop("labels")
+            rank_ids = batch.pop("rank_group_ids")
+            batch_size = int(getattr(self.args, "per_device_train_batch_size", len(labels)))
+            logits_parts = []
+            # A full group is atomic for ranking, but can be larger than the
+            # selected physical batch. Forward it in probed-size chunks.
+            for start in range(0, len(labels), max(1, batch_size)):
+                stop = min(len(labels), start + max(1, batch_size))
+                chunk = {key: value[start:stop] for key, value in batch.items()}
+                logits_parts.append(model(**chunk).logits)
+            logits = torch.cat(logits_parts, dim=0)
+            total, ce, ranking = group_aware_loss(
+                logits, labels, rank_ids, group_ranking_lambda=group_ranking_lambda,
+                class_weight_tensor=ordered_weights)
+            self._e21_loss_accumulator["ce"] += float(ce.detach().float().item())
+            self._e21_loss_accumulator["ranking"] += float(ranking.detach().float().item())
+            self._e21_loss_accumulator["batches"] += 1
+            outputs = types.SimpleNamespace(logits=logits)
+            return (total, outputs) if return_outputs else total
+
+        def log(self, logs, start_time=None):
+            logs = dict(logs)
+            if "loss" in logs and self._e21_loss_accumulator["batches"]:
+                count = self._e21_loss_accumulator["batches"]
+                logs["train_classification_loss"] = self._e21_loss_accumulator["ce"] / count
+                logs["train_group_ranking_loss"] = self._e21_loss_accumulator["ranking"] / count
+                self._e21_loss_accumulator = {"ce": 0.0, "ranking": 0.0, "batches": 0}
+            return super().log(logs, start_time=start_time)
+
+    return GroupRankingTrainer
+
+
+def _save_lora_epoch_checkpoint(backbone, tokenizer, classifier, checkpoint_dir, metadata,
+                                validation_metrics=None):
+    """Write the adapter, classifier head, tokenizer and manifest for one LoRA epoch."""
+    import torch
+
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    backbone.save_pretrained(checkpoint_dir, safe_serialization=True)
+    tokenizer.save_pretrained(checkpoint_dir)
+    torch.save({key: value.detach().cpu() for key, value in classifier.state_dict().items()},
+               checkpoint_dir / "classifier.pt")
+    (checkpoint_dir / "checkpoint_manifest.json").write_text(
+        json.dumps(metadata, indent=2) + "\n")
+    # Kept as an empty object for no-validation runs; no validation is run or scored.
+    (checkpoint_dir / "validation_metrics.json").write_text(
+        json.dumps(validation_metrics or {}, indent=2) + "\n")
+    return checkpoint_dir
 
 
 def normalize_class_weights(class_weights, classes):
@@ -1803,6 +2032,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        training_views=None, training_view_ids=None, stop_file=None,
                        weighted_sampling=False, sampling_weights=None,
                        class_weights=None,
+                       group_aware_sampling=False, group_ranking_lambda=0.0,
+                       group_prompt_ids=None, ranking_rotation_indices=None,
                        resume_optimizer_state_with_lr_override=False,
                        _oom_recovery_context=None, _trainer_resume_checkpoint=None,
                        copy_resume_state=True):
@@ -1821,6 +2052,16 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     label_map = {label: i for i, label in enumerate(classes)}
     y_indices = np.asarray([label_map[y] for y in y_train], dtype=np.int64)
     normalized_class_weights = normalize_class_weights(class_weights, classes)
+    group_ranking_lambda = float(group_ranking_lambda)
+    if not math.isfinite(group_ranking_lambda) or group_ranking_lambda < 0:
+        raise ValueError("group_ranking_lambda must be a finite nonnegative number")
+    if group_aware_sampling and (group_prompt_ids is None or ranking_rotation_indices is None):
+        raise ValueError("group-aware sampling requires prompt IDs and ranking rotation indices")
+    if not group_aware_sampling and group_ranking_lambda:
+        raise ValueError("group_ranking_lambda requires group_aware_sampling")
+    if group_aware_sampling and (len(group_prompt_ids) != len(train_text)
+            or len(ranking_rotation_indices) != len(train_text)):
+        raise ValueError("group-aware metadata must align with every training response")
     model_source = str(_trainer_resume_checkpoint or resume_checkpoint or checkpoint)
     model_revision = None if (_trainer_resume_checkpoint or resume_checkpoint) else revision
     tokenizer = tr.AutoTokenizer.from_pretrained(model_source, revision=model_revision, trust_remote_code=True,
@@ -1839,7 +2080,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     if gradient_checkpointing:
         _set_gradient_checkpointing(model, True)
     train = _TextDataset(train_text, y_indices, tokenizer, max_length,
-                         training_views=training_views, training_view_ids=training_view_ids, seed=seed)
+                         training_views=training_views, training_view_ids=training_view_ids, seed=seed,
+                         include_indices=group_aware_sampling)
     if weighted_sampling and sampling_weights is None:
         raise ValueError("weighted_sampling requires sampling_weights for every training row")
     if sampling_weights is not None and len(sampling_weights) != len(train):
@@ -1851,7 +2093,14 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                    if validation_labels is not None else None)
     val = _TextDataset(validation_text, val_indices, tokenizer, max_length)
     data_collator = tr.DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
-    train.collate_fn = data_collator
+    def group_probe_collator(rows):
+        model_rows = [{key: value for key, value in row.items() if key not in {"labels", "row_index"}}
+                      for row in rows]
+        result = data_collator(model_rows)
+        result["labels"] = torch.stack([row["labels"] for row in rows])
+        return result
+
+    train.collate_fn = group_probe_collator if group_aware_sampling else data_collator
     val.collate_fn = data_collator
     requested_batch_size = int(batch_size)
     requested_inference_batch_size = max(1, int(inference_batch_size or batch_size))
@@ -1875,6 +2124,17 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             train.restore_epoch_views(0)
     effective_batch_size, gradient_accumulation_steps = _resolve_batch_accumulation(
         effective_batch_size, gradient_accumulation_steps, target_effective_batch_size)
+    group_batch_sampler = None
+    if group_aware_sampling:
+        group_batch_sampler = GroupAwareBatchSampler(
+            group_prompt_ids, y_train, ranking_rotation_indices,
+            batch_size=effective_batch_size, seed=seed,
+            initial_epoch=_resume_sampler_epoch(_trainer_resume_checkpoint))
+
+        training_data_collator = _make_group_training_collator(data_collator, group_batch_sampler)
+        train.collate_fn = training_data_collator
+    else:
+        training_data_collator = data_collator
     checkpointing_enabled = _gradient_checkpointing_for_batch(
         gradient_checkpointing, effective_batch_size)
     if gradient_checkpointing:
@@ -1925,9 +2185,20 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         eval_oom_fallbacks = 0
 
         def _get_train_sampler(self, train_dataset=None):
+            if group_batch_sampler is not None:
+                return None
             if weighted_sampler is not None:
                 return weighted_sampler
             return super()._get_train_sampler(train_dataset)
+
+        def get_train_dataloader(self):
+            if group_batch_sampler is None:
+                return super().get_train_dataloader()
+            from torch.utils.data import DataLoader
+            loader = DataLoader(self.train_dataset, batch_sampler=group_batch_sampler,
+                                collate_fn=self.data_collator, num_workers=0,
+                                pin_memory=bool(self.args.dataloader_pin_memory))
+            return self.accelerator.prepare(loader)
 
         def _load_optimizer_and_scheduler(self, checkpoint):
             loaded = super()._load_optimizer_and_scheduler(checkpoint)
@@ -2087,8 +2358,9 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                     self.continuation_checkpoint_path = str(preserved)
             return control
 
-    encoder_steps_per_epoch = _optimizer_steps_per_epoch(
-        len(train), effective_batch_size, gradient_accumulation_steps)
+    batches_per_epoch = len(group_batch_sampler) if group_batch_sampler is not None else math.ceil(
+        len(train) / effective_batch_size)
+    encoder_steps_per_epoch = math.ceil(batches_per_epoch / gradient_accumulation_steps)
     live_callback = _live_training_progress_callback(
         TrainerCallback, out, steps_per_epoch=encoder_steps_per_epoch, epochs=epochs,
         physical_batch_size=effective_batch_size,
@@ -2105,7 +2377,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         seed=seed, data_seed=seed, save_strategy="epoch", save_total_limit=2,
         eval_strategy="epoch" if validation_labels is not None else "no", report_to=[],
         logging_strategy="epoch", fp16=use_fp16, bf16=use_bf16,
-        dataloader_num_workers=0, **_length_grouping_args(tr))
+        dataloader_num_workers=0, remove_unused_columns=not group_aware_sampling,
+        **_length_grouping_args(tr))
 
     trainer_type = OrderedValidationTrainer
     if learning_rate_decay is not None:
@@ -2140,8 +2413,13 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             TrainerCallback, early_stopping_patience, metric=checkpoint_selection_metric)
         callbacks.append(early_stopping_callback)
         callbacks.append(best_checkpoint_callback)
-    trainer_type = _class_weighted_trainer(trainer_type, label_map, normalized_class_weights)
-    trainer = trainer_type(model=model, args=args, train_dataset=train, data_collator=data_collator,
+    if group_aware_sampling:
+        trainer_type = _group_ranking_trainer(trainer_type, normalized_class_weights,
+                                               group_ranking_lambda, group_batch_sampler)
+    else:
+        trainer_type = _class_weighted_trainer(trainer_type, label_map, normalized_class_weights)
+    trainer = trainer_type(model=model, args=args, train_dataset=train,
+        data_collator=training_data_collator,
         eval_dataset=val if validation_labels is not None else None,
         compute_metrics=compute_metrics if validation_labels is not None else None,
         processing_class=tokenizer, callbacks=callbacks)
@@ -2300,6 +2578,13 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             "continuation_checkpoint_path": best_checkpoint_callback.continuation_checkpoint_path,
             "selected_checkpoint_path": str(out),
             "training_view_sampling": (train.sampling_summary() if training_views is not None else None),
+            "group_aware_sampling": (None if group_batch_sampler is None else {
+                "enabled": True, "policy": "every row once; one per group-label selected by epoch rotation",
+                "seed": int(seed), "batch_size_cap": effective_batch_size,
+                "epoch_records": list(group_batch_sampler.epoch_records)}),
+            "group_ranking_lambda": group_ranking_lambda,
+            "training_loss_components_by_epoch": [dict(item) for item in trainer.state.log_history
+                if "train_classification_loss" in item or "train_group_ranking_loss" in item],
             "epoch_checkpoints": list(best_checkpoint_callback.epoch_checkpoints),
             "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None,
             "peak_gpu_memory_reserved_bytes": int(torch.cuda.max_memory_reserved()) if torch.cuda.is_available() else None}
@@ -2307,7 +2592,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
 
 class _TextDataset:
     def __new__(cls, texts, labels, tokenizer, max_length, *, training_views=None,
-                training_view_ids=None, seed=2026):
+                training_view_ids=None, seed=2026, include_indices=False):
         torch, _ = _require_neural()
         class Dataset(torch.utils.data.Dataset):
             def __init__(self):
@@ -2361,6 +2646,7 @@ class _TextDataset:
             def __getitem__(self, idx):
                 item = {k: torch.tensor(v[idx], dtype=torch.long) for k, v in self.enc.items()}
                 if self.labels is not None: item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
+                if include_indices: item["row_index"] = torch.tensor(int(idx), dtype=torch.long)
                 return item
         return Dataset()
 
@@ -2837,6 +3123,11 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         def set_epoch(self,epoch,force=False):
             epoch=int(epoch)
             if not force and self.epoch==epoch:return
+            if not self.texts:
+                self.enc={"input_ids":[],"attention_mask":[]}
+                self.lengths=[]
+                self.epoch=epoch
+                return
             selected,counts=select_epoch_view_indices([len(row) for row in self.views],
                 seed=seed,epoch=epoch,view_ids=self.view_ids)
             prepared=[format_model_input(views[choice]) for views,choice in zip(self.views,selected)]
@@ -2848,6 +3139,11 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             self.epoch_records.append(record);self.epoch_records.sort(key=lambda item:item["epoch"])
             self.epoch=epoch
         def set_probe_views(self):
+            if not self.texts:
+                self.enc={"input_ids":[],"attention_mask":[]}
+                self.lengths=[]
+                self.epoch=None
+                return
             prepared=[format_model_input(views[0]) for views in self.views]
             encoded=tokenizer(prepared,truncation=True,max_length=max_length,padding=False)
             self.enc={k:v for k,v in encoded.items() if k in {"input_ids","attention_mask"}}
@@ -2981,20 +3277,36 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                 _write_json_atomic(training_state_dir / "best_qwen_state.json", {
                     "metrics": self.best_state["metrics"], "epoch": self.best_state["epoch"]})
             if save_epoch_checkpoints:
-                save_started = time.perf_counter()
-                if weighted_sampler is not None:
-                    checkpoint_metadata["weighted_sampling"]["epoch_records"] = list(weighted_sampler.epoch_records)
-                epoch_dir=(out/f"epoch_{epoch}" if epoch_checkpoint_style == "underscore"
-                           else out/f"epoch-{epoch:02d}")
-                epoch_dir.mkdir(parents=True,exist_ok=True)
-                model.backbone.save_pretrained(epoch_dir,safe_serialization=True)
-                tokenizer.save_pretrained(epoch_dir)
-                torch.save({k:v.detach().cpu() for k,v in model.classifier.state_dict().items()},
-                           epoch_dir/"classifier.pt")
-                (epoch_dir/"checkpoint_manifest.json").write_text(json.dumps(checkpoint_metadata,indent=2)+"\n")
-                (epoch_dir/"validation_metrics.json").write_text(json.dumps(metrics or {},indent=2)+"\n")
-                self.checkpoints.append(str(epoch_dir))
-                self.save_seconds += time.perf_counter() - save_started
+                self._save_epoch_snapshot(epoch, metrics or {})
+            return control
+
+        def _save_epoch_snapshot(self, epoch, metrics=None):
+            """Save a self-contained inference checkpoint after a completed epoch."""
+            epoch = int(epoch)
+            epoch_dir=(out/f"epoch_{epoch}" if epoch_checkpoint_style == "underscore"
+                       else out/f"epoch-{epoch:02d}")
+            if epoch_dir.is_dir():
+                self.checkpoints = [item for item in self.checkpoints
+                                    if Path(item) != epoch_dir]
+            save_started = time.perf_counter()
+            if weighted_sampler is not None:
+                checkpoint_metadata["weighted_sampling"]["epoch_records"] = list(weighted_sampler.epoch_records)
+            if training_views is not None:
+                checkpoint_metadata["training_view_sampling"] = train_dataset.sampling_summary()
+            epoch_dir.mkdir(parents=True,exist_ok=True)
+            _save_lora_epoch_checkpoint(model.backbone, tokenizer, model.classifier,
+                                        epoch_dir, checkpoint_metadata, metrics)
+            self.checkpoints.append(str(epoch_dir))
+            self.checkpoints.sort(key=lambda item: Path(item).name)
+            self.save_seconds += time.perf_counter() - save_started
+
+        def on_epoch_end(self,args,state,control,**kwargs):
+            # No-validation runs have no on_evaluate callback. Capture the
+            # adapter and classifier at the epoch boundary instead.
+            if save_epoch_checkpoints and validation_labels is None:
+                epoch = int(round(float(state.epoch or 0)))
+                if epoch > 0:
+                    self._save_epoch_snapshot(epoch, {})
             return control
 
         def on_save(self, args, state, control, **kwargs):
