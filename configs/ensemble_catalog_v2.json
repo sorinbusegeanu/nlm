@@ -101,7 +101,7 @@
     },
     {
       "id": "E12-1",
-      "name": "Error-Aware Specialist Arbitration · top 2 · 15 checkpoints",
+      "name": "Error-Aware Specialist Arbitration \u00b7 top 2 \u00b7 15 checkpoints",
       "algorithm": "pairwise_arbitration",
       "candidates": 2,
       "max_checkpoints": 15,
@@ -115,7 +115,7 @@
     },
     {
       "id": "E12-2",
-      "name": "Error-Aware Specialist Arbitration · top 3 · 15 checkpoints",
+      "name": "Error-Aware Specialist Arbitration \u00b7 top 3 \u00b7 15 checkpoints",
       "algorithm": "pairwise_arbitration",
       "candidates": 3,
       "max_checkpoints": 15,
@@ -129,7 +129,7 @@
     },
     {
       "id": "E12-3",
-      "name": "Error-Aware Specialist Arbitration · top 3 · 20 checkpoints",
+      "name": "Error-Aware Specialist Arbitration \u00b7 top 3 \u00b7 20 checkpoints",
       "algorithm": "pairwise_arbitration",
       "candidates": 3,
       "max_checkpoints": 20,
@@ -143,7 +143,7 @@
     },
     {
       "id": "E13-A",
-      "name": "Learned Reliability Router · checkpoint",
+      "name": "Learned Reliability Router \u00b7 checkpoint",
       "algorithm": "checkpoint_reliability_router",
       "routing_method": "checkpoint",
       "max_checkpoints": 15,
@@ -151,7 +151,7 @@
     },
     {
       "id": "E13-B",
-      "name": "Learned Reliability Router · family max",
+      "name": "Learned Reliability Router \u00b7 family max",
       "algorithm": "checkpoint_reliability_router",
       "routing_method": "family_max",
       "max_checkpoints": 15,
@@ -159,7 +159,7 @@
     },
     {
       "id": "E13-C",
-      "name": "Learned Reliability Router · family max · 20 checkpoints",
+      "name": "Learned Reliability Router \u00b7 family max \u00b7 20 checkpoints",
       "algorithm": "checkpoint_reliability_router",
       "routing_method": "family_max",
       "max_checkpoints": 20,
@@ -169,7 +169,7 @@
   "experiments": [
     {
       "id": "E14-A",
-      "name": "CatBoost label selector · top 2",
+      "name": "CatBoost label selector \u00b7 top 2",
       "category": "Learned label arbitration",
       "description": "CatBoost selector over the top-2 candidate labels.",
       "accuracy": 0.6350500185253798,
@@ -178,11 +178,16 @@
       "primary_score": 0.6349739000745712,
       "status": "Scored",
       "result_source": "artifacts/analysis/e14/20261120T165435084301Z/results.json",
-      "documentation": "docs/e14.md"
+      "documentation": "docs/e14.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E14-B",
-      "name": "CatBoost label selector · pairwise features",
+      "name": "CatBoost label selector \u00b7 pairwise features",
       "category": "Learned label arbitration",
       "description": "CatBoost selector with pairwise error and reliability features.",
       "accuracy": 0.6391256020748425,
@@ -191,11 +196,16 @@
       "primary_score": 0.6390628883917474,
       "status": "Scored",
       "result_source": "artifacts/analysis/e14/20261120T165435084301Z/results.json",
-      "documentation": "docs/e14.md"
+      "documentation": "docs/e14.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E14-C",
-      "name": "LightGBM LambdaRank selector · top 3",
+      "name": "LightGBM LambdaRank selector \u00b7 top 3",
       "category": "Learned label arbitration",
       "description": "LambdaRank selector over the top-3 candidate labels.",
       "accuracy": 0.6369025565024083,
@@ -204,7 +214,12 @@
       "primary_score": 0.6368332090479741,
       "status": "Scored",
       "result_source": "artifacts/analysis/e14/20261120T165435084301Z/results.json",
-      "documentation": "docs/e14.md"
+      "documentation": "docs/e14.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E14-B-GATE",
@@ -217,7 +232,12 @@
       "primary_score": 0.6501640566741238,
       "status": "Scored",
       "result_source": "artifacts/analysis/e14_gate/20261120T180106177007Z/results.json",
-      "documentation": "docs/e14_gate.md"
+      "documentation": "docs/e14_gate.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E15",
@@ -230,11 +250,16 @@
       "primary_score": 0.6497936863037534,
       "status": "Scored",
       "result_source": "artifacts/analysis/e15/metrics.json",
-      "documentation": "docs/e15.md"
+      "documentation": "docs/e15.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E16",
-      "name": "Prompt reconstruction + soft uniqueness · complete",
+      "name": "Prompt reconstruction + soft uniqueness \u00b7 complete",
       "category": "Prompt-group decoder",
       "description": "Groups likely same-prompt responses from text, then jointly decodes labels with a soft duplicate-label penalty.",
       "accuracy": 0.6861800666913672,
@@ -243,11 +268,16 @@
       "primary_score": 0.6861098682575193,
       "status": "Scored",
       "result_source": "artifacts/analysis/e16/results.json",
-      "documentation": "docs/e16.md"
+      "documentation": "docs/e16.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E16-SIM",
-      "name": "Prompt reconstruction + soft uniqueness · simulated",
+      "name": "Prompt reconstruction + soft uniqueness \u00b7 simulated",
       "category": "Prompt-group decoder",
       "description": "Simulated incomplete prompt batches; score is over the evaluated sampled rows.",
       "accuracy": 0.6641372484328605,
@@ -256,7 +286,12 @@
       "primary_score": 0.6637943648937352,
       "status": "Scored",
       "result_source": "artifacts/analysis/e16/results.json",
-      "documentation": "docs/e16.md"
+      "documentation": "docs/e16.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E17",
@@ -269,7 +304,12 @@
       "primary_score": 0.6460874968928659,
       "status": "Scored",
       "result_source": "artifacts/analysis/e17/results.json",
-      "documentation": "docs/e17.md"
+      "documentation": "docs/e17.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E18",
@@ -282,7 +322,12 @@
       "primary_score": 0.6464653243847874,
       "status": "Scored",
       "result_source": "artifacts/analysis/e18/results.json",
-      "documentation": "docs/e18.md"
+      "documentation": "docs/e18.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E19-A",
@@ -295,7 +340,12 @@
       "primary_score": 0.7490852597564006,
       "status": "Scored",
       "result_source": "artifacts/analysis/e19/metrics.json",
-      "documentation": "docs/e19.md"
+      "documentation": "docs/e19.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E19-B",
@@ -308,7 +358,10 @@
       "primary_score": 0.9494010124378679,
       "status": "Scored",
       "result_source": "artifacts/analysis/e19b/metrics.json",
-      "documentation": "docs/e19b.md"
+      "documentation": "docs/e19b.md",
+      "trust_list_version": "N/A - prompt reconstruction",
+      "checkpoints_used": 0,
+      "checkpoint_count": 0
     },
     {
       "id": "E19-D",
@@ -321,7 +374,10 @@
       "primary_score": 0.9636910007004226,
       "status": "Scored",
       "result_source": "artifacts/analysis/e19d/metrics.json",
-      "documentation": "docs/e19d.md"
+      "documentation": "docs/e19d.md",
+      "trust_list_version": "N/A - prompt reconstruction",
+      "checkpoints_used": 0,
+      "checkpoint_count": 0
     },
     {
       "id": "E19-E",
@@ -334,11 +390,14 @@
       "primary_score": 0.9633630918747881,
       "status": "Scored",
       "result_source": "artifacts/analysis/e19e/metrics.json",
-      "documentation": "docs/e19e.md"
+      "documentation": "docs/e19e.md",
+      "trust_list_version": "N/A - prompt reconstruction",
+      "checkpoints_used": 0,
+      "checkpoint_count": 0
     },
     {
       "id": "E19-F-A",
-      "name": "Direct response embeddings · high recall",
+      "name": "Direct response embeddings \u00b7 high recall",
       "category": "Prompt reconstruction",
       "description": "Embeds response text and clusters using fold-local thresholds.",
       "accuracy": null,
@@ -347,11 +406,14 @@
       "primary_score": 0.9815726976866919,
       "status": "Scored",
       "result_source": "artifacts/analysis/e19f/evaluation_metrics.json",
-      "documentation": "docs/e19f.md"
+      "documentation": "docs/e19f.md",
+      "trust_list_version": "N/A - response embeddings",
+      "checkpoints_used": 0,
+      "checkpoint_count": 0
     },
     {
       "id": "E19-F-B",
-      "name": "Direct response embeddings · conservative MNN",
+      "name": "Direct response embeddings \u00b7 conservative MNN",
       "category": "Prompt reconstruction",
       "description": "Embeds response text and clusters using fold-local thresholds.",
       "accuracy": null,
@@ -360,11 +422,14 @@
       "primary_score": 0.835063847071666,
       "status": "Scored",
       "result_source": "artifacts/analysis/e19f/evaluation_metrics.json",
-      "documentation": "docs/e19f.md"
+      "documentation": "docs/e19f.md",
+      "trust_list_version": "N/A - response embeddings",
+      "checkpoints_used": 0,
+      "checkpoint_count": 0
     },
     {
       "id": "E19-F-C",
-      "name": "Direct response embeddings · pair scorer",
+      "name": "Direct response embeddings \u00b7 pair scorer",
       "category": "Prompt reconstruction",
       "description": "Embeds response text and clusters using fold-local thresholds.",
       "accuracy": null,
@@ -373,11 +438,14 @@
       "primary_score": 0.9248224290302164,
       "status": "Scored",
       "result_source": "artifacts/analysis/e19f/evaluation_metrics.json",
-      "documentation": "docs/e19f.md"
+      "documentation": "docs/e19f.md",
+      "trust_list_version": "N/A - response embeddings",
+      "checkpoints_used": 0,
+      "checkpoint_count": 0
     },
     {
       "id": "E20-A",
-      "name": "Group-aware CatBoost classifier · independent argmax",
+      "name": "Group-aware CatBoost classifier \u00b7 independent argmax",
       "category": "Group-aware classifier",
       "description": "Group-aware checkpoint classifier using independent argmax.",
       "accuracy": 0.7665802148944053,
@@ -386,11 +454,16 @@
       "primary_score": 0.7665001242853591,
       "status": "Scored",
       "result_source": "artifacts/analysis/e20/e20ab_metrics.json",
-      "documentation": "docs/e20.md"
+      "documentation": "docs/e20.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E20-B",
-      "name": "Group-aware CatBoost classifier · reconstructed Hungarian",
+      "name": "Group-aware CatBoost classifier \u00b7 reconstructed Hungarian",
       "category": "Group-aware classifier",
       "description": "Group-aware classifier decoded with reconstructed prompt groups.",
       "accuracy": 0.7784364579473879,
@@ -399,11 +472,16 @@
       "primary_score": 0.7783569475515785,
       "status": "Scored",
       "result_source": "artifacts/analysis/e20/e20ab_metrics.json",
-      "documentation": "docs/e20.md"
+      "documentation": "docs/e20.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E20-C",
-      "name": "Oracle group-aware classifier · oracle Hungarian",
+      "name": "Oracle group-aware classifier \u00b7 oracle Hungarian",
       "category": "Group-aware classifier",
       "description": "Oracle prompt-group-trained classifier decoded with true prompt groups.",
       "accuracy": 0.7880696554279363,
@@ -412,11 +490,16 @@
       "primary_score": 0.7879816057668406,
       "status": "Scored",
       "result_source": "artifacts/analysis/e20/e20c_metrics.json",
-      "documentation": "docs/e20.md"
+      "documentation": "docs/e20.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
       "id": "E20-D",
-      "name": "Oracle-trained classifier · reconstructed Hungarian",
+      "name": "Oracle-trained classifier \u00b7 reconstructed Hungarian",
       "category": "Group-aware classifier",
       "description": "Oracle-trained classifier decoded with reconstructed prompt groups.",
       "accuracy": 0.782141533901445,
@@ -425,13 +508,20 @@
       "primary_score": 0.7820581655480984,
       "status": "Scored",
       "result_source": "artifacts/analysis/e20/e20d_metrics.json",
-      "documentation": "docs/e20.md"
+      "documentation": "docs/e20.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "evaluation_checkpoint_count": 87,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold.",
+      "kaggle_checkpoint_count": 37
     },
     {
       "id": "E21-A",
-      "name": "UltraBERT-380M group-aware classifier · λ=0",
+      "name": "UltraBERT-380M group-aware classifier \u00b7 \u03bb=0",
       "category": "Group-aware neural classifier",
-      "description": "V2.GR.OR16 training with CE + 0 × group-ranking loss; full V0 validation.",
+      "description": "V2.GR.OR16 training with CE + 0 \u00d7 group-ranking loss; full V0 validation.",
       "accuracy": null,
       "balanced_accuracy": null,
       "primary_metric": "Balanced accuracy",
@@ -442,13 +532,16 @@
       "evaluation_source": "artifacts/analysis/e21/e21_group_aware_ultrabert380_20261121T074200Z/E21-A/results.json",
       "documentation": "docs/e21.md",
       "lambda": 0.0,
-      "early_stopping_patience": 10
+      "early_stopping_patience": 10,
+      "trust_list_version": "N/A - V2.GR.OR16 training",
+      "checkpoints_used": 1,
+      "checkpoint_count": 1
     },
     {
       "id": "E21-B",
-      "name": "UltraBERT-380M group-aware classifier · λ=0.1",
+      "name": "UltraBERT-380M group-aware classifier \u00b7 \u03bb=0.1",
       "category": "Group-aware neural classifier",
-      "description": "V2.GR.OR16 training with CE + 0.1 × group-ranking loss; full V0 validation.",
+      "description": "V2.GR.OR16 training with CE + 0.1 \u00d7 group-ranking loss; full V0 validation.",
       "accuracy": null,
       "balanced_accuracy": null,
       "primary_metric": "Balanced accuracy",
@@ -459,13 +552,16 @@
       "evaluation_source": "artifacts/analysis/e21/e21_group_aware_ultrabert380_20261121T074200Z/E21-B/results.json",
       "documentation": "docs/e21.md",
       "lambda": 0.1,
-      "early_stopping_patience": 2
+      "early_stopping_patience": 2,
+      "trust_list_version": "N/A - V2.GR.OR16 training",
+      "checkpoints_used": 1,
+      "checkpoint_count": 1
     },
     {
       "id": "E21-C",
-      "name": "UltraBERT-380M group-aware classifier · λ=0.3",
+      "name": "UltraBERT-380M group-aware classifier \u00b7 \u03bb=0.3",
       "category": "Group-aware neural classifier",
-      "description": "V2.GR.OR16 training with CE + 0.3 × group-ranking loss; full V0 validation.",
+      "description": "V2.GR.OR16 training with CE + 0.3 \u00d7 group-ranking loss; full V0 validation.",
       "accuracy": null,
       "balanced_accuracy": null,
       "primary_metric": "Balanced accuracy",
@@ -476,7 +572,203 @@
       "evaluation_source": "artifacts/analysis/e21/e21_group_aware_ultrabert380_20261121T074200Z/E21-C/results.json",
       "documentation": "docs/e21.md",
       "lambda": 0.3,
-      "early_stopping_patience": 2
+      "early_stopping_patience": 2,
+      "trust_list_version": "N/A - V2.GR.OR16 training",
+      "checkpoints_used": 1,
+      "checkpoint_count": 1
+    },
+    {
+      "id": "E22-A",
+      "name": "Updated checkpoint stacker \u00b7 control",
+      "category": "Learned checkpoint ensemble",
+      "description": "E20-style candidate-label CatBoost scoring with E19-D group-constrained Hungarian assignment.",
+      "accuracy": 0.8729158947758429,
+      "balanced_accuracy": 0.8728610489684315,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.8728610489684315,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e22/metrics_E22-A.json",
+      "documentation": "docs/e22.md",
+      "checkpoint_count": 87,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoints_used": 87,
+      "checkpoints_per_fold": 87
+    },
+    {
+      "id": "E22-B",
+      "name": "Updated checkpoint stacker \u00b7 plus E21 checkpoints",
+      "category": "Learned checkpoint ensemble",
+      "description": "E20-style candidate-label CatBoost scoring with E19-D group-constrained Hungarian assignment.",
+      "accuracy": 0.877732493516117,
+      "balanced_accuracy": 0.8776858066119811,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.8776858066119811,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e22/metrics_E22-B.json",
+      "documentation": "docs/e22.md",
+      "checkpoint_count": 89,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoints_used": 89,
+      "checkpoints_per_fold": 89
+    },
+    {
+      "id": "E22-C",
+      "name": "Per-label specialist stacker \u00b7 Hungarian",
+      "category": "Learned checkpoint ensemble",
+      "description": "E20-style candidate-label CatBoost scoring with E19-D group-constrained Hungarian assignment.",
+      "accuracy": 0.8688403112263802,
+      "balanced_accuracy": 0.8687844891871737,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.8687844891871737,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e22/metrics_E22-C.json",
+      "documentation": "docs/e22.md",
+      "checkpoint_count": 89,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoints_used": 89,
+      "checkpoints_per_fold": 89
+    },
+    {
+      "id": "E23-A",
+      "name": "20-checkpoint stacker \u00b7 control",
+      "category": "Learned checkpoint ensemble",
+      "description": "Fold-local roster capped at 20; E20 candidate-label CatBoost with E19-D Hungarian decoding.",
+      "accuracy": 0.7969618377176733,
+      "balanced_accuracy": 0.7968804374844642,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.7968804374844642,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e23/metrics_E23-A.json",
+      "documentation": "docs/e23.md",
+      "checkpoint_count": 44,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoints_used": 44,
+      "checkpoints_per_fold": 20,
+      "checkpoint_count_note": "44 distinct checkpoint IDs across five fold rosters; 20 per fold."
+    },
+    {
+      "id": "E23-B",
+      "name": "20-checkpoint stacker \u00b7 plus E21 checkpoints",
+      "category": "Learned checkpoint ensemble",
+      "description": "Fold-local roster capped at 20; E20 candidate-label CatBoost with E19-D Hungarian decoding.",
+      "accuracy": 0.7951092997406447,
+      "balanced_accuracy": 0.7950260999254288,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.7950260999254288,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e23/metrics_E23-B.json",
+      "documentation": "docs/e23.md",
+      "checkpoint_count": 43,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoints_used": 43,
+      "checkpoints_per_fold": 20,
+      "checkpoint_count_note": "43 distinct checkpoint IDs across five fold rosters; 20 per fold."
+    },
+    {
+      "id": "E23-C",
+      "name": "20-checkpoint per-label specialist stacker",
+      "category": "Learned checkpoint ensemble",
+      "description": "Fold-local roster capped at 20; E20 candidate-label CatBoost with E19-D Hungarian decoding.",
+      "accuracy": 0.7917747313819933,
+      "balanced_accuracy": 0.7917002237136465,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.7917002237136465,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e23/metrics_E23-C.json",
+      "documentation": "docs/e23.md",
+      "checkpoint_count": 43,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoints_used": 43,
+      "checkpoints_per_fold": 20,
+      "checkpoint_count_note": "43 distinct checkpoint IDs across five fold rosters; 20 per fold."
+    },
+    {
+      "id": "E24-A",
+      "name": "30-checkpoint stacker \u00b7 control",
+      "category": "Learned checkpoint ensemble",
+      "description": "Fold-local roster capped at 30; E20 candidate-label CatBoost with E19-D Hungarian decoding.",
+      "accuracy": 0.8040014820303816,
+      "balanced_accuracy": 0.8039473030077057,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.8039473030077057,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e24/metrics_E24-A.json",
+      "documentation": "docs/e24.md",
+      "checkpoint_count": 49,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoints_used": 49,
+      "checkpoints_per_fold": 30,
+      "checkpoint_count_note": "49 distinct checkpoint IDs across five fold rosters; 30 per fold."
+    },
+    {
+      "id": "E24-B",
+      "name": "30-checkpoint stacker \u00b7 plus E21 checkpoints",
+      "category": "Learned checkpoint ensemble",
+      "description": "Fold-local roster capped at 30; E20 candidate-label CatBoost with E19-D Hungarian decoding.",
+      "accuracy": 0.7928862541682105,
+      "balanced_accuracy": 0.7928038777032067,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.7928038777032067,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e24/metrics_E24-B.json",
+      "documentation": "docs/e24.md",
+      "checkpoint_count": 51,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoints_used": 51,
+      "checkpoints_per_fold": 30,
+      "checkpoint_count_note": "51 distinct checkpoint IDs across five fold rosters; 30 per fold."
+    },
+    {
+      "id": "E24-C",
+      "name": "30-checkpoint per-label specialist stacker",
+      "category": "Learned checkpoint ensemble",
+      "description": "Fold-local roster capped at 30; E20 candidate-label CatBoost with E19-D Hungarian decoding.",
+      "accuracy": 0.7925157465728048,
+      "balanced_accuracy": 0.792443450161571,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.792443450161571,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e24/metrics_E24-C.json",
+      "documentation": "docs/e24.md",
+      "checkpoint_count": 51,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoints_used": 51,
+      "checkpoints_per_fold": 30,
+      "checkpoint_count_note": "51 distinct checkpoint IDs across five fold rosters; 30 per fold."
+    },
+    {
+      "id": "E25",
+      "name": "Backward elimination of E22-B checkpoint roster",
+      "category": "Learned checkpoint ensemble",
+      "description": "CPU-only ablation and backward elimination of the 89-checkpoint E22-B roster, with E19-D Hungarian decoding and five prompt-group folds.",
+      "accuracy": 0.7273064097814005,
+      "balanced_accuracy": 0.7271911508824261,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.7271911508824261,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e25/metrics.json",
+      "documentation": "docs/e25.md",
+      "checkpoint_count": 20,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoints_used": 20,
+      "checkpoints_per_fold": 20,
+      "checkpoint_count_note": "20 globally distinct deployment roster; fold-local rosters are recorded separately."
+    },
+    {
+      "id": "E20-D-KFA",
+      "name": "E20-D Kaggle failure analysis",
+      "category": "Evaluation analysis",
+      "description": "Reproduces E20-D packaged V0 scoring; compares OOF and five-model aggregation, true/reconstructed group feature shifts, correctly rebuilt incomplete-group samples, and checkpoint-only ablations. No neural inference or training.",
+      "status": "Scored",
+      "primary_metric": "Balanced accuracy",
+      "documentation": "docs/e20d_kaggle_failure_analysis.md",
+      "result_source": "artifacts/analysis/e20d_kaggle_failure_analysis/metrics.json",
+      "checkpoint_count": 37,
+      "trust_list_version": "trust-list-2-v039",
+      "accuracy": 0.782141533901445,
+      "balanced_accuracy": 0.7820581655480984,
+      "primary_score": 0.7820581655480984,
+      "checkpoints_used": 37
     }
   ],
   "display_catalog_version": "1.0.0",

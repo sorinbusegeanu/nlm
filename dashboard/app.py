@@ -712,6 +712,7 @@ def render_ensemble_catalog(root):
             "Trust List 2": trust_version,
             "Checkpoints used": (len(deployment["checkpoint_ids"]) if deployment else
                                  len(result.get("checkpoint_ids", [])) or None),
+            "Checkpoints per fold": entry.get("checkpoints_per_fold"),
             "Status": result.get("status", "Awaiting score").replace("_", " ").capitalize(),
         })
 
@@ -751,7 +752,9 @@ def render_ensemble_catalog(root):
             "Balanced accuracy": result.get("balanced_accuracy"),
             "Primary metric": entry.get("primary_metric"),
             "Primary score": result.get("primary_score"),
-            "Trust List 2": None, "Checkpoints used": None,
+            "Trust List 2": result.get("trust_list_version", entry.get("trust_list_version")),
+            "Checkpoints used": result.get("checkpoints_used", entry.get("checkpoint_count", entry.get("max_checkpoints"))),
+            "Checkpoints per fold": result.get("checkpoints_per_fold", entry.get("checkpoints_per_fold")),
             "Status": str(result.get("status", "Awaiting result")).replace("_", " ").capitalize(),
         })
 
@@ -763,7 +766,12 @@ def render_ensemble_catalog(root):
                      "Accuracy": st.column_config.NumberColumn(format="percent"),
                      "Balanced accuracy": st.column_config.NumberColumn(format="percent"),
                      "Primary score": st.column_config.NumberColumn(format="percent"),
-                     "Checkpoints used": st.column_config.NumberColumn(),
+                     "Trust List 2": st.column_config.TextColumn(
+                         help="Trust List snapshot used for the experiment, or why it does not apply."),
+                     "Checkpoints used": st.column_config.NumberColumn(
+                         help="Trust List classifier checkpoints used. Zero means the experiment does not use that pool."),
+                     "Checkpoints per fold": st.column_config.NumberColumn(
+                         help="Roster size in each held-out fold, when the experiment selects fold-specific rosters."),
                  })
     all_entries = {**entries, **experiment_entries}
     selected = st.selectbox("Ensemble / experiment", list(all_entries),
