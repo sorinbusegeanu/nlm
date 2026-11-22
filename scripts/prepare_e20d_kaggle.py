@@ -27,7 +27,7 @@ from src.trust_list2_weighted_vote import _model_family
 from src.v2_checkpoint_trust import LABELS
 
 SHARD_REF = "zodrak/e20d-checkpoints-v001"
-KERNEL_REF = "zodrak/e20-d-group-aware-classifier"
+KERNEL_REF = "zodrak/e20-d-dual-gpu-group-aware-classifier"
 SHARD_DIR = ROOT / "artifacts/kaggle/e20d-checkpoints-v001"
 KERNEL_DIR = ROOT / "artifacts/kaggle/e20-d-kernel"
 REMOTE_META = ROOT / "artifacts/kaggle/e20d-remote-catalogs"
@@ -228,6 +228,19 @@ def prepare():
     shutil.copytree(ROOT / "configs", SHARD_DIR / "runtime" / "configs")
 
     profile = json.loads((ROOT / "artifacts/analysis/e20/e20d_config.json").read_text())
+    batch_report_path = ROOT / "artifacts/analysis/e20d_inference_batch_benchmark.json"
+    if not batch_report_path.is_file():
+        raise FileNotFoundError(f"Run the local batch benchmark before packaging: {batch_report_path}")
+    batch_report = json.loads(batch_report_path.read_text())
+    batch_defaults = {item["model"]: int(item["effective_batch_size"])
+                      for item in batch_report["results"] if item.get("status") == "ok"}
+    if not batch_defaults:
+        raise ValueError("The local GPU batch benchmark has no successful model results")
+    for spec in checkpoint_entries.values():
+        if spec["model"] not in {"svc", "catboost_stylometry"}:
+            if spec["model"] not in batch_defaults:
+                raise ValueError(f"No measured GPU inference batch for {spec['model']}")
+            spec["config"]["inference_batch_size"] = batch_defaults[spec["model"]]
     manifest = {
         "schema_version": 1,
         "experiment": "E20-D",
@@ -241,13 +254,15 @@ def prepare():
         "qwen_revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
         "embedding_revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
         "e20d_config": profile,
+        "inference_batch_defaults": batch_defaults,
+        "inference_batch_benchmark": "artifacts/analysis/e20d_inference_batch_benchmark.json",
         "asset_reuse": {"checkpoint_files_reused": reused_count,
                          "checkpoint_files_added": missing_count,
                          "new_checkpoint_asset_bytes": sum(x["size"] for x in new_assets.values())},
     }
     (SHARD_DIR / "e20d_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     (SHARD_DIR / "checkpoint_catalog.json").write_text(json.dumps({
-        "schema_version": 1, "dataset_ref": SHARD_REF, "dataset_version": 6,
+        "schema_version": 1, "dataset_ref": SHARD_REF, "dataset_version": 9,
         "assets": new_assets,
         "checkpoints": {spec["experiment_id"]: {
             "experiment_id": spec["experiment_id"], "sequence_id": sid,
@@ -265,7 +280,7 @@ def prepare():
     sources = sorted({SHARD_REF} | {item["dataset_ref"] for spec in checkpoint_entries.values()
         for item in spec["files"]} | set(BASE_DATASETS))
     kernel_metadata = {
-        "id": KERNEL_REF, "title": "E20-D Group-Aware Classifier",
+        "id": KERNEL_REF, "title": "E20-D Dual-GPU Group-Aware Classifier",
         "code_file": "e20-d-group-aware-classifier.ipynb", "language": "python", "kernel_type": "notebook",
         "is_private": True, "enable_gpu": True, "enable_tpu": False,
         "enable_internet": False, "keywords": [],
@@ -274,7 +289,7 @@ def prepare():
         "machine_shape": "NvidiaTeslaT4",
     }
     notebook = nbf.v4.new_notebook(cells=[
-        nbf.v4.new_markdown_cell("# E20-D — Oracle-Trained Classifier with Reconstructed Groups\n\nApplies the five saved E20-C fold classifiers to test-time E19-B reconstructed groups. It reuses the exact fold checkpoint rosters and E13 router models, averages fold score matrices, and applies Hungarian assignment within predicted groups. No classifier is fitted in this kernel."),
+        nbf.v4.new_markdown_cell("# E20-D — Oracle-Trained Classifier with Reconstructed Groups\n\nApplies the five saved E20-C fold classifiers to test-time E19-B reconstructed groups. It reuses the exact fold checkpoint rosters and E13 router models, averages fold score matrices, and applies Hungarian assignment within predicted groups. Checkpoint inference runs two isolated workers concurrently, with one model loaded at a time on each GPU. CPU thread pools are capped to fit Kaggle's four-core machine. No classifier is fitted in this kernel."),
         nbf.v4.new_code_cell(NOTEBOOK_CODE),
     ])
     notebook.metadata = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}}
@@ -283,6 +298,7 @@ def prepare():
     summary = {"kernel_ref": KERNEL_REF, "shard_ref": SHARD_REF, "checkpoint_count": len(union),
         "checkpoint_files_reused": reused_count, "checkpoint_files_added": missing_count,
         "new_checkpoint_asset_bytes": sum(x["size"] for x in new_assets.values()),
+        "inference_batch_defaults": batch_defaults,
         "qwen_base_bytes": 0,
         "qwen_model_source": QWEN_MODEL_SOURCE,
         "checkpoint_ids": union, "dataset_sources": sources, "model_sources": MODEL_SOURCES,
@@ -294,8 +310,11 @@ def prepare():
 NOTEBOOK_CODE = r'''from pathlib import Path
 import gc, hashlib, json, os, shutil, subprocess, sys, time
 os.environ['HF_HUB_OFFLINE']='1'; os.environ['TRANSFORMERS_OFFLINE']='1'; os.environ['TOKENIZERS_PARALLELISM']='false'
+for thread_var in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS','VECLIB_MAXIMUM_THREADS','BLIS_NUM_THREADS'):
+    os.environ[thread_var]='1'
 import joblib, numpy as np, pandas as pd, torch
 from catboost import CatBoostClassifier
+torch.set_num_threads(1); torch.set_num_interop_threads(1)
 
 INPUT=Path('/kaggle/input'); WORK=Path('/kaggle/working/e20d'); WORK.mkdir(parents=True,exist_ok=True)
 def only(values,desc):
@@ -352,7 +371,6 @@ except importlib_metadata.PackageNotFoundError:
 if torchao_version is not None and torchao_version < Version('0.16.0'):
     subprocess.run([sys.executable,'-m','pip','uninstall','-y','torchao'],check=True,
                    stdout=subprocess.DEVNULL,stderr=subprocess.STDOUT)
-from src.inference import predict_candidate
 from src import e19b_group, e20, e15
 from src.e13_reliability_router import build_feature_frame, _score_correctness, _cat_frame
 from src.e16_common import finite_scores
@@ -387,32 +405,56 @@ TEST=only(test_paths,'competition test.csv')
 test=pd.read_csv(TEST,dtype={'id':'string'}); assert {'id','text'}<=set(test.columns)
 assert test.id.notna().all() and test.id.is_unique and test.text.notna().all()
 ids=test.id.astype(str).to_numpy(); texts=test.text.fillna('').astype(str).to_numpy(); n=len(ids)
-def reconstruct_one(text):
-    inputs=_generation_inputs(processor,[str(text)])
-    target=next(qwen.parameters()).device
+target=next(qwen.parameters()).device
+def reconstruct_batch(batch_texts):
+    inputs=_generation_inputs(processor,[str(text) for text in batch_texts])
     inputs={k:(v.to(target) if hasattr(v,'to') else v) for k,v in inputs.items()}
     with torch.inference_mode():
         generated=qwen.generate(**inputs,do_sample=False,num_beams=1,max_new_tokens=512,use_cache=True,pad_token_id=processor.tokenizer.eos_token_id)
     prefix=inputs['input_ids'].shape[1]
-    raw=processor.batch_decode(generated[:,prefix:],skip_special_tokens=True)[0]
-    return parse_reconstruction(raw)
-recon=[]
-for i,text in enumerate(texts):
-    recon.append(reconstruct_one(text)); print(f'reconstructed {i+1}/{n}',flush=True)
+    raw=processor.batch_decode(generated[:,prefix:],skip_special_tokens=True)
+    return [parse_reconstruction(item) for item in raw]
+recon=[]; qwen_batch_size=int(B['inference_batch_defaults']['qwen_reconstruction']); start=0
+while start<n:
+    size=min(qwen_batch_size,n-start)
+    try:
+        rows=reconstruct_batch(texts[start:start+size])
+    except torch.cuda.OutOfMemoryError:
+        gc.collect(); torch.cuda.empty_cache()
+        if size==1: raise
+        qwen_batch_size=max(1,size//2)
+        print(f'Qwen reconstruction OOM; retrying at batch size {qwen_batch_size}',flush=True)
+        continue
+    recon.extend(rows); start+=size
+    print(f'reconstructed {start}/{n} (batch={size})',flush=True)
 del qwen,processor; gc.collect(); torch.cuda.empty_cache()
 
 # Encode reconstructed prompts with the same pinned EmbeddingGemma revision.
 embedding_root=model_root('embeddinggemma-2')
 tokenizer=AutoTokenizer.from_pretrained(embedding_root,local_files_only=True,padding_side='right')
 encoder=AutoModel.from_pretrained(embedding_root,local_files_only=True,dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32).to(device).eval()
-emb=[]
-for start in range(0,n,8):
-    batch=['task: clustering | query: '+str(x.get('reconstructed_prompt','')) for x in recon[start:start+8]]
-    inputs=tokenizer(batch,padding=True,truncation=True,max_length=512,return_tensors='pt').to(device)
-    with torch.inference_mode():
-        hidden=encoder(**inputs).last_hidden_state.float(); mask=inputs['attention_mask'].unsqueeze(-1).to(hidden.dtype)
-        pooled=(hidden*mask).sum(1)/mask.sum(1).clamp_min(1); pooled=torch.nn.functional.normalize(pooled,p=2,dim=1)
-    emb.append(pooled.cpu().numpy().astype(np.float32))
+emb=[]; embedding_batch_size=int(B['inference_batch_defaults']['embeddinggemma_prompt_encoder']); start=0
+while start<n:
+    size=min(embedding_batch_size,n-start)
+    batch=['task: clustering | query: '+str(x.get('reconstructed_prompt','')) for x in recon[start:start+size]]
+    try:
+        inputs=tokenizer(batch,padding=True,truncation=True,max_length=512,return_tensors='pt').to(device)
+        with torch.inference_mode():
+            hidden=encoder(**inputs).last_hidden_state.float(); mask=inputs['attention_mask'].unsqueeze(-1).to(hidden.dtype)
+            pooled=(hidden*mask).sum(1)/mask.sum(1).clamp_min(1); pooled=torch.nn.functional.normalize(pooled,p=2,dim=1)
+    except torch.cuda.OutOfMemoryError:
+        if 'inputs' in locals(): del inputs
+        if 'hidden' in locals(): del hidden
+        if 'mask' in locals(): del mask
+        if 'pooled' in locals(): del pooled
+        gc.collect(); torch.cuda.empty_cache()
+        if size==1: raise
+        embedding_batch_size=max(1,size//2)
+        print(f'EmbeddingGemma OOM; retrying at batch size {embedding_batch_size}',flush=True)
+        continue
+    emb.append(pooled.cpu().numpy().astype(np.float32)); start+=size
+    print(f'embedded prompts {start}/{n} (batch={size})',flush=True)
+    del inputs,hidden,mask,pooled
 emb=np.concatenate(emb,axis=0)
 del encoder,tokenizer; gc.collect(); torch.cuda.empty_cache()
 
@@ -421,7 +463,7 @@ reconstructed=np.asarray([x.get('reconstructed_prompt','') for x in recon],dtype
 topics=np.asarray([x.get('topic','') for x in recon],dtype=str)
 details=[x.get('distinctive_details',[]) for x in recon]; constraints=[x.get('constraints',[]) for x in recon]
 spaces=e19b_group.transform_similarity_spaces(reconstructed,texts,grouper['vectorizers'])
-row_ix=np.arange(n); pairs=e19b_group.candidate_pairs(row_ix,spaces,emb,neighbors=grouper.get('neighbors',40))
+row_ix=np.arange(n); pairs=e19b_group.candidate_pairs(row_ix,spaces,emb,neighbors=grouper.get('neighbors',40),semantic_device='cuda:0')
 pair_features=e19b_group.pair_features(row_ix,pairs,spaces,reconstructed,texts,emb,topics,details,constraints)
 pair_prob=e19b_group.score_pairs(grouper['pair_scorer'],pair_features) if len(pairs) else np.empty(0,dtype=np.float32)
 groups,_=e19b_group.cluster_complete_link(ids,pairs,pair_prob,threshold=float(grouper['threshold']),max_cluster_size=int(grouper.get('max_cluster_size',18)))
@@ -455,11 +497,28 @@ for item in llama_manifest['files']:
     dst=llama_dir/item['relative_path']; dst.parent.mkdir(parents=True,exist_ok=True)
     if not dst.exists(): dst.symlink_to(src)
 base_models['llama32_3b']=llama_dir
-base_models['smollm3_3b']=model_root('smollm3-3b-base')
+smollm_source=model_root('smollm3-3b-base')
+smollm_runtime=WORK/'bases/smollm3_3b'; smollm_runtime.mkdir(parents=True,exist_ok=True)
+for source_file in smollm_source.rglob('*'):
+    if not source_file.is_file(): continue
+    target=smollm_runtime/source_file.relative_to(smollm_source)
+    target.parent.mkdir(parents=True,exist_ok=True)
+    if source_file.name=='config.json':
+        config=json.loads(source_file.read_text())
+        if config.get('model_type')=='smollm3_text_base': config['model_type']='smollm3'
+        target.write_text(json.dumps(config,indent=2)+'\n')
+    elif not target.exists(): target.symlink_to(source_file)
+smollm_index=only(list(INPUT.rglob('smollm3_base_model.safetensors.index.json')),'SmolLM3 safetensors index')
+index_target=smollm_runtime/'model.safetensors.index.json'
+if not index_target.exists(): index_target.symlink_to(smollm_index)
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+assert 'smollm3' in CONFIG_MAPPING, 'Kaggle Transformers does not register smollm3'
+base_models['smollm3_3b']=smollm_runtime
 checkpoint_root=WORK/'checkpoints'; checkpoint_root.mkdir(parents=True,exist_ok=True)
-probabilities={}; families={}
+worker_specs=[]; families={}
 for num,sid in enumerate(B['checkpoint_ids'],1):
     spec=dict(B['checkpoint_members'][sid]); target=checkpoint_root/sid; target.mkdir(parents=True,exist_ok=True)
+    spec['sequence_id']=sid
     for item in spec['files']:
         src=resolve_asset(item); dst=target/item['relative_path']; dst.parent.mkdir(parents=True,exist_ok=True)
         if not dst.exists(): dst.symlink_to(src)
@@ -468,10 +527,74 @@ for num,sid in enumerate(B['checkpoint_ids'],1):
         checkpoint_file=only([p for p in (checkpoint_root/sid).rglob('*.joblib') if p.is_file()],f'{sid} SVC checkpoint')
         spec['checkpoint']=str(checkpoint_file)
     if spec['model'] in base_models: spec['base_model']=str(base_models[spec['model']])
-    probabilities[sid]=predict_candidate(spec,texts,classes,WORK)
+    else: spec['base_model']=None
+    spec['checkpoint']=str(checkpoint_root/sid) if spec['model']!='svc' else str(spec['checkpoint'])
+    worker_specs.append(spec)
     families[sid]=spec['family']
-    gc.collect(); torch.cuda.empty_cache()
-    if num%4==0 or num==len(B['checkpoint_ids']): print(f'inferred checkpoint {num}/{len(B["checkpoint_ids"])}',flush=True)
+
+# Schedule the heaviest checkpoints first onto the less-loaded GPU. Each worker
+# loads one checkpoint at a time; the two workers run concurrently on T4 0/1.
+def task_cost(spec):
+    size=0
+    for key in ('checkpoint','base_model'):
+        value=spec.get(key)
+        if not value: continue
+        path=Path(value)
+        if path.is_file(): size+=path.stat().st_size
+        elif path.is_dir(): size+=sum(p.stat().st_size for p in path.rglob('*') if p.is_file())
+    return max(1.0,size/1_000_000_000)
+tasks=[[],[]]; loads=[0.0,0.0]
+for spec in sorted(worker_specs,key=task_cost,reverse=True):
+    gpu=min(range(2),key=lambda i:loads[i]); tasks[gpu].append(spec); loads[gpu]+=task_cost(spec)
+assert torch.cuda.device_count()>=2, f'E20-D parallel inference requires two visible GPUs; found {torch.cuda.device_count()}'
+worker_path=WORK/'e20d_gpu_worker.py'
+worker_path.write_text(r"""import gc,json,os,sys
+for name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS','VECLIB_MAXIMUM_THREADS','BLIS_NUM_THREADS'): os.environ[name]='1'
+os.environ['TOKENIZERS_PARALLELISM']='false'; os.environ['HF_HUB_OFFLINE']='1'; os.environ['TRANSFORMERS_OFFLINE']='1'
+import numpy as np, torch
+torch.set_num_threads(1); torch.set_num_interop_threads(1); torch.cuda.set_device(0)
+from pathlib import Path
+from src.inference import predict_candidate
+spec_path,out_dir,text_path,class_path=sys.argv[1:]
+specs=json.loads(Path(spec_path).read_text()); texts=json.loads(Path(text_path).read_text()); classes=json.loads(Path(class_path).read_text())
+worker_id=os.environ.get('WORKER_GPU_ID','unknown'); batch_records={}
+for i,spec in enumerate(specs,1):
+    probs,batch_info=predict_candidate(spec,texts,classes,Path('/'),return_batch_metadata=True)
+    if probs.shape!=(len(texts),len(classes)) or not np.isfinite(probs).all(): raise ValueError(f"bad prediction matrix for {spec['sequence_id']}")
+    path=Path(out_dir)/(str(spec['sequence_id'])+'.npy'); temp=path.with_suffix('.tmp')
+    with temp.open('wb') as f: np.save(f,probs.astype(np.float32,copy=False),allow_pickle=False)
+    os.replace(temp,path); batch_records[spec['sequence_id']]=batch_info
+    print(f"GPU worker {worker_id} scored {i}/{len(specs)}: {spec['sequence_id']} (batch={batch_info.get('effective_batch_size')})",flush=True)
+    del probs; gc.collect(); torch.cuda.empty_cache()
+Path(out_dir,f'worker{worker_id}_batch_sizes.json').write_text(json.dumps(batch_records,indent=2)+'\n')
+""")
+spec_paths=[]; worker_logs=[]; prediction_dir=WORK/'probabilities'; prediction_dir.mkdir(exist_ok=True)
+text_path=WORK/'test_texts.json'; text_path.write_text(json.dumps(texts.tolist()))
+class_path=WORK/'classes.json'; class_path.write_text(json.dumps(classes))
+for gpu,specs in enumerate(tasks):
+    path=WORK/f'worker{gpu}_tasks.json'; path.write_text(json.dumps(specs)); spec_paths.append(path)
+    worker_logs.append((WORK/f'worker{gpu}.log').open('w'))
+procs=[]
+for gpu in range(2):
+    env=os.environ.copy(); env['CUDA_VISIBLE_DEVICES']=str(gpu); env['WORKER_GPU_ID']=str(gpu); env['PYTHONPATH']=str(RUNTIME)+os.pathsep+env.get('PYTHONPATH','')
+    procs.append(subprocess.Popen([sys.executable,str(worker_path),str(spec_paths[gpu]),str(prediction_dir),str(text_path),str(class_path)],env=env,stdout=worker_logs[gpu],stderr=subprocess.STDOUT))
+codes=[p.wait() for p in procs]
+for f in worker_logs: f.close()
+for gpu,code in enumerate(codes):
+    log=(WORK/f'worker{gpu}.log').read_text(); print(log,flush=True)
+    if code: raise RuntimeError(f'E20-D GPU worker {gpu} failed with exit code {code}; see {WORK}/worker{gpu}.log')
+probabilities={}
+effective_batches={}
+for spec in worker_specs:
+    sid=spec['sequence_id']; matrix=np.load(prediction_dir/f'{sid}.npy',allow_pickle=False)
+    if matrix.shape!=(n,len(classes)): raise ValueError(f'cached prediction shape mismatch for {sid}: {matrix.shape}')
+    probabilities[sid]=matrix
+for gpu in range(2):
+    path=prediction_dir/f'worker{gpu}_batch_sizes.json'
+    if not path.is_file(): raise FileNotFoundError(f'missing batch-size metadata: {path}')
+    effective_batches.update(json.loads(path.read_text()))
+assert set(probabilities)==set(B['checkpoint_ids'])
+print(f'Parallel checkpoint inference complete: {len(probabilities)} checkpoints across 2 GPUs; per-worker CPU threads=1',flush=True)
 
 cache=np.load(BROOT/B['v0_cache'],allow_pickle=False)
 v0_ids=np.asarray(cache['row_ids'],dtype=str); v0_texts=np.asarray(cache['texts'],dtype=str); y=np.asarray(cache['y'],dtype=np.int64)
@@ -492,7 +615,7 @@ for fold in B['folds']:
     p=all_probs[[cp_pos[sid] for sid in roster]]
     router=CatBoostClassifier(); router.load_model(str(BROOT/fold['router_file']))
     frame,_=build_feature_frame(p,roster,fold['families'],y[fit],fit,np.arange(len(v0_ids),len(all_ids)))
-    reliability=_score_correctness(router,_cat_frame(frame)).reshape(n,len(roster)).T
+    reliability=router.predict_proba(_cat_frame(frame),thread_count=1)[:,1].reshape(n,len(roster)).T
     hard=p[:,len(v0_ids):].argmax(2)
     ensemble=e15.e13.family_balanced_probabilities(p[:,len(v0_ids):],fold['families'])
     e13_scores=finite_scores(e15._pair_scores(hard,reliability,ensemble,fold['families']))
@@ -501,7 +624,10 @@ for fold in B['folds']:
     feature=e20._combine_features(ctx,evidence,np.arange(len(v0_ids),len(all_ids)),roster,groups,
         vectorizer,pair_scores=pair_scores,oracle=False,fit_texts=v0_texts[fit])
     classifier=CatBoostClassifier(); classifier.load_model(str(BROOT/fold['classifier_file']))
-    matrix=e20._score_with_reused_classifier(classifier,feature); fold_scores.append(matrix)
+    expected=list(classifier.feature_names_)
+    if set(feature.columns)!=set(expected): raise ValueError('saved E20-C feature schema mismatch')
+    raw=classifier.predict_proba(feature.loc[:,expected],thread_count=1)[:,1]
+    matrix=raw.reshape(n,len(classes)); fold_scores.append(matrix)
     print(f'E20-D fold {f}: scored {n} responses',flush=True)
 scores=np.mean(np.stack(fold_scores),axis=0)
 pred=e20.hungarian(scores,groups,ids)
@@ -511,6 +637,7 @@ assert submission.model.notna().all() and submission.model.isin(classes).all()
 output=Path('/kaggle/working/submission.parquet'); submission.to_parquet(output,index=False)
 assert pd.read_parquet(output).equals(submission)
 run={'experiment':'E20-D','rows':n,'checkpoint_ids':B['checkpoint_ids'],'folds':[x['fold'] for x in B['folds']],
+     'configured_inference_batch_defaults':B['inference_batch_defaults'],'effective_inference_batch_sizes':effective_batches,
      'groups':{str(i):str(g) for i,g in zip(ids,groups)},'test_sha256':hashlib.sha256(TEST.read_bytes()).hexdigest(),
      'submission_sha256':hashlib.sha256(output.read_bytes()).hexdigest(),'predictions':submission.to_dict('records')}
 Path('/kaggle/working/e20d_run_manifest.json').write_text(json.dumps(run,indent=2)+'\n')

@@ -89,7 +89,43 @@ def _neighbor_pairs(matrix, rows, neighbors):
     return pairs
 
 
-def candidate_pairs(rows, spaces, semantic_embeddings, *, neighbors=DEFAULT_NEIGHBORS):
+def _dense_neighbor_pairs_gpu(embeddings, rows, neighbors, *, device="cuda:0", block_size=128):
+    """Exact top-k cosine neighbors for dense embeddings, with GPU dot products."""
+    import torch
+
+    rows = np.sort(np.asarray(rows, dtype=np.int64), kind="stable")
+    values = np.asarray(embeddings, dtype=np.float32)[rows]
+    n = len(rows)
+    if n < 2:
+        return set()
+    norms = np.linalg.norm(values, axis=1, keepdims=True)
+    if not np.isfinite(values).all() or np.any(norms <= 0):
+        raise ValueError("Semantic embeddings must be finite and nonzero")
+    values = values / norms
+    matrix = torch.as_tensor(values, dtype=torch.float32, device=device)
+    k = min(n, int(neighbors) + 1)
+    pairs = set()
+    with torch.inference_mode():
+        for start in range(0, n, int(block_size)):
+            end = min(start + int(block_size), n)
+            similarities = (matrix[start:end] @ matrix.T).cpu().numpy()
+            for offset, scores in enumerate(similarities):
+                row = start + offset
+                selected = np.argpartition(-scores, k - 1)[:k]
+                selected = selected[np.lexsort((selected, -scores[selected]))]
+                for other in selected:
+                    other = int(other)
+                    if other != row:
+                        pairs.add((min(row, other), max(row, other)))
+            del similarities
+    del matrix
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        torch.cuda.empty_cache()
+    return pairs
+
+
+def candidate_pairs(rows, spaces, semantic_embeddings, *, neighbors=DEFAULT_NEIGHBORS,
+                    semantic_device=None):
     """Union nearest neighbors from reconstructed prompt and response signals."""
     rows = np.sort(np.asarray(rows, dtype=np.int64), kind="stable")
     if len(rows) < 2:
@@ -98,12 +134,17 @@ def candidate_pairs(rows, spaces, semantic_embeddings, *, neighbors=DEFAULT_NEIG
     for name in ("reconstruction_char_matrix", "reconstruction_word_matrix",
                  "response_char_matrix", "response_word_matrix"):
         result.update(_neighbor_pairs(spaces[name], rows, neighbors))
-    emb = np.asarray(semantic_embeddings, dtype=np.float32)[rows]
-    norms = np.linalg.norm(emb, axis=1, keepdims=True)
-    if not np.isfinite(emb).all() or np.any(norms <= 0):
-        raise ValueError("E19-B semantic embeddings must be finite and nonzero")
-    emb = emb / norms
-    result.update(_neighbor_pairs(sparse.csr_matrix(emb), np.arange(len(rows)), neighbors))
+    emb = np.asarray(semantic_embeddings, dtype=np.float32)
+    if semantic_device is not None:
+        result.update(_dense_neighbor_pairs_gpu(emb, rows, neighbors,
+                                                device=semantic_device))
+    else:
+        emb = emb[rows]
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        if not np.isfinite(emb).all() or np.any(norms <= 0):
+            raise ValueError("E19-B semantic embeddings must be finite and nonzero")
+        emb = emb / norms
+        result.update(_neighbor_pairs(sparse.csr_matrix(emb), np.arange(len(rows)), neighbors))
     return np.asarray(sorted(result), dtype=np.int64).reshape(-1, 2)
 
 

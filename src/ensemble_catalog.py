@@ -27,8 +27,15 @@ def _enabled(series):
     return series.str.lower().isin({"true", "1"})
 
 
-def _load_inputs(root, v0):
-    pointer = json.loads((root / "docs/trust-list-2-latest.json").read_text())
+def _load_inputs(root, v0, *, version=None):
+    if version is None:
+        pointer = json.loads((root / "docs/trust-list-2-latest.json").read_text())
+    else:
+        # Reproducible analyses may pin a historical trust-list snapshot. The
+        # mutable latest pointer must not invalidate an explicitly pinned run.
+        pointer = {"version": str(version),
+                   "csv_path": f"docs/{version}.csv",
+                   "metadata_path": f"docs/{version}.json"}
     path = root / pointer["csv_path"]
     trust_hash = cascades._sha256(path)
     metadata = json.loads((root / pointer["metadata_path"]).read_text())

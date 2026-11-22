@@ -503,10 +503,8 @@ def _load_inputs(root: Path):
     config = json.loads(BASELINE_CONFIG.read_text())
     if config["trust_list"]["version"] != "trust-list-2-v037":
         raise ValueError("The saved E13-B baseline is not Trust List 2 v037")
-    current = json.loads((root / "docs/trust-list-2-latest.json").read_text())
-    if current["version"] != "trust-list-2-v037":
-        raise ValueError("Current Trust List pointer differs from required E13-B v037 snapshot")
-    trust, members, probability_map, excluded, snapshot = catalog._load_inputs(root, v0)
+    trust, members, probability_map, excluded, snapshot = catalog._load_inputs(
+        root, v0, version=config["trust_list"]["version"])
     ids = list(config["ids"])
     missing = sorted(set(ids) - set(probability_map))
     if missing:

@@ -81,7 +81,8 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                     text_only_backbone=False, local_base_model=None, return_scores=False,
                     quantization=None, attention_backend=None, code_revision=None,
                     use_chat_template=False,
-                    chat_template_user_prompt="Identify the source model for the assistant response."):
+                    chat_template_user_prompt="Identify the source model for the assistant response.",
+                    return_batch_metadata=False):
     try:
         import torch
         from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
@@ -111,6 +112,12 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
             batch_size=batch_size, model_dir=local_backbone if local_backbone.is_dir() else None,
             fix_mistral_regex=bundle.get("fix_mistral_regex", False))
         aligned = _readout_probabilities(bundle["model"], features, classes)
+        if return_batch_metadata:
+            return aligned, list(classes), {
+                "configured_batch_size": int(batch_size),
+                "effective_batch_size": int(batch_size),
+                "batch_size_note": "frozen feature extraction may reduce internally on OOM",
+            }
         return aligned, list(classes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # EmbeddingGemma's activations can overflow fp16. Use bf16 where available
@@ -201,6 +208,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     batches=[]; score_batches=[]
     batch_size = max(1, int(batch_size))
     next_batch_size = batch_size
+    first_batch_successful_size = None
     with torch.inference_mode():
         start = 0
         while start < len(texts):
@@ -222,6 +230,8 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                 if hasattr(logits,"logits"): logits=logits.logits
                 raw_logits = logits.float()
                 score_batches.append(raw_logits.cpu().numpy())
+                if start == 0:
+                    first_batch_successful_size = current_size
                 start += current_size
             except RuntimeError as exc:
                 is_cuda_oom = device.type == "cuda" and (
@@ -241,7 +251,17 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     if matrix.shape != (len(texts),len(classes)) or not np.isfinite(matrix).all(): raise ValueError("neural model returned invalid probabilities")
     if return_scores:
         raw_scores=np.concatenate(score_batches,axis=0) if score_batches else np.empty((0,len(classes)))
+        if return_batch_metadata:
+            return matrix, list(classes), raw_scores, {
+                "configured_batch_size": int(batch_size),
+                "effective_batch_size": int(first_batch_successful_size or batch_size),
+            }
         return matrix, list(classes), raw_scores
+    if return_batch_metadata:
+        return matrix, list(classes), {
+            "configured_batch_size": int(batch_size),
+            "effective_batch_size": int(first_batch_successful_size or batch_size),
+        }
     return matrix, list(classes)
 
 
@@ -343,7 +363,7 @@ def predict_from_trust_table(probability_by_candidate, classes, trust_rows, *, m
     return np.asarray(output)
 
 
-def predict_candidate(model_spec, texts, classes, bundle_root):
+def predict_candidate(model_spec, texts, classes, bundle_root, *, return_batch_metadata=False):
     """Run one candidate stored in a prediction bundle and align its class probabilities."""
     bundle_root = Path(bundle_root)
     model = str(model_spec["model"])
@@ -356,7 +376,8 @@ def predict_candidate(model_spec, texts, classes, bundle_root):
         probabilities, returned_classes = predict_catboost_stylometry(checkpoint, texts, classes,
             temperature=model_spec.get("calibration_temperature", 1.0))
     else:
-        probabilities, returned_classes = _predict_neural(model, checkpoint, texts, classes,
+        result = _predict_neural(model, checkpoint, texts, classes,
+            batch_size=config.get("inference_batch_size", 8),
             max_length=config.get("max_length", 384),
             temperature=model_spec.get("calibration_temperature", 1.0),
             base_checkpoint=config.get("checkpoint"), revision=model_spec.get("model_revision"),
@@ -367,12 +388,22 @@ def predict_candidate(model_spec, texts, classes, bundle_root):
             code_revision=config.get("code_revision"),
             use_chat_template=config.get("use_chat_template", False),
             chat_template_user_prompt=config.get("chat_template_user_prompt", "Identify the source model for the assistant response."),
-            local_base_model=(bundle_root / model_spec["base_model"] if model_spec.get("base_model") else None))
+            local_base_model=(bundle_root / model_spec["base_model"] if model_spec.get("base_model") else None),
+            return_batch_metadata=return_batch_metadata)
+        if return_batch_metadata:
+            probabilities, returned_classes, batch_metadata = result
+        else:
+            probabilities, returned_classes = result
     if returned_classes != classes:
         indexes = {label: index for index, label in enumerate(returned_classes)}
         probabilities = probabilities[:, [indexes[label] for label in classes]]
     if probabilities.shape != (len(texts), len(classes)):
         raise ValueError(f"{model_spec['candidate_id']} returned an unexpected probability shape")
+    if return_batch_metadata:
+        if model in {"svc", "catboost_stylometry"}:
+            batch_metadata = {"configured_batch_size": None, "effective_batch_size": None,
+                              "batch_size_note": "CPU inference; no GPU batch size"}
+        return probabilities, batch_metadata
     return probabilities
 
 
