@@ -52,6 +52,12 @@ Canonical descriptions and artifact locations for processed datasets in the NLM 
 |---|---|---:|---|---|---|---|
 | **V2 Open Pool — eligible source rows** | [`dataset_v2_openpool.parquet`](../data/processed/dataset_v2_openpool.parquet) | 188,095 | English Open Pool responses retained by the hard quality filters, before assembling the V2 mix. | Staging training source; no V0 rows are included. | [`dataset_profile_v2_openpool.json`](../data/processed/dataset_profile_v2_openpool.json) | — |
 
+## Research datasets
+
+| Name | Artifact | Rows | Description | Validation | Profile | Related reports |
+|---|---|---:|---|---|---|---|
+| **v2,16OP-RandomGroups — External source-prompt groups** | [`dataset_v2_16OP_RandomGroups.parquet`](../data/processed/dataset_v2_16OP_RandomGroups.parquet) | 502 | Deterministic, source-prompt-preserving random subsets of the V2.16 Open Pool increment, with 4–10 groups per achievable size and one response per distinct label. Sizes 13–18 are unavailable in the source. | External-only E26 meta-training data; split and tune by original source prompt. V0 is reserved for robustness evaluation and must not be used for fitting. | [`dataset_profile_v2_16OP_RandomGroups.json`](../data/processed/dataset_profile_v2_16OP_RandomGroups.json) | [e26.md](../docs/e26.md) |
+
 ## Specialist classifier datasets
 
 | Name | Artifact | Rows | Description | Validation | Profile | Related reports |

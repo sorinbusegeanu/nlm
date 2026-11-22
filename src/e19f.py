@@ -64,7 +64,11 @@ def _cuda_is_busy() -> bool:
         output = subprocess.check_output(
             ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
             stderr=subprocess.DEVNULL, text=True)
-        return any(line.strip().isdigit() for line in output.splitlines())
+        # `torch.cuda.mem_get_info()` may initialize this process's CUDA
+        # context before this check. Ignore our own PID so auto selection
+        # does not mistake the caller for a competing GPU workload.
+        return any(line.strip().isdigit() and int(line.strip()) != os.getpid()
+                   for line in output.splitlines())
     except (OSError, subprocess.SubprocessError):
         return False
 

@@ -101,7 +101,7 @@
     },
     {
       "id": "E12-1",
-      "name": "Error-Aware Specialist Arbitration \u00b7 top 2 \u00b7 15 checkpoints",
+      "name": "Error-Aware Specialist Arbitration · top 2 · 15 checkpoints",
       "algorithm": "pairwise_arbitration",
       "candidates": 2,
       "max_checkpoints": 15,
@@ -115,7 +115,7 @@
     },
     {
       "id": "E12-2",
-      "name": "Error-Aware Specialist Arbitration \u00b7 top 3 \u00b7 15 checkpoints",
+      "name": "Error-Aware Specialist Arbitration · top 3 · 15 checkpoints",
       "algorithm": "pairwise_arbitration",
       "candidates": 3,
       "max_checkpoints": 15,
@@ -129,7 +129,7 @@
     },
     {
       "id": "E12-3",
-      "name": "Error-Aware Specialist Arbitration \u00b7 top 3 \u00b7 20 checkpoints",
+      "name": "Error-Aware Specialist Arbitration · top 3 · 20 checkpoints",
       "algorithm": "pairwise_arbitration",
       "candidates": 3,
       "max_checkpoints": 20,
@@ -143,7 +143,7 @@
     },
     {
       "id": "E13-A",
-      "name": "Learned Reliability Router \u00b7 checkpoint",
+      "name": "Learned Reliability Router · checkpoint",
       "algorithm": "checkpoint_reliability_router",
       "routing_method": "checkpoint",
       "max_checkpoints": 15,
@@ -151,7 +151,7 @@
     },
     {
       "id": "E13-B",
-      "name": "Learned Reliability Router \u00b7 family max",
+      "name": "Learned Reliability Router · family max",
       "algorithm": "checkpoint_reliability_router",
       "routing_method": "family_max",
       "max_checkpoints": 15,
@@ -159,7 +159,7 @@
     },
     {
       "id": "E13-C",
-      "name": "Learned Reliability Router \u00b7 family max \u00b7 20 checkpoints",
+      "name": "Learned Reliability Router · family max · 20 checkpoints",
       "algorithm": "checkpoint_reliability_router",
       "routing_method": "family_max",
       "max_checkpoints": 20,
@@ -169,7 +169,7 @@
   "experiments": [
     {
       "id": "E14-A",
-      "name": "CatBoost label selector \u00b7 top 2",
+      "name": "CatBoost label selector · top 2",
       "category": "Learned label arbitration",
       "description": "CatBoost selector over the top-2 candidate labels.",
       "accuracy": 0.6350500185253798,
@@ -187,7 +187,7 @@
     },
     {
       "id": "E14-B",
-      "name": "CatBoost label selector \u00b7 pairwise features",
+      "name": "CatBoost label selector · pairwise features",
       "category": "Learned label arbitration",
       "description": "CatBoost selector with pairwise error and reliability features.",
       "accuracy": 0.6391256020748425,
@@ -205,7 +205,7 @@
     },
     {
       "id": "E14-C",
-      "name": "LightGBM LambdaRank selector \u00b7 top 3",
+      "name": "LightGBM LambdaRank selector · top 3",
       "category": "Learned label arbitration",
       "description": "LambdaRank selector over the top-3 candidate labels.",
       "accuracy": 0.6369025565024083,
@@ -259,7 +259,7 @@
     },
     {
       "id": "E16",
-      "name": "Prompt reconstruction + soft uniqueness \u00b7 complete",
+      "name": "Prompt reconstruction + soft uniqueness · complete",
       "category": "Prompt-group decoder",
       "description": "Groups likely same-prompt responses from text, then jointly decodes labels with a soft duplicate-label penalty.",
       "accuracy": 0.6861800666913672,
@@ -277,7 +277,7 @@
     },
     {
       "id": "E16-SIM",
-      "name": "Prompt reconstruction + soft uniqueness \u00b7 simulated",
+      "name": "Prompt reconstruction + soft uniqueness · simulated",
       "category": "Prompt-group decoder",
       "description": "Simulated incomplete prompt batches; score is over the evaluated sampled rows.",
       "accuracy": 0.6641372484328605,
@@ -397,7 +397,7 @@
     },
     {
       "id": "E19-F-A",
-      "name": "Direct response embeddings \u00b7 high recall",
+      "name": "Direct response embeddings · high recall",
       "category": "Prompt reconstruction",
       "description": "Embeds response text and clusters using fold-local thresholds.",
       "accuracy": null,
@@ -413,7 +413,7 @@
     },
     {
       "id": "E19-F-B",
-      "name": "Direct response embeddings \u00b7 conservative MNN",
+      "name": "Direct response embeddings · conservative MNN",
       "category": "Prompt reconstruction",
       "description": "Embeds response text and clusters using fold-local thresholds.",
       "accuracy": null,
@@ -429,7 +429,7 @@
     },
     {
       "id": "E19-F-C",
-      "name": "Direct response embeddings \u00b7 pair scorer",
+      "name": "Direct response embeddings · pair scorer",
       "category": "Prompt reconstruction",
       "description": "Embeds response text and clusters using fold-local thresholds.",
       "accuracy": null,
@@ -445,7 +445,7 @@
     },
     {
       "id": "E20-A",
-      "name": "Group-aware CatBoost classifier \u00b7 independent argmax",
+      "name": "Group-aware CatBoost classifier · independent argmax",
       "category": "Group-aware classifier",
       "description": "Group-aware checkpoint classifier using independent argmax.",
       "accuracy": 0.7665802148944053,
@@ -463,7 +463,7 @@
     },
     {
       "id": "E20-B",
-      "name": "Group-aware CatBoost classifier \u00b7 reconstructed Hungarian",
+      "name": "Group-aware CatBoost classifier · reconstructed Hungarian",
       "category": "Group-aware classifier",
       "description": "Group-aware classifier decoded with reconstructed prompt groups.",
       "accuracy": 0.7784364579473879,
@@ -481,7 +481,7 @@
     },
     {
       "id": "E20-C",
-      "name": "Oracle group-aware classifier \u00b7 oracle Hungarian",
+      "name": "Oracle group-aware classifier · oracle Hungarian",
       "category": "Group-aware classifier",
       "description": "Oracle prompt-group-trained classifier decoded with true prompt groups.",
       "accuracy": 0.7880696554279363,
@@ -499,7 +499,7 @@
     },
     {
       "id": "E20-D",
-      "name": "Oracle-trained classifier \u00b7 reconstructed Hungarian",
+      "name": "Oracle-trained classifier · reconstructed Hungarian",
       "category": "Group-aware classifier",
       "description": "Oracle-trained classifier decoded with reconstructed prompt groups.",
       "accuracy": 0.782141533901445,
@@ -519,9 +519,9 @@
     },
     {
       "id": "E21-A",
-      "name": "UltraBERT-380M group-aware classifier \u00b7 \u03bb=0",
+      "name": "UltraBERT-380M group-aware classifier · λ=0",
       "category": "Group-aware neural classifier",
-      "description": "V2.GR.OR16 training with CE + 0 \u00d7 group-ranking loss; full V0 validation.",
+      "description": "V2.GR.OR16 training with CE + 0 × group-ranking loss; full V0 validation.",
       "accuracy": null,
       "balanced_accuracy": null,
       "primary_metric": "Balanced accuracy",
@@ -539,9 +539,9 @@
     },
     {
       "id": "E21-B",
-      "name": "UltraBERT-380M group-aware classifier \u00b7 \u03bb=0.1",
+      "name": "UltraBERT-380M group-aware classifier · λ=0.1",
       "category": "Group-aware neural classifier",
-      "description": "V2.GR.OR16 training with CE + 0.1 \u00d7 group-ranking loss; full V0 validation.",
+      "description": "V2.GR.OR16 training with CE + 0.1 × group-ranking loss; full V0 validation.",
       "accuracy": null,
       "balanced_accuracy": null,
       "primary_metric": "Balanced accuracy",
@@ -559,9 +559,9 @@
     },
     {
       "id": "E21-C",
-      "name": "UltraBERT-380M group-aware classifier \u00b7 \u03bb=0.3",
+      "name": "UltraBERT-380M group-aware classifier · λ=0.3",
       "category": "Group-aware neural classifier",
-      "description": "V2.GR.OR16 training with CE + 0.3 \u00d7 group-ranking loss; full V0 validation.",
+      "description": "V2.GR.OR16 training with CE + 0.3 × group-ranking loss; full V0 validation.",
       "accuracy": null,
       "balanced_accuracy": null,
       "primary_metric": "Balanced accuracy",
@@ -579,7 +579,7 @@
     },
     {
       "id": "E22-A",
-      "name": "Updated checkpoint stacker \u00b7 control",
+      "name": "Updated checkpoint stacker · control",
       "category": "Learned checkpoint ensemble",
       "description": "E20-style candidate-label CatBoost scoring with E19-D group-constrained Hungarian assignment.",
       "accuracy": 0.8729158947758429,
@@ -596,7 +596,7 @@
     },
     {
       "id": "E22-B",
-      "name": "Updated checkpoint stacker \u00b7 plus E21 checkpoints",
+      "name": "Updated checkpoint stacker · plus E21 checkpoints",
       "category": "Learned checkpoint ensemble",
       "description": "E20-style candidate-label CatBoost scoring with E19-D group-constrained Hungarian assignment.",
       "accuracy": 0.877732493516117,
@@ -613,7 +613,7 @@
     },
     {
       "id": "E22-C",
-      "name": "Per-label specialist stacker \u00b7 Hungarian",
+      "name": "Per-label specialist stacker · Hungarian",
       "category": "Learned checkpoint ensemble",
       "description": "E20-style candidate-label CatBoost scoring with E19-D group-constrained Hungarian assignment.",
       "accuracy": 0.8688403112263802,
@@ -630,7 +630,7 @@
     },
     {
       "id": "E23-A",
-      "name": "20-checkpoint stacker \u00b7 control",
+      "name": "20-checkpoint stacker · control",
       "category": "Learned checkpoint ensemble",
       "description": "Fold-local roster capped at 20; E20 candidate-label CatBoost with E19-D Hungarian decoding.",
       "accuracy": 0.7969618377176733,
@@ -648,7 +648,7 @@
     },
     {
       "id": "E23-B",
-      "name": "20-checkpoint stacker \u00b7 plus E21 checkpoints",
+      "name": "20-checkpoint stacker · plus E21 checkpoints",
       "category": "Learned checkpoint ensemble",
       "description": "Fold-local roster capped at 20; E20 candidate-label CatBoost with E19-D Hungarian decoding.",
       "accuracy": 0.7951092997406447,
@@ -684,7 +684,7 @@
     },
     {
       "id": "E24-A",
-      "name": "30-checkpoint stacker \u00b7 control",
+      "name": "30-checkpoint stacker · control",
       "category": "Learned checkpoint ensemble",
       "description": "Fold-local roster capped at 30; E20 candidate-label CatBoost with E19-D Hungarian decoding.",
       "accuracy": 0.8040014820303816,
@@ -702,7 +702,7 @@
     },
     {
       "id": "E24-B",
-      "name": "30-checkpoint stacker \u00b7 plus E21 checkpoints",
+      "name": "30-checkpoint stacker · plus E21 checkpoints",
       "category": "Learned checkpoint ensemble",
       "description": "Fold-local roster capped at 30; E20 candidate-label CatBoost with E19-D Hungarian decoding.",
       "accuracy": 0.7928862541682105,
@@ -755,6 +755,44 @@
       "checkpoint_count_note": "20 globally distinct deployment roster; fold-local rosters are recorded separately."
     },
     {
+      "id": "E26",
+      "name": "Ensemble generalization and Hungarian robustness",
+      "category": "External-only ensemble generalization",
+      "description": "Trains checkpoint-only and group-aware candidate-label classifiers on v2.16 Open Pool incremental responses, evaluates reconstructed/oracle Hungarian assignment on external held-out prompts, and reports robustness on 50 randomized V0 scenarios without fitting on V0.",
+      "status": "Scored",
+      "training_dataset": "v2_16OP_RandomGroups",
+      "validation_dataset": "v0_group",
+      "primary_metric": "Mean scenario accuracy",
+      "documentation": "docs/e26.md",
+      "result_source": "artifacts/analysis/e26/metrics.json",
+      "checkpoint_count": 3,
+      "checkpoint_ids": [
+        "qwen06_v2.16",
+        "ultrabert380_v2.16",
+        "modernbert_large_v2.16"
+      ],
+      "v0_exposure_note": "Base checkpoints were trained on V2.16 and selected using V0; external incremental response overlap must be verified before use.",
+      "accuracy": 0.5694,
+      "balanced_accuracy": 0.5703799402572836,
+      "primary_score": 0.5694
+    },
+    {
+      "id": "E27",
+      "name": "External grouping and assignment validation",
+      "category": "External-only ensemble generalization",
+      "description": "Fits and selects prompt grouping methods on prompt-disjoint V2.14 groups, then evaluates the frozen 89-checkpoint family-balanced ensemble with independent and group-constrained Hungarian prediction on complete and incomplete V0 groups.",
+      "status": "Running",
+      "training_dataset": "v2.14 canonical prompt groups",
+      "validation_dataset": "v0",
+      "primary_metric": "Balanced accuracy",
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoint_count": 89,
+      "checkpoints_used": 89,
+      "documentation": "docs/e27.md",
+      "result_source": "artifacts/analysis/e27/metrics.json",
+      "v0_exposure_note": "Frozen checkpoints have historical V0 selection exposure; E27 fits no grouper or ensemble parameter on V0 labels."
+    },
+    {
       "id": "E20-D-KFA",
       "name": "E20-D Kaggle failure analysis",
       "category": "Evaluation analysis",
@@ -769,6 +807,92 @@
       "balanced_accuracy": 0.7820581655480984,
       "primary_score": 0.7820581655480984,
       "checkpoints_used": 37
+    },
+    {
+      "id": "E27-A",
+      "name": "Independent classification",
+      "category": "External-only ensemble generalization",
+      "description": "Family-balanced 89-checkpoint independent argmax baseline.",
+      "status": "Scored",
+      "training_dataset": "v2.14 canonical prompt groups",
+      "validation_dataset": "v0",
+      "primary_metric": "Balanced accuracy",
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoint_count": 89,
+      "checkpoints_used": 89,
+      "documentation": "docs/e27.md",
+      "result_source": "artifacts/analysis/e27/frozen_roster_metrics.json",
+      "v0_exposure_note": "Frozen checkpoint pool has historical V0 selection exposure; no grouper fitting or threshold selection uses V0 labels.",
+      "accuracy": 0.6235642830678029,
+      "balanced_accuracy": 0.6235321899080288,
+      "primary_score": 0.6235321899080288
+    },
+    {
+      "id": "E27-B",
+      "name": "Oracle prompt-group Hungarian",
+      "category": "External-only ensemble generalization",
+      "description": "Oracle-only Hungarian assignment with the true V0 prompt groups; diagnostic upper bound, not deployable.",
+      "status": "Scored",
+      "training_dataset": "v2.14 canonical prompt groups",
+      "validation_dataset": "v0",
+      "primary_metric": "Balanced accuracy",
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoint_count": 89,
+      "checkpoints_used": 89,
+      "documentation": "docs/e27.md",
+      "result_source": "artifacts/analysis/e27/frozen_roster_metrics.json",
+      "v0_exposure_note": "Frozen checkpoint pool has historical V0 selection exposure; no grouper fitting or threshold selection uses V0 labels.",
+      "accuracy": 0.756947017413857,
+      "balanced_accuracy": 0.7568580661198111,
+      "primary_score": 0.7568580661198111
+    },
+    {
+      "id": "E27-C",
+      "name": "External-group Hungarian",
+      "category": "External-only ensemble generalization",
+      "description": "Hungarian assignment using the externally trained, validation-selected grouper.",
+      "status": "Running",
+      "training_dataset": "v2.14 canonical prompt groups",
+      "validation_dataset": "v0",
+      "primary_metric": "Balanced accuracy",
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoint_count": 89,
+      "checkpoints_used": 89,
+      "documentation": "docs/e27.md",
+      "result_source": "artifacts/analysis/e27/e27-c_metrics.json",
+      "v0_exposure_note": "Frozen checkpoint pool has historical V0 selection exposure; no grouper fitting or threshold selection uses V0 labels."
+    },
+    {
+      "id": "E27-D",
+      "name": "Confidence-gated Hungarian",
+      "category": "External-only ensemble generalization",
+      "description": "Apply assignment only when external-validation-calibrated group confidence clears the selected threshold.",
+      "status": "Running",
+      "training_dataset": "v2.14 canonical prompt groups",
+      "validation_dataset": "v0",
+      "primary_metric": "Balanced accuracy",
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoint_count": 89,
+      "checkpoints_used": 89,
+      "documentation": "docs/e27.md",
+      "result_source": "artifacts/analysis/e27/e27-d_metrics.json",
+      "v0_exposure_note": "Frozen checkpoint pool has historical V0 selection exposure; no grouper fitting or threshold selection uses V0 labels."
+    },
+    {
+      "id": "E27-E",
+      "name": "External grouper comparison",
+      "category": "External-only ensemble generalization",
+      "description": "Compare E19-B, E19-D and E19-F-A/B/C groupers on shared external and V0 scenarios.",
+      "status": "Running",
+      "training_dataset": "v2.14 canonical prompt groups",
+      "validation_dataset": "v0",
+      "primary_metric": "Balanced accuracy",
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoint_count": 89,
+      "checkpoints_used": 89,
+      "documentation": "docs/e27.md",
+      "result_source": "artifacts/analysis/e27/e27-e_metrics.json",
+      "v0_exposure_note": "Frozen checkpoint pool has historical V0 selection exposure; no grouper fitting or threshold selection uses V0 labels."
     }
   ],
   "display_catalog_version": "1.0.0",

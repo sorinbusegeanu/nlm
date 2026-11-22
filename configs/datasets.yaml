@@ -323,6 +323,16 @@ datasets:
     reports:
       - docs/openpool_v16_increment.md
 
+  - id: v2_16OP_RandomGroups
+    name: v2,16OP-RandomGroups — External source-prompt groups
+    section: Research datasets
+    description: Deterministic, source-prompt-preserving random subsets of the V2.16 Open Pool increment, with 4–10 groups per achievable size and one response per distinct label. Sizes 13–18 are unavailable in the source.
+    artifact: data/processed/dataset_v2_16OP_RandomGroups.parquet
+    profile: data/processed/dataset_profile_v2_16OP_RandomGroups.json
+    validation: External-only E26 meta-training data; split and tune by original source prompt. V0 is reserved for robustness evaluation and must not be used for fitting.
+    reports:
+      - docs/e26.md
+
   - id: v2.GR.OR16
     name: V2.GR.OR16 — Group-Ranking Open Pool v16
     section: Training datasets
