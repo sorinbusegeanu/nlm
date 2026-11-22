@@ -658,8 +658,10 @@ def render_ensemble_catalog(root):
         return
 
     entries = {entry["id"]: entry for entry in catalog["strategies"]}
+    experiment_entries = {entry["id"]: entry for entry in catalog.get("experiments", [])}
     catalog_hash = hashlib.sha256(catalog_bytes).hexdigest()
     latest_scores = {}
+    compatible_scores = {}
     results_root = root / "artifacts/analysis/ensemble_catalog"
     manifest_paths = list(results_root.glob("*/results.json"))
     manifest_paths.extend((root / "artifacts/analysis/e13").glob("*/catalog_results.json"))
@@ -668,39 +670,130 @@ def render_ensemble_catalog(root):
             run = json.loads(manifest.read_text())
         except (OSError, ValueError):
             continue
-        if run.get("catalog_sha256") != catalog_hash:
-            continue
         for result in run.get("results", []):
             code = result.get("ensemble")
-            if code in entries:
+            if code not in entries:
+                continue
+            if run.get("catalog_sha256") == catalog_hash:
                 latest_scores.setdefault(code, (result, run["trust_list"]["version"], manifest.parent.name))
+                continue
+
+            # The whole-catalog hash changes when unrelated experiments are
+            # appended. Reuse an older score only if this strategy's scoring
+            # definition is unchanged; names are display-only.
+            saved_strategy = result.get("strategy")
+            current_strategy = dict(entries[code])
+            if not isinstance(saved_strategy, dict):
+                continue
+            saved_strategy = dict(saved_strategy)
+            saved_strategy.pop("name", None)
+            current_strategy.pop("name", None)
+            if (saved_strategy == current_strategy
+                    and result.get("accuracy") is not None
+                    and result.get("balanced_accuracy") is not None):
+                compatible_scores.setdefault(
+                    code, (result, run.get("trust_list", {}).get("version"), manifest.parent.name))
         if len(latest_scores) == len(entries):
             break
+
+    for code, score in compatible_scores.items():
+        latest_scores.setdefault(code, score)
 
     rows = []
     for code, entry in entries.items():
         result, trust_version, _ = latest_scores.get(code, ({}, None, None))
         deployment = result.get("deployment")
         rows.append({
-            "Code": code, "Ensemble": entry["name"],
+            "Code": code, "Ensemble / experiment": entry["name"],
+            "Category": "Dynamic strategy",
             "Accuracy": result.get("accuracy"), "Balanced accuracy": result.get("balanced_accuracy"),
+            "Primary metric": "Balanced accuracy",
+            "Primary score": result.get("balanced_accuracy"),
             "Trust List 2": trust_version,
             "Checkpoints used": (len(deployment["checkpoint_ids"]) if deployment else
                                  len(result.get("checkpoint_ids", [])) or None),
             "Status": result.get("status", "Awaiting score").replace("_", " ").capitalize(),
         })
 
+    live_experiment_results = {}
+    for code, entry in experiment_entries.items():
+        result = dict(entry)
+        queue_path = entry.get("result_source")
+        if queue_path and queue_path.endswith("queue.json"):
+            try:
+                queue = json.loads((root / queue_path).read_text())
+                job = next((item for item in queue.get("results", [])
+                            if item.get("experiment") == entry.get("queue_experiment")), None)
+                if job is not None:
+                    result["status"] = job.get("status", result.get("status", "queued"))
+                    result["job_name"] = job.get("experiment_name")
+                    result["job_started_at"] = job.get("started_at_utc")
+                    result["job_finished_at"] = job.get("finished_at_utc")
+                evaluation_path = entry.get("evaluation_source")
+                if evaluation_path and (root / evaluation_path).is_file():
+                    evaluation = json.loads((root / evaluation_path).read_text())
+                    selected_epoch = evaluation.get("selected_epoch")
+                    metric = next((item for item in evaluation.get("metrics_by_epoch", [])
+                                   if item.get("epoch") == selected_epoch
+                                   and item.get("method") == "independent_argmax"), None)
+                    if metric is not None:
+                        result.update(accuracy=metric.get("accuracy"),
+                                      balanced_accuracy=metric.get("balanced_accuracy"),
+                                      primary_score=metric.get("balanced_accuracy"),
+                                      selected_epoch=selected_epoch, status="scored")
+            except (OSError, ValueError, TypeError):
+                pass
+        live_experiment_results[code] = result
+        rows.append({
+            "Code": code, "Ensemble / experiment": entry["name"],
+            "Category": entry.get("category", "Experiment"),
+            "Accuracy": result.get("accuracy"),
+            "Balanced accuracy": result.get("balanced_accuracy"),
+            "Primary metric": entry.get("primary_metric"),
+            "Primary score": result.get("primary_score"),
+            "Trust List 2": None, "Checkpoints used": None,
+            "Status": str(result.get("status", "Awaiting result")).replace("_", " ").capitalize(),
+        })
+
     st.subheader("Ensemble catalog")
-    st.caption(f"Version {catalog['version']}. Saved scores use held-out V0 prompt groups.")
+    st.caption(f"Version {catalog.get('display_catalog_version', catalog['version'])} · "
+               f"{len(rows)} strategies and experiments. Saved classification scores use held-out V0 prompt groups.")
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True,
                  column_config={
                      "Accuracy": st.column_config.NumberColumn(format="percent"),
                      "Balanced accuracy": st.column_config.NumberColumn(format="percent"),
+                     "Primary score": st.column_config.NumberColumn(format="percent"),
                      "Checkpoints used": st.column_config.NumberColumn(),
                  })
-    selected = st.selectbox("Ensemble", list(entries),
-                            format_func=lambda code: f"{code} — {entries[code]['name']}",
+    all_entries = {**entries, **experiment_entries}
+    selected = st.selectbox("Ensemble / experiment", list(all_entries),
+                            format_func=lambda code: f"{code} — {all_entries[code]['name']}",
                             key="ensemble_catalog_strategy")
+    if selected in experiment_entries:
+        result = live_experiment_results[selected]
+        st.markdown(f"**{result.get('category', 'Experiment')}** · {result.get('status', 'Awaiting result').replace('_', ' ').capitalize()}")
+        st.write(result.get("description", ""))
+        metric_columns = st.columns(3)
+        if result.get("accuracy") is not None:
+            metric_columns[0].metric("Accuracy", f"{result['accuracy']:.2%}")
+        if result.get("balanced_accuracy") is not None:
+            metric_columns[1].metric("Balanced accuracy", f"{result['balanced_accuracy']:.2%}")
+        if result.get("primary_score") is not None:
+            metric_columns[2].metric(result.get("primary_metric", "Primary score"),
+                                     f"{result['primary_score']:.2%}")
+        if result.get("selected_epoch") is not None:
+            st.caption(f"Selected by independent V0 balanced accuracy at epoch {result['selected_epoch']}.")
+        if result.get("job_name"):
+            st.caption(f"Training job: {result['job_name']}")
+        if result.get("documentation"):
+            st.caption(f"Report: {result['documentation']}")
+        if result.get("result_source"):
+            st.caption(f"Recorded result source: {result['result_source']}")
+        with st.expander("Experiment record"):
+            st.json({key: value for key, value in result.items()
+                     if key not in {"description", "accuracy", "balanced_accuracy", "primary_score"}})
+        return
+
     result, trust_version, timestamp = latest_scores.get(selected, ({}, None, None))
     if timestamp:
         st.caption(f"Scored with {trust_version} · Run {timestamp}")

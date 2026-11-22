@@ -323,6 +323,19 @@ datasets:
     reports:
       - docs/openpool_v16_increment.md
 
+  - id: v2.GR.OR16
+    name: V2.GR.OR16 — Group-Ranking Open Pool v16
+    section: Training datasets
+    description: All 231,036 labeled rows from the original Open Pool v16 main parquet, with namespaced prompt IDs and deterministic duplicate-label rotation metadata for group-ranking training.
+    artifact: data/processed/dataset_v2.GR.OR16.parquet
+    profile: data/processed/dataset_profile_v2.GR.OR16.json
+    validation: External-only training data; reserve all 2,699 official V0 rows for validation and checkpoint selection.
+    external_only: true
+    validation_dataset: v0
+    validation_rows: 2699
+    reports:
+      - docs/v2.GR.OR16.md
+
   - id: granite4_350m_v214_openpool16_v0w10
     name: Granite 4 350M V2.14 + Open Pool v16 + V0 weighted mix
     section: Training datasets

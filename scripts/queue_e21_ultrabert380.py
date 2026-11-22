@@ -158,8 +158,7 @@ def create_queue() -> Path:
         command = [PYTHON, "-u", "-m", "src.pipeline", "models", "train",
                    "--model", "ultrabert380", "--dataset", DATASET,
                    "--validation-dataset", "v0", "--config", str(config_path),
-                   "--seed", "2026", "--accept-config-defaults",
-                   "--refresh-prediction", "--refresh-checkpoint-catalog"]
+                   "--seed", "2026", "--accept-config-defaults"]
         jobs.append({
             "index": index, "experiment": experiment_id, "job_id": config["experiment_name"],
             "model": "ultrabert380", "dataset": DATASET,
@@ -259,6 +258,10 @@ def run_worker(queue_dir: Path) -> int:
     environment = {**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                    "TOKENIZERS_PARALLELISM": "false", "OMP_NUM_THREADS": "1"}
     for job in state["results"]:
+        saved_evaluation = job.get("evaluation_results")
+        if (job.get("status") in {"completed", "completed_with_warning"}
+                and saved_evaluation and (ROOT / saved_evaluation).is_file()):
+            continue
         while True:
             processes, gpu_pids = active_resources()
             state.update(status="waiting_for_gpu_release", active_training_processes=processes,
