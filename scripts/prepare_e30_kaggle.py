@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv, hashlib, json, os, shutil
+import importlib.metadata
 from pathlib import Path
 
 import nbformat as nbf
@@ -9,7 +10,8 @@ from huggingface_hub import snapshot_download
 
 from scripts.publish_kaggle_checkpoint_store import ROOT, build_checkpoint, sha256_file
 from scripts.prepare_e12_2_kaggle import _asset_ref, _remote_assets
-from scripts.prepare_e28_kaggle import _notebook_code
+from scripts.prepare_e28_kaggle import _notebook_code, WORKER_CODE as E28_WORKER_CODE
+from scripts.kaggle_preflight import embed_runtime_preflight, validate_kernel_package
 
 LOCAL = ROOT / "artifacts/kaggle/e30-checkpoints-v001"
 KERNEL = ROOT / "artifacts/kaggle/e30-kernel"
@@ -17,15 +19,23 @@ ANALYSIS = ROOT / "artifacts/analysis/e30"
 TRUST = ROOT / "docs/trust-list-2-v037.csv"
 E28_MANIFEST = ROOT / "artifacts/kaggle/e20d-remote-catalogs/e13-b-checkpoints-v001/e13_b_manifest.json"
 DATASET_REF = "zodrak/e30-checkpoints-v001"
-KERNEL_REF = "zodrak/e30-e13-b-family-max-hungarian"
+KERNEL_REF = "zodrak/e30-b-17-checkpoint-e13-b-with-external-hungarian"
 
 
 def prepare():
     deployment = json.loads((ANALYSIS / "e30_b_manifest.json").read_text())
     bench = json.loads((ANALYSIS / "inference_benchmark.json").read_text())
     bench_by_id = {r["checkpoint_id"]: r for r in bench["checkpoints"]}
-    if len(deployment["roster"]) != 20:
-        raise ValueError("E30 deployment must contain exactly 20 checkpoints")
+    for observed in bench.get("end_to_end_checkpoint_records", []):
+        sid = observed["checkpoint_id"]
+        effective = observed.get("maximum_stable_batch_size")
+        if effective:
+            previous = bench_by_id[sid].get("maximum_stable_batch_size")
+            bench_by_id[sid]["maximum_stable_batch_size"] = (
+                min(int(previous), int(effective)) if previous else int(effective))
+            bench_by_id[sid]["e2e_observed_batch_size"] = int(effective)
+    if not 15 <= len(deployment["roster"]) <= 20:
+        raise ValueError("E30 deployment must contain 15-20 checkpoints")
     if LOCAL.exists(): shutil.rmtree(LOCAL)
     if KERNEL.exists(): shutil.rmtree(KERNEL)
     (LOCAL / "assets").mkdir(parents=True)
@@ -93,49 +103,20 @@ def prepare():
         if batch: member["config"]["inference_batch_size"] = int(batch)
         members.append(member)
 
-    # MiniCPM and Hunyuan bases have no Kaggle model source in the existing
-    # deployment inventory. Package these pinned base weights in the E30 delta.
-    base_models = {}
-    allowed = {"config.json", "model.safetensors.index.json", "pytorch_model.bin.index.json",
-        "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "tokenizer.model",
-        "spiece.model", "vocab.json", "vocab.txt", "merges.txt", "added_tokens.json",
-        "generation_config.json", "chat_template.jinja"}
-    for model, sid in (("minicpm5_2b", "N0130"), ("hunyuan_1_8b", "N0129")):
-        member = next(x for x in members if x["candidate_id"] == sid)
-        repo = member["config"].get("checkpoint")
-        revision = member.get("model_revision") or member["config"].get("revision")
-        base_dir = Path(snapshot_download(repo_id=repo, revision=revision, local_files_only=True))
-        files = []
-        for source in sorted(base_dir.rglob("*")):
-            if not source.is_file():
-                continue
-            if source.name not in allowed and not source.name.endswith((".safetensors", ".bin", ".py")):
-                continue
-            relative = source.relative_to(base_dir).as_posix()
-            digest, size = sha256_file(source), source.stat().st_size
-            ref = _asset_ref(digest, size, by_hash, inventory)
-            if ref is None:
-                filename = f"assets/{model}__{digest}"
-                target = LOCAL / filename; target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target)
-                ref = {"dataset_ref": DATASET_REF, "flat_filename": filename,
-                       "sha256": digest, "size": size}
-                new_assets[digest] = {"size": size, "flat_filename": filename,
-                                      "dataset_ref": DATASET_REF}
-            files.append({"relative_path": relative, **ref})
-        if not any(Path(item["relative_path"]).name == "config.json" for item in files):
-            raise FileNotFoundError(f"Pinned {model} base has no config.json")
-        base_models[model] = {"repo_id": repo, "revision": revision, "files": files}
+    # The selected E30 roster has no additional base model requirements beyond
+    # the pinned base inputs inherited from E13-B. Keep this mapping generic so
+    # a future selected checkpoint can explicitly package its own base payload.
+    base_models = deployment.get("base_models", {})
 
     # Assets shared with E28 are copied here so the Kaggle input has one unique
     # E30 marker and one self-contained runtime/grouping bundle.
     group_source = ROOT / "artifacts/kaggle/e28-groupers-v001/deployment"
     (LOCAL / "deployment").mkdir(exist_ok=True)
-    shutil.copy2(group_source / "e19_f_c_external_grouper.joblib", LOCAL / "deployment/e19_f_c_external_grouper.joblib")
     shutil.copy2(group_source / "e19_f_c_external_grouper.joblib", LOCAL / "e19_f_c_external_grouper.joblib")
     shutil.copytree(ROOT / "src", LOCAL / "runtime/src",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copy2(ROOT / "src/e13_b_inference.py", LOCAL / "e13_b_inference.py")
+    shutil.copy2(ROOT / "src/e30_deploy.py", LOCAL / "e30_deploy.py")
     e28_package = json.loads((ROOT / "artifacts/kaggle/e28-groupers-v001/e28_manifest.json").read_text())
     batch_by_cp = {r["checkpoint_id"]: r["maximum_stable_batch_size"]
                    for r in bench["checkpoints"] if r.get("maximum_stable_batch_size")}
@@ -151,6 +132,29 @@ def prepare():
     member_manifest["deployment"]["families"] = deployment["families"]
     member_manifest["e30_variant"] = "E30-B"
     member_manifest["base_models"] = base_models
+    member_manifest["trust_list"] = {"version": deployment["trust_list_version"]}
+    member_manifest["roster"] = deployment["roster"]
+    member_manifest["router"] = "e30_b_router.cbm"
+    member_manifest["router_sha256"] = deployment["router_sha256"]
+    member_manifest["selection"] = deployment["selection"]
+    member_manifest["selection_rule"] = deployment["selection_rule"]
+    member_manifest["baseline_roster"] = deployment["baseline"]["roster"]
+    strict_versions = {}
+    if any(m["model"] == "svc" for m in members):
+        strict_versions["scikit-learn"] = importlib.metadata.version("scikit-learn")
+    required_distributions = ["numpy", "pandas", "scikit-learn", "torch", "transformers", "peft", "catboost"]
+    member_manifest["runtime_preflight"] = {
+        "strict_versions": strict_versions,
+        "required_distributions": required_distributions,
+        "checks": ["input mounts", "checkpoint asset names and sizes", "model config and tokenizer loading"],
+    }
+    member_manifest["inference_batch_parameters"] = {
+        sid: {"measured_effective_batch_size": bench_by_id.get(sid, {}).get("maximum_stable_batch_size"),
+              "device": bench_by_id.get(sid, {}).get("device"),
+              "peak_allocated_mib": bench_by_id.get(sid, {}).get("peak_allocated_mib"),
+              "peak_reserved_mib": bench_by_id.get(sid, {}).get("peak_reserved_mib"),
+              "oom_fallback": "enabled"}
+        for sid in deployment["roster"]}
     (LOCAL / "e30_b_manifest.json").write_text(json.dumps(member_manifest, indent=2)+"\n")
     shutil.copy2(ANALYSIS / "e30_b_router.cbm", LOCAL / "e30_b_router.cbm")
     e28_package["inference_batch_by_checkpoint"] = batch_by_cp
@@ -168,30 +172,31 @@ def prepare():
     e28_package["experiment"] = "E30"
     e28_package["checkpoint_ids"] = deployment["roster"]
     (LOCAL / "e28_manifest.json").write_text(json.dumps(e28_package, indent=2)+"\n")
-    (LOCAL / "dataset-metadata.json").write_text(json.dumps({"title":"NLM E30-B 20 Checkpoint Deployment",
+    (LOCAL / "dataset-metadata.json").write_text(json.dumps({"title":f"NLM E30-B {len(members)} Checkpoint Deployment",
         "id":DATASET_REF,"licenses":[{"name":"other"}],
         "subtitle":"E30-B router and only checkpoint assets not already published",
-        "description":"E30-B frozen 20-checkpoint E13-B family-max deployment, grouped with E19-F-A/F-C and Hungarian assignment."},indent=2)+"\n")
+        "description":f"E30-B frozen {len(members)}-checkpoint E13-B family-max deployment, with independent and E19-F-A/F-C Hungarian outputs."},indent=2)+"\n")
 
     notebook_code = _notebook_code()
+    notebook_code = notebook_code.replace("__WORKER_CODE_LITERAL__", repr(E28_WORKER_CODE))
     notebook_code = notebook_code.replace("'johnnyhyland/smollm3-3b-base-36l-text':'config.json',", "")
     notebook_code = notebook_code.replace("schedule=distribute_checkpoints(members,runtime_by_id,e28[\"inference_batch_defaults\"],n)",
         "schedule=distribute_checkpoints(members,runtime_by_id,e28[\"inference_batch_defaults\"],max(4000,n))")
     notebook_code = notebook_code.replace("spec.setdefault(\"config\",{})[\"inference_batch_size\"]=int(e28[\"inference_batch_defaults\"].get(m[\"model\"],64))",
         "spec.setdefault(\"config\",{})[\"inference_batch_size\"]=int(e28.get(\"inference_batch_by_checkpoint\",{}).get(m[\"candidate_id\"],e28[\"inference_batch_defaults\"].get(m[\"model\"],32)))")
     notebook_code = notebook_code.replace("BROOT=root_for('e13_b_manifest.json')",
-                                          "BROOT=root_for('e30_b_manifest.json')")
+                                          "BROOT=root_for('e30_b_manifest.json'); E28ROOT=BROOT")
     notebook_code = notebook_code.replace("E28ROOT=root_for('e28_manifest.json')", "E28ROOT=BROOT")
     notebook_code = notebook_code.replace('E28ROOT=root_for("e28_manifest.json")', 'E28ROOT=BROOT')
     notebook_code = notebook_code.replace("B=json.loads((BROOT/'e13_b_manifest.json').read_text())",
                                           "B=json.loads((BROOT/'e30_b_manifest.json').read_text())")
     notebook_code = notebook_code.replace("'zodrak/e13-b-checkpoints-v001':'e13_b_manifest.json'",
-        "'zodrak/e13-b-checkpoints-v001':'e13_b_manifest.json','zodrak/e30-checkpoints-v001':'e30_b_manifest.json','zodrak/zod03-llama-base':'llama_base_manifest.json'")
+        "'zodrak/e13-b-checkpoints-v001':'e13_b_manifest.json','zodrak/e30-checkpoints-v001':'e30_b_manifest.json'")
     notebook_code = notebook_code.replace("e13_b_router.cbm", "e30_b_router.cbm")
     notebook_code = notebook_code.replace("B['ensemble']=='E13-B' and B['routing_method']=='family_max' and len(B['members'])==15",
-                                          "B['ensemble']=='E13-B' and B['routing_method']=='family_max' and len(B['members'])==20")
+                                          "B['ensemble']=='E13-B' and B['routing_method']=='family_max' and 15 <= len(B['members']) <= 20")
     notebook_code = notebook_code.replace("from e13_b_inference import make_features", "from e13_b_inference import make_features, family_max_scores, route_family_max")
-    base_code = '''# Resolve all additional E30 base models from pinned packaged assets.
+    base_code = '''# Materialize any additional pinned base assets in the E30 manifest.
 for model,entry in B.get("base_models",{}).items():
     dest=WORK/"bases"/model; dest.mkdir(parents=True,exist_ok=True)
     for item in entry["files"]:
@@ -199,31 +204,6 @@ for model,entry in B.get("base_models",{}).items():
         target.parent.mkdir(parents=True,exist_ok=True)
         if not target.exists(): target.symlink_to(source)
     BASES[model]=dest
-llama_manifest_path=root_for("llama_base_manifest.json")/"llama_base_manifest.json"
-llama_manifest=json.loads(llama_manifest_path.read_text())
-llama_dir=WORK/"bases"/"llama32_3b"; llama_dir.mkdir(parents=True,exist_ok=True)
-for item in llama_manifest["files"]:
-    source=llama_manifest_path.parent/item["flat_filename"]
-    target=llama_dir/item["relative_path"]; target.parent.mkdir(parents=True,exist_ok=True)
-    if not target.exists(): target.symlink_to(source)
-BASES["llama32_3b"]=llama_dir
-smollm_paths=[p.parent for p in INPUT.rglob("config.json") if "smollm3-3b-base" in str(p.parent).casefold()]
-assert smollm_paths, "SmolLM3 base dataset is missing"
-smollm_source=only(smollm_paths,"SmolLM3 base")
-smollm_dir=WORK/"bases"/"smollm3_3b"; smollm_dir.mkdir(parents=True,exist_ok=True)
-for source in smollm_source.rglob("*"):
-    if not source.is_file(): continue
-    target=smollm_dir/source.relative_to(smollm_source); target.parent.mkdir(parents=True,exist_ok=True)
-    if source.name=="config.json":
-        cfg=json.loads(source.read_text())
-        if cfg.get("model_type")=="smollm3_text_base": cfg["model_type"]="smollm3"
-        target.write_text(json.dumps(cfg)+"\\n")
-    elif not target.exists(): target.symlink_to(source)
-index_files=list(INPUT.rglob("smollm3_base_model.safetensors.index.json"))
-if index_files:
-    target=smollm_dir/"model.safetensors.index.json"
-    if not target.exists(): target.symlink_to(only(index_files,"SmolLM3 index"))
-BASES["smollm3_3b"]=smollm_dir
 '''
     notebook_code = notebook_code.replace('members=B["members"]; classes=B["classes"]',
         base_code + '\nmembers=B["members"]; classes=B["classes"]')
@@ -252,6 +232,26 @@ groups_c=cluster_f_candidates("E19-F-C",ids,ordered,pairs,features,grouper)
     if old_grouping not in notebook_code:
         raise ValueError("Could not replace E28's embedded grouping/assignment with shared E30 helpers")
     notebook_code = notebook_code.replace(old_grouping, new_grouping)
+    runtime_bootstrap = '''# Prefer the exact E30 runtime. Kaggle may expose the uploaded directory as a ZIP.
+E30_RUNTIME_ROOT=E28ROOT/"runtime"
+if not (E30_RUNTIME_ROOT/"src"/"e30_deploy.py").is_file():
+    archives=[]
+    for candidate in E28ROOT.rglob("*.zip"):
+        with zipfile.ZipFile(candidate) as zf:
+            if any(name.endswith("src/e30_deploy.py") for name in zf.namelist()): archives.append(candidate)
+    if not archives: raise FileNotFoundError("E30 runtime directory/ZIP is missing")
+    unpack=WORK/"e30_runtime_unpacked"; unpack.mkdir(parents=True,exist_ok=True)
+    with zipfile.ZipFile(archives[0]) as zf: zf.extractall(unpack)
+    matches=list(unpack.rglob("src/e30_deploy.py"))
+    if len(matches)!=1: raise FileNotFoundError(f"expected one packaged e30_deploy.py, found {matches[:5]}")
+    E30_RUNTIME_ROOT=matches[0].parent.parent
+sys.path.insert(0,str(E30_RUNTIME_ROOT))
+'''
+    import_statement = "\nfrom src.e30_deploy import cluster_f_candidates, hungarian\n"
+    if notebook_code.count(import_statement) != 1:
+        raise ValueError("Expected one outer E30 grouping import line")
+    notebook_code = notebook_code.replace(import_statement,
+        "\n" + runtime_bootstrap + "from src.e30_deploy import cluster_f_candidates, hungarian\n", 1)
     start = notebook_code.index("# Family-max score outputs retain the frozen v037 routing decision.")
     end = notebook_code.index("# No checkpoint inference competes with grouping inference.", start)
     notebook_code = notebook_code[:start] + """# Shared E13-B routing implementation used locally and in this notebook.
@@ -266,37 +266,72 @@ assert np.isfinite(finite_scores).all()
 """ + notebook_code[end:]
     notebook_code = notebook_code.replace("e28_manifest.json", "e28_manifest.json")
     notebook_code = notebook_code.replace("e28_runtime_root", "e30_runtime_root")
+    notebook_code = notebook_code.replace(
+        "WORK=Path('/kaggle/working/e30_runtime_root'); SRC=WORK/'src'; SRC.mkdir(parents=True,exist_ok=True)",
+        "WORK=Path('/kaggle/working/e30_runtime_root'); SRC=WORK/'src'; SRC.mkdir(parents=True,exist_ok=True); RUNTIME=WORK")
     notebook_code = notebook_code.replace("e28_probabilities", "e30_probabilities")
     notebook_code = notebook_code.replace("e28_worker_report", "e30_worker_report")
     notebook_code = notebook_code.replace("E28-B", "E30-E19-F-C").replace("E28-C", "E30-E19-F-A")
     notebook_code = notebook_code.replace("'experiment':'E28'", "'experiment':'E30-B'")
     notebook_code = notebook_code.replace("\"experiment\":\"E28\"", "\"experiment\":\"E30-B\"")
     notebook_code = notebook_code.replace("e28_run_manifest.json", "e30_run_manifest.json")
-    notebook_code = notebook_code.replace('f"submission_{code.lower().replace(\'-\',\'_\')}.parquet"',
-        'f"submission_{code.lower().replace(\'-\',\'_\')}.csv"')
-    notebook_code = notebook_code.replace("submission.to_parquet(out,index=False)", "submission.to_csv(out,index=False)")
-    notebook_code = notebook_code.replace("assert pd.read_parquet(out).equals(submission)",
-        "check=pd.read_csv(out,dtype={\"id\":\"string\"}); assert check.equals(submission)")
+    new_outputs = '''submissions={}
+def write_submission(key,filename,pred):
+    submission=pd.DataFrame({"id":ids,"model":np.asarray(classes,dtype=object)[pred].astype(str)})
+    assert submission.id.tolist()==test.id.astype(str).tolist() and submission.id.is_unique
+    assert submission.model.notna().all() and submission.model.isin(classes).all()
+    out=Path("/kaggle/working")/filename
+    submission.to_parquet(out,index=False)
+    reread=pd.read_parquet(out)
+    assert reread.equals(submission) and list(reread.columns)==["id","model"]
+    submissions[key]={"path":str(out),"rows":len(submission),
+        "submission_sha256":hashlib.sha256(out.read_bytes()).hexdigest(),
+        "changed_from_independent":int(np.count_nonzero(pred!=independent))}
+write_submission("independent_E13-B","submission.parquet",independent)
+pred_a=hungarian(finite_scores,groups_a,ids)
+write_submission("E19-F-A","submission_e19_f_a.parquet",pred_a)
+pred_c=hungarian(finite_scores,groups_c,ids)
+write_submission("E19-F-C","submission_e19_f_c.parquet",pred_c)'''
+    output_start = notebook_code.index("submissions={}")
+    output_end = notebook_code.index("run={", output_start)
+    notebook_code = notebook_code[:output_start] + new_outputs + "\n" + notebook_code[output_end:]
     notebook_code = notebook_code.replace("spec.setdefault('config',{})['inference_batch_size']=int(e28['inference_batch_defaults'].get(m['model'],64))",
         "spec.setdefault('config',{})['inference_batch_size']=int(e28['inference_batch_by_checkpoint'].get(m['candidate_id'],e28['inference_batch_defaults'].get(m['model'],32)))")
+    model_sources = []
+    model_map = {
+        "embeddinggemma2": "google/embeddinggemma-2/Transformers/embeddinggemma-2/1",
+        "ministral3_3b": "mistral-ai/ministral-3/Transformers/ministral-3-3b-base-2512/1",
+        "qwen06": "qwen-lm/qwen-3/Transformers/0.6b/1",
+    }
+    for model in sorted({m["model"] for m in members}):
+        if model in model_map:
+            model_sources.append(model_map[model])
     nbf.write(nbf.v4.new_notebook(cells=[
-        nbf.v4.new_markdown_cell("# E30-B — 20-checkpoint E13-B family-max + E19-F grouping\n\nTwo GPU inference workers, frozen deployment artifacts and the shared E13-B score/routing functions. Writes E19-F-C and E19-F-A Hungarian submission files; this notebook is prepared only and is not submitted or run."),
+        nbf.v4.new_markdown_cell(f"# E30-B — {len(members)}-checkpoint E13-B family-max + E19-F grouping\n\nTwo GPU inference workers, frozen deployment artifacts and shared local/Kaggle E13-B scoring functions. Produces the primary independent E13-B submission plus E19-F-A and E19-F-C Hungarian variants."),
         nbf.v4.new_code_cell(notebook_code)],
         metadata={"kernelspec":{"display_name":"Python 3","language":"python","name":"python3"}}), KERNEL / "e30.ipynb")
     source_refs = sorted({DATASET_REF, *[f["dataset_ref"] for m in members for f in m["files"]],
-                          "zodrak/lc3-lc4-checkpoints-v035", "zodrak/zod03-llama-base",
-                          "johnnyhyland/smollm3-3b-base-36l-text"})
-    (KERNEL / "kernel-metadata.json").write_text(json.dumps({"id":KERNEL_REF,"title":"E30-B 20 Checkpoint E13-B with External Hungarian",
+                          "zodrak/e13-b-checkpoints-v001", "zodrak/lc3-lc4-checkpoints-v035"})
+    (KERNEL / "kernel-metadata.json").write_text(json.dumps({"id":KERNEL_REF,"title":f"E30-B {len(members)} Checkpoint E13-B with External Hungarian",
         "code_file":"e30.ipynb","language":"python","kernel_type":"notebook","is_private":True,
         "enable_gpu":True,"enable_tpu":False,"enable_internet":False,
         "keywords":["name-that-llm","E30","Hungarian"],"dataset_sources":source_refs,
         "kernel_sources":[],"competition_sources":["name-that-llm"],
-        "model_sources":["google/embeddinggemma-2/Transformers/embeddinggemma-2/1",
-            "mistral-ai/ministral-3/Transformers/ministral-3-3b-base-2512/1",
-            "qwen-lm/qwen-3/Transformers/0.6b/1"],"machine_shape":"NvidiaTeslaT4"},indent=2)+"\n")
+        "model_sources":model_sources,"machine_shape":"NvidiaTeslaT4"},indent=2)+"\n")
+    # N0082 is a serialized scikit-learn checkpoint. Require the same version
+    # used to create it; Kaggle's differing sklearn version previously emitted
+    # InconsistentVersionWarning and could silently change predictions.
+    safe_json_calls = embed_runtime_preflight(
+        KERNEL,
+        strict_versions=strict_versions,
+        required_distributions=required_distributions,
+        manifest_paths=[LOCAL / "e30_b_manifest.json"],
+    )
+    package_preflight = validate_kernel_package(KERNEL)
     return {"dataset_dir":str(LOCAL),"notebook_dir":str(KERNEL),"dataset_ref":DATASET_REF,
         "kernel_ref":KERNEL_REF,"roster":deployment["roster"],"new_files":len(new_assets),
-        "new_bytes":sum(x["size"] for x in new_assets.values()),"data_sources":source_refs}
+        "new_bytes":sum(x["size"] for x in new_assets.values()),"data_sources":source_refs,
+        "preflight":package_preflight,"runtime_json_calls_wrapped":safe_json_calls}
 
 
 if __name__ == "__main__":

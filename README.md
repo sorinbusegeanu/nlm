@@ -86,6 +86,8 @@ python -m src.pipeline package-kaggle --manifest /path/to/selected_model_manifes
 
 Attach `model_package.zip` and the competition input data as Kaggle input datasets. Open [`notebooks/kaggle_inference.ipynb`](notebooks/kaggle_inference.ipynb), update its input paths, and disable Internet in Kaggle notebook settings. The notebook writes `submission.parquet` using the observed `id,model` schema. Verify the actual competition schema, filenames, memory, and runtime limits before submitting.
 
+For new NLM Kaggle releases, use the shared [Kaggle preflight and submission workflow](docs/kaggle_submission_preflight.md). It checks notebook code, attached Kaggle sources and manifest assets before upload, runs a runtime compatibility gate before inference, and validates exact-version outputs before competition submission.
+
 ## Results and tests
 
 Run tests with `python -m unittest discover -s tests -v`. Neural adapter tests create tiny local models and skip when the optional neural dependencies are absent. Run the dashboard with `streamlit run dashboard/app.py`.
