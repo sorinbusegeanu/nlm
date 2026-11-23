@@ -288,6 +288,8 @@ def _notebook_code():
         "sys.path.insert(0,str(E28ROOT/'runtime')); sys.path.insert(0,str(WORK))")
     code = code.replace("sys.path.insert(0,str(BROOT))",
         "sys.path.insert(0,str(BROOT)); sys.path.insert(0,str(E28ROOT/'runtime'))")
+    code = code.replace('str(RUNTIME)+os.pathsep+env.get("PYTHONPATH","")',
+        'str(WORK)+os.pathsep+env.get("PYTHONPATH","")')
     code = code.replace("WORK=Path('/kaggle/working/e13_b_runtime');", "WORK=Path('/kaggle/working/e28_runtime_root');")
     code = code.replace("BASES= {}", "BASES= {}")
     code = code.replace("WORK=Path('/kaggle/working/e28_runtime_root'); SRC=WORK/'src'; SRC.mkdir(parents=True,exist_ok=True)",

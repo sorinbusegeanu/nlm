@@ -952,8 +952,8 @@
       "primary_local_variant": "E28-D",
       "local_result_source": "artifacts/analysis/e28/local_results.json",
       "kaggle_kernel": "zodrak/e28-e13-b-external-grouping-hungarian",
-      "kaggle_kernel_version": 3,
-      "kaggle_submission_status": "Kernel v3 running after fixing embedded worker-code placeholder"
+      "kaggle_kernel_version": 4,
+      "kaggle_submission_status": "Kernel v4 queued after fixing notebook worker source and PYTHONPATH"
     },
     {
       "id": "E28-A",
@@ -997,7 +997,7 @@
         0.6401816754638089,
         0.7252540146067816
       ],
-      "kernel_version": 3
+      "kernel_version": 4
     },
     {
       "id": "E28-C",
@@ -1025,7 +1025,7 @@
         0.6348326912300434,
         0.7296153972811905
       ],
-      "kernel_version": 3
+      "kernel_version": 4
     },
     {
       "id": "E28-D",
@@ -1248,7 +1248,7 @@
         }
       },
       "v0_exposure_note": "All scenarios reuse V0. These are correlated robustness diagnostics. Full-V0 metrics and global consensus roster are in-sample development diagnostics, not independent validation.",
-      "kaggle_preparation_status": "Local package/notebook prepared; upload and Kaggle run pending.",
+      "kaggle_preparation_status": "E30 checkpoint dataset v001 uploaded; kernel v1 running; three competition submissions pending.",
       "checkpoint_roster": [
         "N0110",
         "N0054",
@@ -1298,7 +1298,9 @@
           "accuracy": 0.6483882919599852,
           "balanced_accuracy": 0.6483271190653742
         }
-      }
+      },
+      "kaggle_kernel": "zodrak/e30-b-17-checkpoint-e13-b-with-external-hungarian",
+      "kaggle_kernel_version": 1
     },
     {
       "id": "E30-A",
@@ -1343,13 +1345,15 @@
       "scenario_max_balanced_accuracy": 0.6876976959679627,
       "v0_exposure_note": "All scenarios reuse official V0 responses. The router was fitted using V0 labels and roster selection was based on V0 prompt-group folds. These are correlated in-sample robustness diagnostics, not independent validation or expected Kaggle performance.",
       "inference_benchmark": "docs/e30_inference_benchmark.md",
-      "kaggle_preparation_status": "Local package and notebook prepared; not yet uploaded or run.",
+      "kaggle_preparation_status": "E30 checkpoint dataset v001 uploaded; kernel v1 running; submissions pending.",
       "scenario_improved_vs_E30_A": null,
       "scenario_regressed_vs_E30_A": null,
       "v0_full_diagnostic": {
         "accuracy": 0.6539459058910708,
         "balanced_accuracy": 0.6538702460850112
-      }
+      },
+      "kaggle_kernel": "zodrak/e30-b-17-checkpoint-e13-b-with-external-hungarian",
+      "kaggle_kernel_version": 1
     },
     {
       "id": "E30-B",
@@ -1396,13 +1400,15 @@
       "scenario_max_balanced_accuracy": 0.709589098057767,
       "v0_exposure_note": "All scenarios reuse official V0 responses. The router was fitted using V0 labels and roster selection was based on V0 prompt-group folds. These are correlated in-sample robustness diagnostics, not independent validation or expected Kaggle performance.",
       "inference_benchmark": "docs/e30_inference_benchmark.md",
-      "kaggle_preparation_status": "Local package and notebook prepared; not yet uploaded or run.",
+      "kaggle_preparation_status": "E30 checkpoint dataset v001 uploaded; kernel v1 running; submissions pending.",
       "scenario_improved_vs_E30_A": 50,
       "scenario_regressed_vs_E30_A": 0,
       "v0_full_diagnostic": {
         "accuracy": 0.6665431641348648,
         "balanced_accuracy": 0.6664678100919711
-      }
+      },
+      "kaggle_kernel": "zodrak/e30-b-17-checkpoint-e13-b-with-external-hungarian",
+      "kaggle_kernel_version": 1
     }
   ],
   "display_catalog_version": "1.0.0",
