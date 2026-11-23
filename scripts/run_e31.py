@@ -158,8 +158,8 @@ def _fixed_scenarios(v0, truth, base_pred, base_scores, new_pred, new_scores,
             "scenarios_regressed": int((new_ba < base_ba).sum()),
             "scenarios_tied": int((new_ba == base_ba).sum()),
             "comparison_totals": {key: int(sum(x["comparison"][key]
-                for x in scenarios_by_id.values())
-                for key in ("corrected", "introduced", "changed", "net_correct"))}}
+                for x in scenarios_by_id.values()))
+                for key in ("corrected", "introduced", "changed", "net_correct")}}
         group_records = [x["grouping_metrics"] for x in scenarios_by_id.values()
                          if x.get("grouping_metrics") is not None]
         if group_records:

@@ -171,6 +171,9 @@ def prepare():
     notebook_code = _notebook_code()
     notebook_code = notebook_code.replace("__WORKER_CODE_LITERAL__", repr(E28_WORKER_CODE))
     notebook_code = notebook_code.replace("'johnnyhyland/smollm3-3b-base-36l-text':'config.json',", "")
+    notebook_code = notebook_code.replace(
+        "('qwen06','qwen-3/transformers/0.6b')]",
+        "('qwen06','qwen-3/transformers/0.6b'),('qwen17','qwen-3/transformers/1.7b-base')]")
     notebook_code = notebook_code.replace("schedule=distribute_checkpoints(members,runtime_by_id,e28[\"inference_batch_defaults\"],n)",
         "schedule=distribute_checkpoints(members,runtime_by_id,e28[\"inference_batch_defaults\"],max(4000,n))")
     notebook_code = notebook_code.replace("spec.setdefault(\"config\",{})[\"inference_batch_size\"]=int(e28[\"inference_batch_defaults\"].get(m[\"model\"],64))",
@@ -293,6 +296,7 @@ write_submission("E19-F-C","submission_e19_f_c.parquet",pred_c)'''
         "embeddinggemma2": "google/embeddinggemma-2/Transformers/embeddinggemma-2/1",
         "ministral3_3b": "mistral-ai/ministral-3/Transformers/ministral-3-3b-base-2512/1",
         "qwen06": "qwen-lm/qwen-3/Transformers/0.6b/1",
+        "qwen17": "qwen-lm/qwen-3/Transformers/1.7b-base/1",
     }
     for model in sorted({m["model"] for m in members}):
         if model in model_map:
