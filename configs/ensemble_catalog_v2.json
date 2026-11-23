@@ -1421,7 +1421,7 @@
       "target_checkpoint_count": 40,
       "checkpoint_count": 40,
       "checkpoints_used": 17,
-      "checkpoint_count_note": "E30-B manifest contains 17 checkpoints; E31 is selecting 23 additions to reach 40.",
+      "checkpoint_count_note": "E30-B manifest contains 17 checkpoints; E31 selects 23 additions for 40 total. Twenty additions would yield 37 total.",
       "training_dataset": "V0-trained E13-B family-max router",
       "validation_dataset": "Prompt-group outer folds and v0_group 50-scenario diagnostics",
       "primary_metric": "Prompt-group out-of-fold balanced accuracy",
@@ -1436,6 +1436,41 @@
       "result_source": "artifacts/analysis/e31/selection_results.json",
       "scenario_count": 50,
       "kaggle_preparation_status": "Local package preparation pending; competition submission disabled."
+    },
+    {
+      "id": "E31-Confusion",
+      "name": "E31-Confusion three-model diagnosis",
+      "category": "E13-B confusion and group-assignment analysis",
+      "description": "Completed diagnosis of GLM-5.3, GLM-5.3-Flash and Claude Fable 5 separability, training-fold disagreement flags, and E28 Hungarian group constraints. Uses cached probabilities and CPU-only lightweight classifiers; V0 and v0_group results are development diagnostics.",
+      "status": "Scored",
+      "target_labels": [
+        "glm-5.3",
+        "glm-5.3-flash",
+        "claude-fable-5"
+      ],
+      "checkpoint_count": 15,
+      "checkpoint_roster": [
+        "N0110",
+        "N0054",
+        "N0008",
+        "N0127",
+        "N0082",
+        "N0065",
+        "N0124",
+        "N0117",
+        "N0133",
+        "N0097",
+        "N0120",
+        "N0033",
+        "N0059",
+        "N0113",
+        "N0071"
+      ],
+      "documentation": "docs/e31_confusion.md",
+      "result_source": "artifacts/analysis/e31_confusion/metrics.json",
+      "validation_dataset": "V0 five prompt-group folds and 50 v0_group scenarios",
+      "primary_metric": "Three-label and whole-dataset balanced accuracy",
+      "v0_exposure_note": "The fixed E13-B roster was historically selected using V0. v0_group reuses V0 rows and is correlated sensitivity analysis, not independent validation."
     }
   ],
   "display_catalog_version": "1.0.0",

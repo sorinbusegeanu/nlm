@@ -509,7 +509,7 @@ def run(root=ROOT, output=OUT):
     pd.DataFrame([{"method": name, "metric": metric, **value}
         for name, obj in scenario_summary.items() for metric, value in obj.items()
         if isinstance(value, dict)]).to_csv(output / "scenario_summary.csv", index=False)
-    result = {"experiment": "E31 Three-Model Confusion Diagnosis", "seed": SEED,
+    result = {"experiment": "E31-Confusion Three-Model Diagnosis", "seed": SEED,
         "cpu_threads": N_THREADS, "target_labels": list(TARGETS), "checkpoint_roster": roster,
         "roster_source": "frozen E13-B v037 deployment manifest; 15 checkpoints fixed in all folds",
         "folds": fold_log, "metrics": {"fixed_roster_router_oof": _metrics(truth, routed, np.arange(18)),
