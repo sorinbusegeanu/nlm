@@ -204,24 +204,6 @@
       "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
     },
     {
-      "id": "E14-C",
-      "name": "LightGBM LambdaRank selector · top 3",
-      "category": "Learned label arbitration",
-      "description": "LambdaRank selector over the top-3 candidate labels.",
-      "accuracy": 0.6369025565024083,
-      "balanced_accuracy": 0.6368332090479741,
-      "primary_metric": "Balanced accuracy",
-      "primary_score": 0.6368332090479741,
-      "status": "Scored",
-      "result_source": "artifacts/analysis/e14/20261120T165435084301Z/results.json",
-      "documentation": "docs/e14.md",
-      "trust_list_version": "trust-list-2-v037",
-      "checkpoints_used": 37,
-      "checkpoint_count": 37,
-      "checkpoints_per_fold": 15,
-      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
-    },
-    {
       "id": "E14-B-GATE",
       "name": "E13-B strongest-competitor intervention gate",
       "category": "Correction gate",
@@ -233,6 +215,24 @@
       "status": "Scored",
       "result_source": "artifacts/analysis/e14_gate/20261120T180106177007Z/results.json",
       "documentation": "docs/e14_gate.md",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoints_used": 37,
+      "checkpoint_count": 37,
+      "checkpoints_per_fold": 15,
+      "checkpoint_count_note": "37 distinct checkpoint IDs across five fold rosters; 15 per fold."
+    },
+    {
+      "id": "E14-C",
+      "name": "LightGBM LambdaRank selector · top 3",
+      "category": "Learned label arbitration",
+      "description": "LambdaRank selector over the top-3 candidate labels.",
+      "accuracy": 0.6369025565024083,
+      "balanced_accuracy": 0.6368332090479741,
+      "primary_metric": "Balanced accuracy",
+      "primary_score": 0.6368332090479741,
+      "status": "Scored",
+      "result_source": "artifacts/analysis/e14/20261120T165435084301Z/results.json",
+      "documentation": "docs/e14.md",
       "trust_list_version": "trust-list-2-v037",
       "checkpoints_used": 37,
       "checkpoint_count": 37,
@@ -518,6 +518,22 @@
       "kaggle_checkpoint_count": 37
     },
     {
+      "id": "E20-D-KFA",
+      "name": "E20-D Kaggle failure analysis",
+      "category": "Evaluation analysis",
+      "description": "Reproduces E20-D packaged V0 scoring; compares OOF and five-model aggregation, true/reconstructed group feature shifts, correctly rebuilt incomplete-group samples, and checkpoint-only ablations. No neural inference or training.",
+      "status": "Scored",
+      "primary_metric": "Balanced accuracy",
+      "documentation": "docs/e20d_kaggle_failure_analysis.md",
+      "result_source": "artifacts/analysis/e20d_kaggle_failure_analysis/metrics.json",
+      "checkpoint_count": 37,
+      "trust_list_version": "trust-list-2-v039",
+      "accuracy": 0.782141533901445,
+      "balanced_accuracy": 0.7820581655480984,
+      "primary_score": 0.7820581655480984,
+      "checkpoints_used": 37
+    },
+    {
       "id": "E21-A",
       "name": "UltraBERT-380M group-aware classifier · λ=0",
       "category": "Group-aware neural classifier",
@@ -800,22 +816,6 @@
       "reconstruction_sample_group_sizes": "1-18"
     },
     {
-      "id": "E20-D-KFA",
-      "name": "E20-D Kaggle failure analysis",
-      "category": "Evaluation analysis",
-      "description": "Reproduces E20-D packaged V0 scoring; compares OOF and five-model aggregation, true/reconstructed group feature shifts, correctly rebuilt incomplete-group samples, and checkpoint-only ablations. No neural inference or training.",
-      "status": "Scored",
-      "primary_metric": "Balanced accuracy",
-      "documentation": "docs/e20d_kaggle_failure_analysis.md",
-      "result_source": "artifacts/analysis/e20d_kaggle_failure_analysis/metrics.json",
-      "checkpoint_count": 37,
-      "trust_list_version": "trust-list-2-v039",
-      "accuracy": 0.782141533901445,
-      "balanced_accuracy": 0.7820581655480984,
-      "primary_score": 0.7820581655480984,
-      "checkpoints_used": 37
-    },
-    {
       "id": "E27-A",
       "name": "Independent classification",
       "category": "External-only ensemble generalization",
@@ -952,8 +952,8 @@
       "primary_local_variant": "E28-D",
       "local_result_source": "artifacts/analysis/e28/local_results.json",
       "kaggle_kernel": "zodrak/e28-e13-b-external-grouping-hungarian",
-      "kaggle_kernel_version": 2,
-      "kaggle_submission_status": "Not submitted; awaiting successful dual-GPU inference"
+      "kaggle_kernel_version": 3,
+      "kaggle_submission_status": "Kernel v3 running after fixing embedded worker-code placeholder"
     },
     {
       "id": "E28-A",
@@ -996,7 +996,8 @@
       "scenario_range_balanced_accuracy": [
         0.6401816754638089,
         0.7252540146067816
-      ]
+      ],
+      "kernel_version": 3
     },
     {
       "id": "E28-C",
@@ -1023,7 +1024,8 @@
       "scenario_range_balanced_accuracy": [
         0.6348326912300434,
         0.7296153972811905
-      ]
+      ],
+      "kernel_version": 3
     },
     {
       "id": "E28-D",
@@ -1172,15 +1174,142 @@
       }
     },
     {
-      "id": "E30-A",
-      "name": "E28 15-checkpoint router + E19-F-C Hungarian",
-      "category": "External grouping with learned checkpoint router",
-      "description": "Fixed roster and router evaluated over 50 randomized incomplete-group scenarios from v0_group; E19-F-C groups rebuilt independently per scenario.",
-      "status": "Scored",
-      "training_dataset": "V0-trained E13-B router; external E19-F-C grouper",
+      "id": "E30",
+      "name": "E13-B v037 15 vs fold-selected 17 checkpoint roster",
+      "category": "E13-B family-max checkpoint router",
+      "description": "Nested prompt-group greedy addition, then five-fold consensus with a positive mean marginal BA requirement; two additions qualified, so the final roster has 17 checkpoints.",
+      "status": "Scored; Kaggle package prepared",
+      "training_dataset": "V0-trained E13-B family-max router",
       "validation_dataset": "v0_group (50 scenarios; V0 rows reused)",
       "primary_metric": "Mean scenario balanced accuracy",
-      "trust_list_version": "trust-list-2-v037",
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoint_count": 17,
+      "checkpoints_used": 17,
+      "documentation": "docs/e30.md",
+      "result_source": "artifacts/analysis/e30/selection/selection_results.json",
+      "inference_benchmark": "docs/e30_inference_benchmark.md",
+      "scenario_count": 50,
+      "primary_variant": "E30-B independent E13-B family-max",
+      "primary_score": 0.6680740105824925,
+      "scenario_results": {
+        "independent": {
+          "E30-A": {
+            "mean_balanced_accuracy": 0.6529968410108391,
+            "std_balanced_accuracy": 0.020619738444598502,
+            "minimum_balanced_accuracy": 0.6058691993187918,
+            "p10_balanced_accuracy": 0.6322243210901624,
+            "maximum_balanced_accuracy": 0.6876976959679627
+          },
+          "E30-B": {
+            "mean_balanced_accuracy": 0.6680740105824925,
+            "std_balanced_accuracy": 0.02010011770730164,
+            "minimum_balanced_accuracy": 0.6250493476782215,
+            "p10_balanced_accuracy": 0.6416759000901298,
+            "maximum_balanced_accuracy": 0.709589098057767,
+            "scenarios_improved_vs_E30-A": 50,
+            "scenarios_regressed_vs_E30-A": 0
+          }
+        },
+        "E19-F-A": {
+          "E30-A": {
+            "mean_balanced_accuracy": 0.6547831190132901,
+            "std_balanced_accuracy": 0.021144718987260547,
+            "minimum_balanced_accuracy": 0.6060218244714171,
+            "p10_balanced_accuracy": 0.6300577803328312,
+            "maximum_balanced_accuracy": 0.6876027670277891
+          },
+          "E30-B": {
+            "mean_balanced_accuracy": 0.6679311463187859,
+            "std_balanced_accuracy": 0.020447868104356358,
+            "minimum_balanced_accuracy": 0.6256309763114426,
+            "p10_balanced_accuracy": 0.6425616270073692,
+            "maximum_balanced_accuracy": 0.7041332800666004,
+            "scenarios_improved_vs_E30-A": 46,
+            "scenarios_regressed_vs_E30-A": 4
+          }
+        },
+        "E19-F-C": {
+          "E30-A": {
+            "mean_balanced_accuracy": 0.657760718722691,
+            "std_balanced_accuracy": 0.020663759189361336,
+            "minimum_balanced_accuracy": 0.6117300051795977,
+            "p10_balanced_accuracy": 0.636211708293126,
+            "maximum_balanced_accuracy": 0.6891088344305957
+          },
+          "E30-B": {
+            "mean_balanced_accuracy": 0.6712704777048064,
+            "std_balanced_accuracy": 0.01988412821355862,
+            "minimum_balanced_accuracy": 0.6271447917141468,
+            "p10_balanced_accuracy": 0.6463609188764609,
+            "maximum_balanced_accuracy": 0.7090984364559942,
+            "scenarios_improved_vs_E30-A": 45,
+            "scenarios_regressed_vs_E30-A": 5
+          }
+        }
+      },
+      "v0_exposure_note": "All scenarios reuse V0. These are correlated robustness diagnostics. Full-V0 metrics and global consensus roster are in-sample development diagnostics, not independent validation.",
+      "kaggle_preparation_status": "Local package/notebook prepared; upload and Kaggle run pending.",
+      "checkpoint_roster": [
+        "N0110",
+        "N0054",
+        "N0008",
+        "N0127",
+        "N0082",
+        "N0065",
+        "N0124",
+        "N0117",
+        "N0133",
+        "N0097",
+        "N0120",
+        "N0033",
+        "N0059",
+        "N0113",
+        "N0071",
+        "N0030",
+        "N0006"
+      ],
+      "selection_rule": "descending selection frequency, ascending mean selection rank, descending mean marginal BA, then checkpoint ID; only positive mean marginal BA candidates are deployable",
+      "qualified_additions": [
+        "N0030",
+        "N0006"
+      ],
+      "fold_local_5_step_oof_metrics": {
+        "0": {
+          "accuracy": 0.6387550944794368,
+          "balanced_accuracy": 0.6386726323639075
+        },
+        "1": {
+          "accuracy": 0.639866617265654,
+          "balanced_accuracy": 0.6397812577678351
+        },
+        "2": {
+          "accuracy": 0.6402371248610597,
+          "balanced_accuracy": 0.6401565995525726
+        },
+        "3": {
+          "accuracy": 0.6454242311967395,
+          "balanced_accuracy": 0.6453442704449417
+        },
+        "4": {
+          "accuracy": 0.6476472767691738,
+          "balanced_accuracy": 0.6475764354958986
+        },
+        "5": {
+          "accuracy": 0.6483882919599852,
+          "balanced_accuracy": 0.6483271190653742
+        }
+      }
+    },
+    {
+      "id": "E30-A",
+      "name": "Frozen E13-B v037 15 checkpoint independent router",
+      "category": "E13-B family-max checkpoint router",
+      "description": "E30-A preserves exact E13-B v037 roster and router.",
+      "status": "Scored",
+      "training_dataset": "V0-trained E13-B family-max router",
+      "validation_dataset": "v0_group (50 scenarios; V0 rows reused)",
+      "primary_metric": "Mean scenario balanced accuracy",
+      "trust_list_version": "trust-list-2-v039",
       "checkpoint_count": 15,
       "checkpoints_used": 15,
       "checkpoint_roster": [
@@ -1200,34 +1329,40 @@
         "N0113",
         "N0071"
       ],
-      "grouping_method": "E19-F-C",
+      "grouping_method": "independent family_max",
       "documentation": "docs/e30.md",
-      "result_source": "artifacts/analysis/e30/evaluation.json",
-      "accuracy": null,
-      "balanced_accuracy": 0.657760718722691,
-      "primary_score": 0.657760718722691,
+      "result_source": "artifacts/analysis/e30/v0_group_evaluation.json",
+      "accuracy": 0.6518,
+      "balanced_accuracy": 0.6529968410108391,
+      "primary_score": 0.6529968410108391,
       "scenario_count": 50,
-      "scenario_mean_balanced_accuracy": 0.657760718722691,
-      "scenario_std_balanced_accuracy": 0.020663759189361336,
-      "scenario_min_balanced_accuracy": 0.6117300051795977,
-      "scenario_p10_balanced_accuracy": 0.636211708293126,
-      "scenario_max_balanced_accuracy": 0.6891088344305957,
-      "v0_exposure_note": "All scenarios reuse official V0 responses. E30-B roster selection and router fitting use V0 labels; results are correlated in-sample robustness diagnostics, not independent validation or expected Kaggle performance.",
+      "scenario_mean_balanced_accuracy": 0.6529968410108391,
+      "scenario_std_balanced_accuracy": 0.020619738444598502,
+      "scenario_min_balanced_accuracy": 0.6058691993187918,
+      "scenario_p10_balanced_accuracy": 0.6322243210901624,
+      "scenario_max_balanced_accuracy": 0.6876976959679627,
+      "v0_exposure_note": "All scenarios reuse official V0 responses. The router was fitted using V0 labels and roster selection was based on V0 prompt-group folds. These are correlated in-sample robustness diagnostics, not independent validation or expected Kaggle performance.",
       "inference_benchmark": "docs/e30_inference_benchmark.md",
-      "kaggle_preparation_status": "Local package and notebook prepared; not uploaded, run, or submitted."
+      "kaggle_preparation_status": "Local package and notebook prepared; not yet uploaded or run.",
+      "scenario_improved_vs_E30_A": null,
+      "scenario_regressed_vs_E30_A": null,
+      "v0_full_diagnostic": {
+        "accuracy": 0.6539459058910708,
+        "balanced_accuracy": 0.6538702460850112
+      }
     },
     {
       "id": "E30-B",
-      "name": "E30 20-checkpoint router + E19-F-C Hungarian",
-      "category": "External grouping with learned checkpoint router",
-      "description": "Fixed roster and router evaluated over 50 randomized incomplete-group scenarios from v0_group; E19-F-C groups rebuilt independently per scenario.",
+      "name": "E30 selected 17 checkpoint independent router",
+      "category": "E13-B family-max checkpoint router",
+      "description": "E30-B keeps the exact frozen 15-checkpoint v037 roster and adds the two checkpoints that passed the fold-consensus positive mean marginal balanced-accuracy rule.",
       "status": "Scored",
-      "training_dataset": "V0-trained E13-B router; external E19-F-C grouper",
+      "training_dataset": "V0-trained E13-B family-max router",
       "validation_dataset": "v0_group (50 scenarios; V0 rows reused)",
       "primary_metric": "Mean scenario balanced accuracy",
-      "trust_list_version": "trust-list-2-v037",
-      "checkpoint_count": 20,
-      "checkpoints_used": 20,
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoint_count": 17,
+      "checkpoints_used": 17,
       "checkpoint_roster": [
         "N0110",
         "N0054",
@@ -1244,90 +1379,30 @@
         "N0059",
         "N0113",
         "N0071",
-        "N0063",
-        "N0131",
-        "N0102",
-        "N0130",
-        "N0129"
+        "N0030",
+        "N0006"
       ],
-      "grouping_method": "E19-F-C",
+      "grouping_method": "independent family_max",
       "documentation": "docs/e30.md",
-      "result_source": "artifacts/analysis/e30/evaluation.json",
-      "accuracy": null,
-      "balanced_accuracy": 0.6619383528728895,
-      "primary_score": 0.6619383528728895,
+      "result_source": "artifacts/analysis/e30/v0_group_evaluation.json",
+      "accuracy": 0.66672,
+      "balanced_accuracy": 0.6680740105824925,
+      "primary_score": 0.6680740105824925,
       "scenario_count": 50,
-      "scenario_mean_balanced_accuracy": 0.6619383528728895,
-      "scenario_std_balanced_accuracy": 0.02060159728095669,
-      "scenario_min_balanced_accuracy": 0.6059774032222754,
-      "scenario_p10_balanced_accuracy": 0.6384887953092285,
-      "scenario_max_balanced_accuracy": 0.7011699855331333,
-      "v0_exposure_note": "All scenarios reuse official V0 responses. E30-B roster selection and router fitting use V0 labels; results are correlated in-sample robustness diagnostics, not independent validation or expected Kaggle performance.",
+      "scenario_mean_balanced_accuracy": 0.6680740105824925,
+      "scenario_std_balanced_accuracy": 0.02010011770730164,
+      "scenario_min_balanced_accuracy": 0.6250493476782215,
+      "scenario_p10_balanced_accuracy": 0.6416759000901298,
+      "scenario_max_balanced_accuracy": 0.709589098057767,
+      "v0_exposure_note": "All scenarios reuse official V0 responses. The router was fitted using V0 labels and roster selection was based on V0 prompt-group folds. These are correlated in-sample robustness diagnostics, not independent validation or expected Kaggle performance.",
       "inference_benchmark": "docs/e30_inference_benchmark.md",
-      "kaggle_preparation_status": "Local package and notebook prepared; not uploaded, run, or submitted."
-    },
-    {
-      "id": "E30",
-      "name": "E28 15 vs E30 20 checkpoint comparison",
-      "category": "External grouping with learned checkpoint router",
-      "description": "Compares exact E28 15-checkpoint deployment (E30-A) against a newly fitted 20-checkpoint E13-B router (E30-B) across 50 randomized incomplete-group scenarios using E19-F-A and E19-F-C.",
-      "status": "Scored; Kaggle package prepared",
-      "training_dataset": "V0-trained E13-B router; external E19-F groupers",
-      "validation_dataset": "v0_group (50 scenarios; V0 rows reused)",
-      "primary_metric": "Mean scenario balanced accuracy",
-      "trust_list_version": "trust-list-2-v037",
-      "checkpoint_count": 20,
-      "checkpoints_used": 20,
-      "documentation": "docs/e30.md",
-      "result_source": "artifacts/analysis/e30/evaluation.json",
-      "inference_benchmark": "docs/e30_inference_benchmark.md",
-      "scenario_count": 50,
-      "primary_variant": "E30-B + E19-F-C",
-      "primary_score": 0.6619383528728895,
-      "scenario_results": {
-        "E19-F-A": {
-          "E30-A": {
-            "mean_balanced_accuracy": 0.6547831190132901,
-            "std_balanced_accuracy": 0.021144718987260547,
-            "minimum_balanced_accuracy": 0.6060218244714171,
-            "p10_balanced_accuracy": 0.6300577803328312,
-            "maximum_balanced_accuracy": 0.6876027670277891,
-            "scenarios_improved_vs_E30-A": null,
-            "scenarios_regressed_vs_E30-A": null
-          },
-          "E30-B": {
-            "mean_balanced_accuracy": 0.6589150232296314,
-            "std_balanced_accuracy": 0.020527976639803026,
-            "minimum_balanced_accuracy": 0.6079665982191332,
-            "p10_balanced_accuracy": 0.6357794882760894,
-            "maximum_balanced_accuracy": 0.6989900522707037,
-            "scenarios_improved_vs_E30-A": 34,
-            "scenarios_regressed_vs_E30-A": 16
-          }
-        },
-        "E19-F-C": {
-          "E30-A": {
-            "mean_balanced_accuracy": 0.657760718722691,
-            "std_balanced_accuracy": 0.020663759189361336,
-            "minimum_balanced_accuracy": 0.6117300051795977,
-            "p10_balanced_accuracy": 0.636211708293126,
-            "maximum_balanced_accuracy": 0.6891088344305957,
-            "scenarios_improved_vs_E30-A": null,
-            "scenarios_regressed_vs_E30-A": null
-          },
-          "E30-B": {
-            "mean_balanced_accuracy": 0.6619383528728895,
-            "std_balanced_accuracy": 0.02060159728095669,
-            "minimum_balanced_accuracy": 0.6059774032222754,
-            "p10_balanced_accuracy": 0.6384887953092285,
-            "maximum_balanced_accuracy": 0.7011699855331333,
-            "scenarios_improved_vs_E30-A": 32,
-            "scenarios_regressed_vs_E30-A": 18
-          }
-        }
-      },
-      "v0_exposure_note": "All scenarios reuse official V0 responses. Roster selection and router fitting use V0 labels; results are correlated in-sample robustness diagnostics, not independent validation or expected Kaggle performance.",
-      "kaggle_preparation_status": "Local 20-checkpoint package and notebook prepared; not uploaded, run, or submitted."
+      "kaggle_preparation_status": "Local package and notebook prepared; not yet uploaded or run.",
+      "scenario_improved_vs_E30_A": 50,
+      "scenario_regressed_vs_E30_A": 0,
+      "v0_full_diagnostic": {
+        "accuracy": 0.6665431641348648,
+        "balanced_accuracy": 0.6664678100919711
+      }
     }
   ],
   "display_catalog_version": "1.0.0",

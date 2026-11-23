@@ -262,6 +262,11 @@ print(json.dumps(run,indent=2),flush=True)
 
 def _notebook_code():
     code = E13_NOTEBOOK
+    # The original single-worker inference import is replaced in the parent
+    # notebook before embedding WORKER_CODE, so this replacement cannot alter
+    # the worker's quoted Python source.
+    code = code.replace("from src.inference import predict_candidate",
+                        "from src.e28_deploy import distribute_checkpoints")
     code = code.replace("__WORKER_CODE_LITERAL__", repr(WORKER_CODE))
     code = code.replace(
         "assert torch.cuda.is_available(), 'Kaggle GPU is required for checkpoint inference'",
@@ -270,7 +275,8 @@ def _notebook_code():
         "LC3=root_for('lc3_lc4_manifest.json'); BROOT=root_for('e13_b_manifest.json')")
     begin = code.index("members=B['members']; classes=B['classes']")
     end = code.index("probs=np.stack(probs)", begin) + len("probs=np.stack(probs)")
-    code = code[:begin] + WORKER_REPLACEMENT + code[end:]
+    replacement = WORKER_REPLACEMENT.replace("__WORKER_CODE_LITERAL__", repr(WORKER_CODE))
+    code = code[:begin] + replacement + code[end:]
     start = code.index("families=np.asarray([m['family'] for m in members]); family_names=sorted(set(families))", begin)
     # Replace the original final scoring and submission block, keeping the
     # packaged feature builder and CatBoost inference above this point.
@@ -283,8 +289,6 @@ def _notebook_code():
     code = code.replace("sys.path.insert(0,str(BROOT))",
         "sys.path.insert(0,str(BROOT)); sys.path.insert(0,str(E28ROOT/'runtime'))")
     code = code.replace("WORK=Path('/kaggle/working/e13_b_runtime');", "WORK=Path('/kaggle/working/e28_runtime_root');")
-    code = code.replace("from src.inference import predict_candidate",
-        "from src.e28_deploy import distribute_checkpoints\nfrom src.inference import predict_candidate")
     code = code.replace("BASES= {}", "BASES= {}")
     code = code.replace("WORK=Path('/kaggle/working/e28_runtime_root'); SRC=WORK/'src'; SRC.mkdir(parents=True,exist_ok=True)",
         "WORK=Path('/kaggle/working/e28_runtime_root'); SRC=WORK/'src'; SRC.mkdir(parents=True,exist_ok=True)")
