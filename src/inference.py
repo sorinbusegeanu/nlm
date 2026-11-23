@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
+import time
 import zipfile
 
 import joblib
@@ -83,6 +84,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                     use_chat_template=False,
                     chat_template_user_prompt="Identify the source model for the assistant response.",
                     return_batch_metadata=False):
+    call_started = time.perf_counter()
     try:
         import torch
         from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
@@ -107,6 +109,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
         from .model_factory import extract_frozen_backbone_features
         bundle = joblib.load(checkpoint / "readout.joblib")
         local_backbone = Path(local_base_model) if local_base_model else checkpoint / "base_model"
+        extraction_started = time.perf_counter()
         features, _ = extract_frozen_backbone_features(
             model_name, base_checkpoint, revision, texts, max_length=max_length,
             batch_size=batch_size, model_dir=local_backbone if local_backbone.is_dir() else None,
@@ -117,6 +120,10 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                 "configured_batch_size": int(batch_size),
                 "effective_batch_size": int(batch_size),
                 "batch_size_note": "frozen feature extraction may reduce internally on OOM",
+                "model_loading_seconds": None,
+                "pure_inference_seconds": time.perf_counter() - extraction_started,
+                "cleanup_seconds": 0.0,
+                "timing_note": "feature extraction API combines backbone load and forward time",
             }
         return aligned, list(classes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -131,6 +138,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     tokenizer_kwargs = {"local_files_only": True, "trust_remote_code": True}
     if fix_mistral_regex:
         tokenizer_kwargs["fix_mistral_regex"] = True
+    load_started = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, **tokenizer_kwargs)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     if model_name in {"ultrabert380", "modernbert_large", "deberta_v3_large", "electra_large", "gte_large", "mpnet_base", "deberta_gemini", "deberta_glm"}:
@@ -205,10 +213,12 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
         network.eval()
     else:
         network.to(device).eval()
+    model_loading_seconds = time.perf_counter() - load_started
     batches=[]; score_batches=[]
     batch_size = max(1, int(batch_size))
     next_batch_size = batch_size
     first_batch_successful_size = None
+    pure_inference_seconds = 0.0
     with torch.inference_mode():
         start = 0
         while start < len(texts):
@@ -226,7 +236,12 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
             try:
                 enc=tokenizer(text_batch,truncation=True,max_length=max_length,padding=True,return_tensors="pt")
                 if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen35_08b", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
-                enc={k:v.to(device) for k,v in enc.items()}; logits=network(**enc)
+                enc={k:v.to(device) for k,v in enc.items()}
+                forward_started = time.perf_counter()
+                logits=network(**enc)
+                if return_batch_metadata and device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                pure_inference_seconds += time.perf_counter() - forward_started
                 if hasattr(logits,"logits"): logits=logits.logits
                 raw_logits = logits.float()
                 score_batches.append(raw_logits.cpu().numpy())
@@ -249,18 +264,37 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
             batches.append(torch.softmax(raw_logits/float(temperature),dim=-1).cpu().numpy())
     matrix=np.concatenate(batches,axis=0) if batches else np.empty((0,len(classes)))
     if matrix.shape != (len(texts),len(classes)) or not np.isfinite(matrix).all(): raise ValueError("neural model returned invalid probabilities")
+    cleanup_started = time.perf_counter()
+    if "enc" in locals(): del enc
+    if "logits" in locals(): del logits
+    if "raw_logits" in locals(): del raw_logits
+    if "text_batch" in locals(): del text_batch
+    del network, tokenizer
+    import gc
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    cleanup_seconds = time.perf_counter() - cleanup_started
     if return_scores:
         raw_scores=np.concatenate(score_batches,axis=0) if score_batches else np.empty((0,len(classes)))
         if return_batch_metadata:
             return matrix, list(classes), raw_scores, {
                 "configured_batch_size": int(batch_size),
                 "effective_batch_size": int(first_batch_successful_size or batch_size),
+                "model_loading_seconds": model_loading_seconds,
+                "pure_inference_seconds": pure_inference_seconds,
+                "cleanup_seconds": cleanup_seconds,
+                "call_total_seconds": time.perf_counter() - call_started,
             }
         return matrix, list(classes), raw_scores
     if return_batch_metadata:
         return matrix, list(classes), {
             "configured_batch_size": int(batch_size),
             "effective_batch_size": int(first_batch_successful_size or batch_size),
+            "model_loading_seconds": model_loading_seconds,
+            "pure_inference_seconds": pure_inference_seconds,
+            "cleanup_seconds": cleanup_seconds,
+            "call_total_seconds": time.perf_counter() - call_started,
         }
     return matrix, list(classes)
 
@@ -370,11 +404,14 @@ def predict_candidate(model_spec, texts, classes, bundle_root, *, return_batch_m
     checkpoint = bundle_root / model_spec["checkpoint"]
     config = model_spec.get("config", {})
     classes = list(classes)
+    call_started = time.perf_counter()
     if model == "svc":
         probabilities, returned_classes = predict_svc_bundle(joblib.load(checkpoint), texts)
+        cpu_seconds = time.perf_counter() - call_started
     elif model == "catboost_stylometry":
         probabilities, returned_classes = predict_catboost_stylometry(checkpoint, texts, classes,
             temperature=model_spec.get("calibration_temperature", 1.0))
+        cpu_seconds = time.perf_counter() - call_started
     else:
         result = _predict_neural(model, checkpoint, texts, classes,
             batch_size=config.get("inference_batch_size", 8),
@@ -402,7 +439,11 @@ def predict_candidate(model_spec, texts, classes, bundle_root, *, return_batch_m
     if return_batch_metadata:
         if model in {"svc", "catboost_stylometry"}:
             batch_metadata = {"configured_batch_size": None, "effective_batch_size": None,
-                              "batch_size_note": "CPU inference; no GPU batch size"}
+                              "batch_size_note": "CPU inference; no GPU batch size",
+                              "model_loading_seconds": None,
+                              "pure_inference_seconds": cpu_seconds,
+                              "cleanup_seconds": 0.0,
+                              "call_total_seconds": cpu_seconds}
         return probabilities, batch_metadata
     return probabilities
 
