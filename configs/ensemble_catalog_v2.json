@@ -944,7 +944,16 @@
       "result_source": "artifacts/analysis/e28/local_results.json",
       "kaggle_baseline_public_score": 0.606,
       "v0_exposure_note": "E13-B v037 roster/router is frozen; V0 is evaluation-only for E28.",
-      "started_at": "2026-11-23"
+      "started_at": "2026-11-23",
+      "accuracy": 0.6465357539829566,
+      "balanced_accuracy": 0.6464653243847874,
+      "local_status": "Local evaluation complete; Kaggle kernel queued",
+      "scenario_count": 50,
+      "primary_local_variant": "E28-D",
+      "local_result_source": "artifacts/analysis/e28/local_results.json",
+      "kaggle_kernel": "zodrak/e28-e13-b-external-grouping-hungarian",
+      "kaggle_kernel_version": 2,
+      "kaggle_submission_status": "Not submitted; awaiting successful dual-GPU inference"
     },
     {
       "id": "E28-A",
@@ -958,8 +967,9 @@
       "documentation": "docs/e28.md",
       "result_source": "artifacts/analysis/e28/local_results.json",
       "kaggle_public_score": 0.606,
-      "accuracy": null,
-      "balanced_accuracy": null
+      "accuracy": 0.6465357539829566,
+      "balanced_accuracy": 0.6464653243847874,
+      "local_status": "Scored"
     },
     {
       "id": "E28-B",
@@ -972,7 +982,21 @@
       "checkpoints_used": 15,
       "grouping_method": "E19-F-C",
       "documentation": "docs/e28.md",
-      "result_source": "artifacts/analysis/e28/local_results.json"
+      "result_source": "artifacts/analysis/e28/local_results.json",
+      "accuracy": 0.7173027047054464,
+      "balanced_accuracy": 0.7172110365398956,
+      "local_status": "Scored",
+      "grouping_pairwise_precision": 0.9916848418756816,
+      "grouping_pairwise_recall": 0.6344568961758165,
+      "corrected": 321,
+      "introduced": 130,
+      "changed": 621,
+      "full_v0_runtime_seconds": 4.611850162036717,
+      "scenario_mean_balanced_accuracy": 0.6855272826367469,
+      "scenario_range_balanced_accuracy": [
+        0.6401816754638089,
+        0.7252540146067816
+      ]
     },
     {
       "id": "E28-C",
@@ -985,20 +1009,48 @@
       "checkpoints_used": 15,
       "grouping_method": "E19-F-A",
       "documentation": "docs/e28.md",
-      "result_source": "artifacts/analysis/e28/local_results.json"
+      "result_source": "artifacts/analysis/e28/local_results.json",
+      "accuracy": 0.7354575768803261,
+      "balanced_accuracy": 0.7353566989808601,
+      "local_status": "Scored",
+      "grouping_pairwise_precision": 0.992609126984127,
+      "grouping_pairwise_recall": 0.8725853573453103,
+      "corrected": 396,
+      "introduced": 156,
+      "changed": 758,
+      "full_v0_runtime_seconds": 3.652990856207907,
+      "scenario_mean_balanced_accuracy": 0.6847734540165118,
+      "scenario_range_balanced_accuracy": [
+        0.6348326912300434,
+        0.7296153972811905
+      ]
     },
     {
       "id": "E28-D",
       "name": "E13-B + E19-D + Hungarian",
       "category": "External grouping with learned checkpoint router",
       "description": "E13-B v037 family-max reliability scores with external E19-D groups and Hungarian assignment; include only if measured Kaggle runtime fits the 9-hour budget.",
-      "status": "Running",
+      "status": "Scored locally; Kaggle package conditional",
       "trust_list_version": "trust-list-2-v037",
       "checkpoint_count": 15,
       "checkpoints_used": 15,
       "grouping_method": "E19-D",
       "documentation": "docs/e28.md",
-      "result_source": "artifacts/analysis/e28/local_results.json"
+      "result_source": "artifacts/analysis/e28/local_results.json",
+      "accuracy": 0.7402741756206003,
+      "balanced_accuracy": 0.7401839423315933,
+      "local_status": "Scored",
+      "grouping_pairwise_precision": 0.9958016012497559,
+      "grouping_pairwise_recall": 0.8894606026250381,
+      "corrected": 399,
+      "introduced": 146,
+      "changed": 755,
+      "full_v0_runtime_seconds": 27.288645381107926,
+      "scenario_mean_balanced_accuracy": 0.6922931378742285,
+      "scenario_range_balanced_accuracy": [
+        0.6457618495867836,
+        0.7381967977590497
+      ]
     },
     {
       "id": "E29-A",

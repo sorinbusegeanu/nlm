@@ -280,6 +280,8 @@ def _notebook_code():
     code = code.replace("RUNTIME=WORK/'src'", "RUNTIME=WORK/'src'")
     code = code.replace("sys.path.insert(0,str(WORK))",
         "sys.path.insert(0,str(E28ROOT/'runtime')); sys.path.insert(0,str(WORK))")
+    code = code.replace("sys.path.insert(0,str(BROOT))",
+        "sys.path.insert(0,str(BROOT)); sys.path.insert(0,str(E28ROOT/'runtime'))")
     code = code.replace("WORK=Path('/kaggle/working/e13_b_runtime');", "WORK=Path('/kaggle/working/e28_runtime_root');")
     code = code.replace("from src.inference import predict_candidate",
         "from src.e28_deploy import distribute_checkpoints\nfrom src.inference import predict_candidate")
