@@ -33,6 +33,30 @@ def test_prompt_split_is_deterministic_and_group_disjoint():
     assert sorted(np.concatenate(list(a.values())).tolist()) == list(range(len(frame)))
 
 
+def test_stratified_prompt_sample_reproducible_and_retains_all_sizes():
+    frame=_fixture()
+    a=e27.stratified_prompt_sample(frame,.8,seed=77)
+    b=e27.stratified_prompt_sample(frame,.8,seed=77)
+    assert a.id.tolist()==b.id.tolist()
+    expected=set(frame.groupby("prompt_canon").model.nunique().unique())
+    assert set(a.groupby("prompt_canon").model.nunique().unique())==expected
+    splits=e27.prompt_disjoint_split(a,seed=77)
+    for rows in splits.values():
+        observed=set(a.iloc[rows].groupby("prompt_canon").model.nunique().unique())
+        assert observed==expected
+
+
+def test_tiny_sample_keeps_each_stratum_in_all_splits():
+    frame=_fixture()
+    sampled=e27.stratified_prompt_sample(frame,.01,seed=5)
+    splits=e27.prompt_disjoint_split(sampled,seed=5)
+    expected=set(frame.groupby("prompt_canon").model.nunique().unique())
+    assert all(set(sampled.iloc[rows].groupby("prompt_canon").model.nunique().unique())==expected
+               for rows in splits.values())
+    prompt_sets=[set(sampled.iloc[rows].prompt_canon) for rows in splits.values()]
+    assert not (prompt_sets[0]&prompt_sets[1] or prompt_sets[0]&prompt_sets[2] or prompt_sets[1]&prompt_sets[2])
+
+
 def test_duplicate_rotation_is_one_per_label_and_covers_each_row_once():
     rotated, stats = e27.rotate_one_per_label(_fixture())
     assert not rotated.duplicated("id").any()

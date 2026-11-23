@@ -372,13 +372,22 @@ def _pair_features(rows, pairs, lexical, embeddings):
     pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
     if not len(pairs):
         return np.empty((0, 3), dtype=np.float32)
+    # Large external corpora can produce millions of nearest-neighbor pairs.
+    # SciPy's CSR fancy-row indexing allocates intermediate nnz arrays using
+    # its sparse index dtype; one enormous operation can overflow that size.
+    # Chunking preserves the feature calculation while bounding each sparse
+    # gather and its temporary allocations.
     local_embeddings = np.asarray(embeddings, dtype=np.float32)[rows]
-    cosine = np.sum(local_embeddings[pairs[:, 0]] * local_embeddings[pairs[:, 1]], axis=1)
-    word = np.asarray(lexical["word"][rows[pairs[:, 0]]].multiply(
-        lexical["word"][rows[pairs[:, 1]]]).sum(axis=1)).reshape(-1)
-    char = np.asarray(lexical["char"][rows[pairs[:, 0]]].multiply(
-        lexical["char"][rows[pairs[:, 1]]]).sum(axis=1)).reshape(-1)
-    return np.column_stack((cosine, word, char)).astype(np.float32)
+    chunks=[]
+    for start in range(0, len(pairs), 100_000):
+        part=pairs[start:start + 100_000]
+        cosine = np.sum(local_embeddings[part[:, 0]] * local_embeddings[part[:, 1]], axis=1)
+        word = np.asarray(lexical["word"][rows[part[:, 0]]].multiply(
+            lexical["word"][rows[part[:, 1]]]).sum(axis=1)).reshape(-1)
+        char = np.asarray(lexical["char"][rows[part[:, 0]]].multiply(
+            lexical["char"][rows[part[:, 1]]]).sum(axis=1)).reshape(-1)
+        chunks.append(np.column_stack((cosine, word, char)).astype(np.float32))
+    return np.concatenate(chunks,axis=0) if len(chunks)>1 else chunks[0]
 
 
 def _training_pairs(rows, pairs, groups):

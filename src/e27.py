@@ -37,6 +37,16 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _reconstruction_sample_paths(output_dir=OUT):
+    manifest=Path(output_dir)/"reconstruction_sample_manifest.json"
+    if not manifest.is_file():
+        raise FileNotFoundError("Prepare the prompt-stratified E27 reconstruction sample first")
+    fraction=float(json.loads(manifest.read_text())["fraction"])
+    tag=f"{int(round(fraction*100)):02d}pct"
+    return (Path(output_dir)/f"external_v214_reconstruction_sample_{tag}.parquet",
+            Path(output_dir)/f"external_v214_reconstruction_rotation_{tag}.parquet")
+
+
 def canonical_external(path: Path) -> pd.DataFrame:
     """Load only V2.14 rows whose prompt identity is verified by prompt_canon."""
     frame = pd.read_parquet(path)
@@ -61,6 +71,27 @@ def prompt_disjoint_split(frame: pd.DataFrame, *, seed=SEED) -> dict[str, np.nda
     """Deterministic approximately 70/15/15 split stratified by group label-count."""
     groups = frame.groupby("prompt_canon", sort=True).agg(
         label_count=("model", "nunique"), n=("id", "size")).reset_index()
+    if int(groups.label_count.value_counts().min()) < 5:
+        # Tiny benchmark samples cannot satisfy sklearn's two-stage
+        # stratification constraints. Allocate at least one whole prompt per
+        # label-count stratum to each split, then distribute the remainder
+        # approximately 70/15/15.
+        rng=np.random.default_rng(int(seed)); assigned={k:set() for k in ("train","validation","test")}
+        for _,part in groups.groupby("label_count",sort=True):
+            ids=part.prompt_canon.astype(str).to_numpy().copy(); rng.shuffle(ids)
+            n=len(ids)
+            if n<3:
+                raise ValueError("Each retained group-size stratum needs at least three prompts for train/validation/test")
+            n_train=min(n-2,max(1,int(round(.70*n))))
+            n_val=min(n-n_train-1,max(1,int(round(.15*n))))
+            assigned["train"].update(ids[:n_train])
+            assigned["validation"].update(ids[n_train:n_train+n_val])
+            assigned["test"].update(ids[n_train+n_val:])
+        row_sets={name:np.flatnonzero(frame.prompt_canon.astype(str).isin(keys).to_numpy())
+                  for name,keys in assigned.items()}
+        if any(not rows.size for rows in row_sets.values()):
+            raise ValueError("Small-sample prompt split produced an empty partition")
+        return row_sets
     # Split prompts, never individual responses. Stratification uses the actual
     # number of distinct canonical labels represented by each prompt.
     strata = groups.label_count.astype(str)
@@ -83,6 +114,25 @@ def prompt_disjoint_split(frame: pd.DataFrame, *, seed=SEED) -> dict[str, np.nda
     if set.intersection(*(assigned[k] for k in assigned)):
         raise ValueError("External prompt split leaked prompt_canon across partitions")
     return row_sets
+
+
+def stratified_prompt_sample(frame: pd.DataFrame, fraction=0.1, seed=SEED):
+    """Sample complete prompt groups while retaining all label-count strata."""
+    fraction=float(fraction)
+    if not 0 < fraction <= 1:
+        raise ValueError("sample fraction must be in (0, 1]")
+    prompt_labels=frame.groupby("prompt_canon",sort=True).model.nunique()
+    rng=np.random.default_rng(int(seed))
+    selected=[]
+    for _, prompt_ids in prompt_labels.groupby(prompt_labels).groups.items():
+        ids=np.asarray(sorted(map(str,prompt_ids)),dtype=object)
+        count=min(len(ids),max(3,int(round(len(ids)*fraction))))
+        selected.extend(rng.choice(ids,size=count,replace=False).tolist())
+    sampled=frame.loc[frame.prompt_canon.isin(set(selected))].copy().reset_index(drop=True)
+    found=set(map(int,sampled.groupby("prompt_canon").model.nunique().unique()))
+    if found != set(map(int,prompt_labels.unique())):
+        raise ValueError("stratified sample lost one or more available group-size strata")
+    return sampled
 
 
 def rotate_one_per_label(frame: pd.DataFrame, rows=None) -> tuple[pd.DataFrame, dict]:
@@ -274,7 +324,8 @@ def reconstruct_external(method, *, root=ROOT, limit=None, batch_size=40):
     """Resumably reconstruct V2.14 prompts with the pinned E19-B or E19-D Qwen."""
     if method not in {"E19-B","E19-D"}:
         raise ValueError("External reconstruction method must be E19-B or E19-D")
-    frame=pd.read_parquet(Path(root)/"artifacts/analysis/e27/external_v214_canonical.parquet")
+    sample_path,_=_reconstruction_sample_paths(Path(root)/"artifacts/analysis/e27")
+    frame=pd.read_parquet(sample_path)
     if limit is not None:
         frame=frame.sort_values("id",kind="stable").head(int(limit)).reset_index(drop=True)
         limit=None
@@ -285,11 +336,30 @@ def reconstruct_external(method, *, root=ROOT, limit=None, batch_size=40):
         model_id=e19d_reconstruct.MODEL_ID; revision=e19d_reconstruct.MODEL_REVISION
         prompt_version=e19d_reconstruct.PROMPT_VERSION
     out=OUT/method.lower(); out.mkdir(parents=True,exist_ok=True)
-    return e19b_reconstruct.reconstruct_rows(row_ids=frame.id.astype(str).to_numpy(),
+    result=e19b_reconstruct.reconstruct_rows(row_ids=frame.id.astype(str).to_numpy(),
         texts=frame.text.fillna("").astype(str).to_numpy(),model_id=model_id,revision=revision,
         cache_path=out/"reconstruction_cache.sqlite3",
         output_path=out/"reconstructed_external.parquet",limit=limit,
         batch_size=batch_size,max_new_tokens=1024,seed=SEED,prompt_version=prompt_version)
+    reconstructed_path=out/"reconstructed_external.parquet"
+    reconstructed=pd.read_parquet(reconstructed_path)
+    failed=reconstructed.status.eq("failed")
+    fallback_text=frame.set_index(frame.id.astype(str)).text.fillna("").astype(str)
+    for idx in reconstructed.index[failed]:
+        row_id=str(reconstructed.at[idx,"id"])
+        reconstructed.at[idx,"reconstructed_prompt"]=fallback_text.loc[row_id]
+        reconstructed.at[idx,"topic"]="response-text fallback after reconstruction failure"
+        reconstructed.at[idx,"distinctive_details"]="[]"
+        reconstructed.at[idx,"constraints"]="[]"
+        reconstructed.at[idx,"status"]="fallback_response"
+    if failed.any():
+        reconstructed.to_parquet(reconstructed_path,index=False)
+        result["fallback_response_rows"]=int(failed.sum())
+        result["fallback_policy"]="use original response text as the reconstructed-prompt feature; retain failed cache status and error"
+        manifest_path=out/"reconstruction_manifest.json"
+        manifest=json.loads(manifest_path.read_text()); manifest.update(result)
+        manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
+    return result
 
 
 def embed_reconstructed_prompts(method):
@@ -297,7 +367,7 @@ def embed_reconstructed_prompts(method):
         raise ValueError("External reconstruction method must be E19-B or E19-D")
     folder=OUT/method.lower()
     frame=pd.read_parquet(folder/"reconstructed_external.parquet")
-    if not frame.status.eq("ok").all():
+    if not frame.status.isin(("ok","fallback_response")).all():
         raise ValueError(f"{method} external reconstructions are incomplete")
     vectors,meta=e19f.encode_response_embeddings(frame.reconstructed_prompt.astype(str).tolist(),
         cache_path=folder/"semantic_embedding_cache.sqlite3",device="auto")
@@ -344,11 +414,12 @@ def run_external_reconstruction_grouper(method, *, root=ROOT, output_dir=OUT):
         raise ValueError("method must be E19-B or E19-D")
     root,output_dir=Path(root).resolve(),Path(output_dir)
     folder=output_dir/method.lower()
-    frame=pd.read_parquet(output_dir/"external_v214_rotation_views.parquet")
+    _,rotation_path=_reconstruction_sample_paths(output_dir)
+    frame=pd.read_parquet(rotation_path)
     recon_frame=pd.read_parquet(folder/"reconstructed_external.parquet")
     recon_meta=json.loads((folder/"semantic_embeddings.json").read_text())
     semantic=np.load(folder/"semantic_embeddings.npy",mmap_mode="r")
-    if not recon_frame.status.eq("ok").all() or recon_frame.id.duplicated().any():
+    if not recon_frame.status.isin(("ok","fallback_response")).all() or recon_frame.id.duplicated().any():
         raise ValueError(f"{method} requires complete, unique external reconstructions")
     recon_pos={sid:i for i,sid in enumerate(recon_frame.id.astype(str))}
     order=np.asarray([recon_pos[sid] for sid in frame.id.astype(str)],dtype=np.int64)
@@ -407,10 +478,11 @@ def run_external_reconstruction_grouper(method, *, root=ROOT, output_dir=OUT):
 
     v0=e22.catalog.cascades._v0(root); v0ids=v0.id.astype(str).to_numpy()
     v0texts=v0.text.fillna("").astype(str).to_numpy()
-    v0recon=pd.read_parquet(root/f"artifacts/analysis/{method.lower()}/reconstructed_prompts.parquet")
+    v0_artifact_name=method.lower().replace("-","")
+    v0recon=pd.read_parquet(root/f"artifacts/analysis/{v0_artifact_name}/reconstructed_prompts.parquet")
     if v0recon.id.astype(str).tolist()!=v0ids.tolist() or not v0recon.status.eq("ok").all():
         raise ValueError(f"{method} saved V0 reconstructions are missing or misaligned")
-    v0sem=np.load(root/f"artifacts/analysis/{method.lower()}/semantic_embeddings.npy")
+    v0sem=np.load(root/f"artifacts/analysis/{v0_artifact_name}/semantic_embeddings.npy")
     v0rec=v0recon.reconstructed_prompt.astype(str).to_numpy()
     v0topic=v0recon.topic.fillna("").astype(str).to_numpy()
     v0detail=[_as_list(x) for x in v0recon.distinctive_details.to_numpy()]
@@ -442,6 +514,7 @@ def run_external_reconstruction_grouper(method, *, root=ROOT, output_dir=OUT):
         "v0":{"independent":e20._metric(y,independent),"group_hungarian":e20._metric(y,assigned),
               "confidence_gated_hungarian":e20._metric(y,gated_assigned),
               "corrected_introduced":e20._comparison(y,independent,assigned),
+              "confidence_gated_comparison_vs_independent":e20._comparison(y,independent,gated_assigned),
               "scenarios":scenario_result}}
     (output_dir/f"{method.lower()}_grouping_results.json").write_text(json.dumps(payload,indent=2)+"\n")
     pd.DataFrame({"id":row_ids,"predicted_group":groups_v0,"confidence":[conf[str(g)] for g in pred]}).to_parquet(
@@ -453,14 +526,21 @@ def finalize(root=ROOT, output_dir=OUT):
     """Collect available external groupers and update the catalog/dashboard."""
     root,output_dir=Path(root).resolve(),Path(output_dir)
     baseline=json.loads((output_dir/"frozen_roster_metrics.json").read_text())
-    methods={}
-    f_path=output_dir/"e19f_grouping_results.json"
-    if f_path.is_file():
-        f=json.loads(f_path.read_text())
-        for method in METHODS:
-            methods[method]={"validation":f["external_validation"][method]["pairwise_metrics"],
-                "test":f["external_test"][method]["pairwise_metrics"],
-                "v0":f["v0"][method]}
+    def read_f_results(path):
+        result={}
+        if path.is_file():
+            payload=json.loads(path.read_text())
+            for method in METHODS:
+                result[method]={"validation":payload["external_validation"][method]["pairwise_metrics"],
+                    "test":payload["external_test"][method]["pairwise_metrics"],
+                    "v0":payload["v0"][method]}
+        return result
+    full_f=read_f_results(output_dir/"e19f_grouping_results.json")
+    sample_path=output_dir/"e19f_grouping_results_01pct.json"
+    sample_f=read_f_results(sample_path)
+    # Compare all grouping families on the same small external split. Preserve
+    # the more precise full-corpus E19-F evaluation separately as context.
+    methods=dict(sample_f or full_f)
     for method in ("E19-B","E19-D"):
         path=output_dir/f"{method.lower()}_grouping_results.json"
         if path.is_file():
@@ -481,18 +561,22 @@ def finalize(root=ROOT, output_dir=OUT):
         "trust_list_sha256":baseline["trust_list_sha256"],"checkpoint_count":89,
         "checkpoints":baseline["checkpoints"],"v0_rows":2699,
         "external_split":json.loads((output_dir/"split_manifest.json").read_text()),
+        "reconstruction_sample":json.loads((output_dir/"reconstruction_sample_manifest.json").read_text())
+            if (output_dir/"reconstruction_sample_manifest.json").is_file() else None,
         "v0_overlap":json.loads((output_dir/"data_quality.json").read_text()),
         "E27-A":{"independent":baseline["family_balanced"]},
         "E27-B":{"oracle_hungarian":baseline["oracle_hungarian"],
                  "scenario_summary":baseline["scenario_summary"],
                  "comparison_vs_independent":oracle_comparison},
         "external_groupers":methods,"selected_grouper":best_method,
+        "external_groupers_full":full_f if sample_f else {},
         "scenario_accuracy_summary":{method:summarize_classification_scenarios(
             data["v0"].get("scenarios",{})) for method,data in methods.items()},
         "E27-C":e27_c,"E27-D":e27_d,
         "E27-C_comparison_vs_independent":best.get("comparison_vs_independent",
             best.get("corrected_introduced")),
-        "E27-D_comparison_vs_independent":best.get("confidence_gated_comparison_vs_independent"),
+        "E27-D_comparison_vs_independent":best.get("confidence_gated_comparison_vs_independent",
+            best.get("corrected_introduced")),
         "pending_groupers":[x for x in ("E19-B","E19-D") if x not in methods],
         "v0_exposure_limitation":"The frozen 89-checkpoint pool has historical V0 selection exposure; no E27 grouping fit or threshold uses V0 labels.",
         "status":"Partial" if set(methods)!={"E19-B","E19-D",*METHODS} else "Scored"}
@@ -501,6 +585,15 @@ def finalize(root=ROOT, output_dir=OUT):
     catalog=json.loads(catalog_path.read_text())
     for entry in catalog["experiments"]:
         eid=entry["id"]
+        if eid=="E27":
+            entry.update(status=metrics["status"],
+                result_source="artifacts/analysis/e27/metrics.json",
+                accuracy=baseline["family_balanced"]["accuracy"],
+                balanced_accuracy=baseline["family_balanced"]["balanced_accuracy"],
+                primary_score=baseline["family_balanced"]["balanced_accuracy"])
+            entry.pop("pending_groupers",None)
+            entry.pop("running_groupers",None)
+            continue
         if eid=="E27-A":
             m=baseline["family_balanced"]
         elif eid=="E27-B":
@@ -519,17 +612,22 @@ def finalize(root=ROOT, output_dir=OUT):
         if eid in {"E27-C","E27-D","E27-E"}:
             entry["selected_grouper"]=best_method
             entry["grouping_validation_pairwise_f1"]=methods[best_method]["validation"]["pairwise_f1"]
-        if eid=="E27":
-            entry.update(status=metrics["status"],result_source="artifacts/analysis/e27/metrics.json",
-                accuracy=baseline["family_balanced"]["accuracy"],
-                balanced_accuracy=baseline["family_balanced"]["balanced_accuracy"],
-                primary_score=baseline["family_balanced"]["balanced_accuracy"])
+        entry.pop("pending_groupers",None)
+        entry.pop("running_groupers",None)
     catalog_path.write_text(json.dumps(catalog,indent=2,ensure_ascii=False)+"\n")
     split_info=metrics["external_split"]
     split_counts={k:int(v["rows"]) for k,v in split_info["splits"].items()}
     available_sizes=sorted(map(int,split_info["group_size_distribution"].keys()))
+    sample_info=metrics.get("reconstruction_sample")
+    sample_split_counts={k:int(v["rows"]) for k,v in sample_info["splits"].items()} if sample_info else {}
+    sample_tag=f"{int(round(sample_info['fraction']*100)):02d}pct" if sample_info else "10pct"
+    sample_fraction=float(sample_info["fraction"]) if sample_info else 0.1
+    sample_note=(f" E19-B/D use a deterministic {sample_info['fraction']:.0%} stratified prompt sample "
+        f"({sample_info['rows']:,} responses, {sample_info['prompt_groups']:,} prompts) with split counts "
+        f"{sample_split_counts}; all group-label-count "
+        "strata 1–18 are represented in every split. This is a small-sample pilot: held-out strata can have only one prompt, so its pairwise metrics are noisy.") if sample_info else ""
     lines=["# E27 — External Grouping and Assignment Validation","",
-        f"E27 freezes the E24 Trust List v039 cache roster (89 checkpoints) and family-balanced scores. The external set contains {split_info['rows']:,} responses across {split_info['prompt_groups']:,} verified `prompt_canon` groups; available distinct-label group sizes are {available_sizes}. Prompt-disjoint split sizes are {split_counts}. V0 labels are used only for final classification metrics. The frozen checkpoint pool has historical V0 selection exposure.","",
+        f"E27 freezes the E24 Trust List v039 cache roster (89 checkpoints) and family-balanced scores. The E19-F external fit/evaluation set contains {split_info['rows']:,} responses across {split_info['prompt_groups']:,} verified `prompt_canon` groups; available distinct-label group sizes are {available_sizes}. Prompt-disjoint split sizes are {split_counts}.{sample_note} V0 labels are used only for final classification metrics. The frozen checkpoint pool has historical V0 selection exposure.","",
         "## Results","",
         "| Variant | Grouper | Accuracy | Balanced accuracy | Corrected | Introduced |",
         "|---|---|---:|---:|---:|---:|"]
@@ -551,6 +649,14 @@ def finalize(root=ROOT, output_dir=OUT):
     for method,data in methods.items():
         m=data["test"]; val=data["validation"]
         lines.append(f"| {method} | {val['pairwise_f1']:.4%} | {m['pairwise_precision']:.4%} | {m['pairwise_recall']:.4%} | {m['pairwise_f1']:.4%} | {m['exact_groups']}/{m['true_group_count']} | {m['split_original_groups']} | {m['incorrectly_merged_groups']} |")
+    lines += ["","All five confidence-gate thresholds selected as 0.0 on external validation, so confidence-gated assignment made no changes; E27-D equals E27-C in this run.",""]
+    if metrics.get("external_groupers_full"):
+        lines += ["## Full-corpus E19-F reference","",
+            "This earlier E19-F pass used all 223,168 canonical external responses (rather than the 1% split used for the cross-grouper table above). Keep its grouping metrics separate from the small-sample comparison.",
+            "","| Grouper | Full-corpus test pair F1 | V0 Hungarian balanced accuracy |","|---|---:|---:|"]
+        for method,data in metrics["external_groupers_full"].items():
+            grouped=data["v0"]["external_group_hungarian"]
+            lines.append(f"| {method} | {data['test']['pairwise_f1']:.4%} | {grouped['balanced_accuracy']:.4%} |")
     lines += ["","## V0 incomplete-group scenarios","",
         "| Grouper | Size range | Mode | Mean accuracy | 10th percentile | Minimum |",
         "|---|---|---|---:|---:|---:|"]
@@ -560,10 +666,11 @@ def finalize(root=ROOT, output_dir=OUT):
             lines.append(f"| {method} | {cap} | {mode} | {record['mean_accuracy']:.4%} | {record['p10_accuracy']:.4%} | {record['minimum_accuracy']:.4%} |")
     lines += ["","## Status and reproducibility","",f"Selected grouper on external validation: **{best_method}**, selected by pairwise F1 with precision tie-break. Completed methods: {', '.join(methods)}. Pending: {', '.join(metrics['pending_groupers']) or 'none'}.","",
         "The independent and oracle 50-scenario baselines, row samples, 89 cache hashes, prompt-disjoint split manifest, response overlap checks, embeddings, method-specific group assignments and metrics are under `artifacts/analysis/e27/`. The first 25 scenarios sample 1–10 distinct-label responses per prompt; the remaining 25 sample 1–18. Their lower-tail accuracy is a robustness diagnostic on the same V0 rows, not independent generalization evidence.","",
+        f"The reduced E19-B/D scope is reproducible from `reconstruction_sample_manifest.json` and the paired `external_v214_reconstruction_sample_{sample_tag}.parquet` / `external_v214_reconstruction_rotation_{sample_tag}.parquet` files. Failed generations are retried; any remaining failures use the original response text as a recorded fallback feature so no sampled row is discarded.","",
         "No E27 grouper or threshold is fit on V0 labels. The V2.14 canonical subset has zero V0 response-ID and normalized-text overlaps. V0 original canonical prompt text is unavailable, so prompt-level cross-pool identity cannot be checked.",""]
     lines += ["## Reproduction commands","",
         "The stages are resumable and use cached embeddings/reconstructions when present:","",
-        "```bash","python -m src.e27 --prepare --freeze-v0","python -m src.e27 --embed-external","python -m src.e27 --run-f-grouping","python -m src.e27 --reconstruct-b","python -m src.e27 --embed-recon E19-B","python -m src.e27 --run-reconstructed-b","python -m src.e27 --reconstruct-d","python -m src.e27 --embed-recon E19-D","python -m src.e27 --run-reconstructed-d","python -m src.e27 --finalize","```","",
+        "```bash","python -m src.e27 --prepare --freeze-v0","python -m src.e27 --embed-external","python -m src.e27 --run-f-grouping",f"python -m src.e27 --prepare-reconstruction-sample --sample-fraction {sample_fraction}","python -m src.e27 --reconstruct-b --reconstruction-batch-size 40","python -m src.e27 --embed-recon E19-B","python -m src.e27 --run-reconstructed-b","python -m src.e27 --reconstruct-d --reconstruction-batch-size 20","python -m src.e27 --embed-recon E19-D","python -m src.e27 --run-reconstructed-d","python -m src.e27 --finalize","```","",
         "E19-B/D reconstruction and embedding stages are intentionally separate so they can be interrupted and resumed independently.",""]
     (root/"docs/e27.md").write_text("\n".join(lines))
     return metrics
@@ -665,19 +772,28 @@ def _confidence_gate(groups, confidence, row_ids, threshold):
     return gated
 
 
-def run_external_f(root=ROOT, output_dir=OUT):
+def run_external_f(root=ROOT, output_dir=OUT, *, reconstruction_sample=False):
     """Fit E19-F A/B/C groupers externally and evaluate V0 assignment."""
     root, output_dir = Path(root).resolve(), Path(output_dir)
-    frame=pd.read_parquet(output_dir/"external_v214_rotation_views.parquet")
-    canonical=pd.read_parquet(output_dir/"external_v214_canonical.parquet")
+    if reconstruction_sample:
+        canonical_path,rotation_path=_reconstruction_sample_paths(output_dir)
+        frame=pd.read_parquet(rotation_path)
+        canonical=pd.read_parquet(canonical_path)
+        full_canonical=pd.read_parquet(output_dir/"external_v214_canonical.parquet")
+        result_suffix=f"_{int(round(json.loads((output_dir/'reconstruction_sample_manifest.json').read_text())['fraction']*100)):02d}pct"
+    else:
+        frame=pd.read_parquet(output_dir/"external_v214_rotation_views.parquet")
+        canonical=pd.read_parquet(output_dir/"external_v214_canonical.parquet")
+        full_canonical=canonical
+        result_suffix=""
     canonical_embeddings=np.load(output_dir/"external_embeddings.npy",mmap_mode="r")
     # The prepared canonical artifact is authoritative. Embeddings were saved
     # in that row order; rotate views are reordered by unique response ID.
     meta=json.loads((output_dir/"external_embeddings.json").read_text())
-    expected=hashlib.sha256("\n".join(canonical.id.astype(str)).encode()).hexdigest()
+    expected=hashlib.sha256("\n".join(full_canonical.id.astype(str)).encode()).hexdigest()
     if meta.get("ids_sha256")!=expected:
         raise ValueError("E27 embedding manifest is not aligned to prepared canonical V2.14 rows")
-    canonical_positions={value:i for i,value in enumerate(canonical.id.astype(str))}
+    canonical_positions={value:i for i,value in enumerate(full_canonical.id.astype(str))}
     embeddings=canonical_embeddings[np.asarray([canonical_positions[x]
         for x in frame.id.astype(str)],dtype=np.int64)]
     if embeddings.shape[0]!=len(frame) or frame.id.duplicated().any():
@@ -739,7 +855,7 @@ def run_external_f(root=ROOT, output_dir=OUT):
         test[method]={"pair_rows":len(test_pairs),"pairwise_metrics":e19b_evaluate.grouping_metrics(groups[test_rows],pred)}
         assignment=pd.DataFrame({"id":ids[test_rows],"true_prompt_canon":groups[test_rows],
                                  "predicted_group":pred,"confidence":[conf[str(g)] for g in pred]})
-        assignment.to_parquet(output_dir/f"external_test_{method}.parquet",index=False)
+        assignment.to_parquet(output_dir/f"external_test_{method}{result_suffix}.parquet",index=False)
 
     # Refit the learned pair model on train+validation groups; keep validation
     # thresholds frozen. The pair feature definitions are unchanged at V0.
@@ -799,12 +915,13 @@ def run_external_f(root=ROOT, output_dir=OUT):
                  for n,v in sampled.items()}),"selected_parameters":settings}
         pd.DataFrame({"id":row_ids,"predicted_group":full_groups,
             "group_confidence":confidence_by_row}).to_parquet(
-                output_dir/f"v0_groups_{method}.parquet",index=False)
+        output_dir/f"v0_groups_{method}{result_suffix}.parquet",index=False)
     payload={"external_validation":validation,"external_test":test,
         "selected_parameters":chosen,"v0":v0_results,
         "v0_embedding":embed_meta,"candidate_method":"exact batched embedding cosine top-40; word and character cosine retained as E19-F-C pair features",
         "frozen_checkpoint_count":89,"trust_list_version":"trust-list-2-v039"}
-    (output_dir/"e19f_grouping_results.json").write_text(json.dumps(payload,indent=2)+"\n")
+    result_name=f"e19f_grouping_results{result_suffix}.json"
+    (output_dir/result_name).write_text(json.dumps(payload,indent=2)+"\n")
     return payload
 
 
@@ -823,6 +940,11 @@ def main(argv=None):
                         help="resumably encode all canonical V2.14 responses")
     parser.add_argument("--run-f-grouping", action="store_true",
                         help="fit E19-F-A/B/C on external prompts and evaluate V0 assignment")
+    parser.add_argument("--run-f-grouping-sample",action="store_true",
+                        help="run E19-F on the same small prompt sample as E19-B/D")
+    parser.add_argument("--prepare-reconstruction-sample", action="store_true",
+                        help="prepare a prompt-stratified subset for slower E19-B/D reconstruction")
+    parser.add_argument("--sample-fraction",type=float,default=0.1)
     parser.add_argument("--reconstruct-b", action="store_true")
     parser.add_argument("--reconstruct-d", action="store_true")
     parser.add_argument("--reconstruction-limit", type=int)
@@ -880,6 +1002,36 @@ def main(argv=None):
         print(json.dumps({"external_test":{k:v["pairwise_metrics"] for k,v in result["external_test"].items()},
                           "v0_balanced_accuracy":{k:v["external_group_hungarian"]["balanced_accuracy"]
                                                   for k,v in result["v0"].items()}},indent=2))
+    if args.run_f_grouping_sample:
+        result=run_external_f(args.root,reconstruction_sample=True)
+        print(json.dumps({"external_test":{k:v["pairwise_metrics"] for k,v in result["external_test"].items()},
+                          "v0_balanced_accuracy":{k:v["external_group_hungarian"]["balanced_accuracy"]
+                                                  for k,v in result["v0"].items()}},indent=2))
+    if args.prepare_reconstruction_sample:
+        sample=stratified_prompt_sample(frame,args.sample_fraction,SEED)
+        split=prompt_disjoint_split(sample)
+        split_names=np.empty(len(sample),dtype=object)
+        for name,rows in split.items(): split_names[rows]=name
+        sample["split"]=split_names
+        group_split=sample.drop_duplicates("prompt_canon").set_index("prompt_canon").split.to_dict()
+        rotation,rotation_stats=rotate_one_per_label(sample)
+        rotation["split"]=rotation.prompt_canon.map(group_split)
+        tag=f"{int(round(float(args.sample_fraction)*100)):02d}pct"
+        sample_path=OUT/f"external_v214_reconstruction_sample_{tag}.parquet"
+        rotation_path=OUT/f"external_v214_reconstruction_rotation_{tag}.parquet"
+        sample.to_parquet(sample_path,index=False); rotation.to_parquet(rotation_path,index=False)
+        manifest={"source":"external_v214_canonical.parquet","source_sha256":sha256(OUT/"external_v214_canonical.parquet"),
+            "fraction":float(args.sample_fraction),"seed":SEED,"rows":len(sample),
+            "prompt_groups":int(sample.prompt_canon.nunique()),"group_label_count":
+            sample.groupby("prompt_canon").model.nunique().value_counts().sort_index().to_dict(),
+            "splits":{},"rotation":rotation_stats,"canonical_path":str(sample_path),
+            "rotation_path":str(rotation_path)}
+        for name,rows in split.items():
+            part=sample.iloc[rows]
+            manifest["splits"][name]={"rows":len(part),"prompts":int(part.prompt_canon.nunique()),
+                "group_label_count":part.groupby("prompt_canon").model.nunique().value_counts().sort_index().to_dict()}
+        (OUT/"reconstruction_sample_manifest.json").write_text(json.dumps(manifest,indent=2,default=int)+"\n")
+        print(json.dumps(manifest,indent=2,default=int))
     if args.reconstruct_b or args.reconstruct_d:
         for method,enabled in (("E19-B",args.reconstruct_b),("E19-D",args.reconstruct_d)):
             if enabled: print(json.dumps(reconstruct_external(method,root=args.root,
