@@ -927,6 +927,131 @@
       "reconstruction_sample_rows": 2080,
       "reconstruction_sample_prompts": 361,
       "reconstruction_sample_group_sizes": "1-18"
+    },
+    {
+      "id": "E28",
+      "name": "E13-B v037 with external grouping and Hungarian assignment",
+      "category": "External grouping with learned checkpoint router",
+      "description": "Freeze the E13-B v037 15-checkpoint family-max CatBoost router and score matrix; apply externally trained E19 groupers followed by per-group Hungarian assignment.",
+      "status": "Running",
+      "training_dataset": "V2.14 prompt groups (external grouping only)",
+      "validation_dataset": "v0",
+      "primary_metric": "Balanced accuracy",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoint_count": 15,
+      "checkpoints_used": 15,
+      "documentation": "docs/e28.md",
+      "result_source": "artifacts/analysis/e28/local_results.json",
+      "kaggle_baseline_public_score": 0.606,
+      "v0_exposure_note": "E13-B v037 roster/router is frozen; V0 is evaluation-only for E28.",
+      "started_at": "2026-11-23"
+    },
+    {
+      "id": "E28-A",
+      "name": "E13-B v037 independent baseline",
+      "category": "External grouping with learned checkpoint router",
+      "description": "Original E13-B prediction path, unchanged; baseline only, no duplicate Kaggle submission.",
+      "status": "Scored",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoint_count": 15,
+      "checkpoints_used": 15,
+      "documentation": "docs/e28.md",
+      "result_source": "artifacts/analysis/e28/local_results.json",
+      "kaggle_public_score": 0.606,
+      "accuracy": null,
+      "balanced_accuracy": null
+    },
+    {
+      "id": "E28-B",
+      "name": "E13-B + E19-F-C + Hungarian",
+      "category": "External grouping with learned checkpoint router",
+      "description": "E13-B v037 family-max reliability scores with external E19-F-C groups and Hungarian assignment.",
+      "status": "Running",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoint_count": 15,
+      "checkpoints_used": 15,
+      "grouping_method": "E19-F-C",
+      "documentation": "docs/e28.md",
+      "result_source": "artifacts/analysis/e28/local_results.json"
+    },
+    {
+      "id": "E28-C",
+      "name": "E13-B + E19-F-A + Hungarian",
+      "category": "External grouping with learned checkpoint router",
+      "description": "E13-B v037 family-max reliability scores with external E19-F-A groups and Hungarian assignment.",
+      "status": "Running",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoint_count": 15,
+      "checkpoints_used": 15,
+      "grouping_method": "E19-F-A",
+      "documentation": "docs/e28.md",
+      "result_source": "artifacts/analysis/e28/local_results.json"
+    },
+    {
+      "id": "E28-D",
+      "name": "E13-B + E19-D + Hungarian",
+      "category": "External grouping with learned checkpoint router",
+      "description": "E13-B v037 family-max reliability scores with external E19-D groups and Hungarian assignment; include only if measured Kaggle runtime fits the 9-hour budget.",
+      "status": "Running",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoint_count": 15,
+      "checkpoints_used": 15,
+      "grouping_method": "E19-D",
+      "documentation": "docs/e28.md",
+      "result_source": "artifacts/analysis/e28/local_results.json"
+    },
+    {
+      "id": "E29-A",
+      "name": "E25 checkpoint pruning stability on randomized V0 groups",
+      "category": "Checkpoint pruning robustness",
+      "description": "Replay E25 checkpoint removals and roster budgets on 50 randomized incomplete-group scenarios from V0, using saved checkpoint probabilities and fold classifiers; evaluation-only sensitivity analysis.",
+      "status": "Scored",
+      "training_dataset": "E25 saved E22-B fold classifiers (no new fitting)",
+      "validation_dataset": "v0_group (50 correlated scenarios from V0)",
+      "primary_metric": "Mean scenario balanced accuracy (E22-B 89, frozen E19-D)",
+      "trust_list_version": "trust-list-2-v039",
+      "checkpoint_count": 89,
+      "checkpoints_used": 89,
+      "documentation": "docs/e29a.md",
+      "result_source": "artifacts/analysis/e29a/metrics.json",
+      "v0_exposure_note": "All 50 scenarios reuse V0 responses. Scores are correlated sensitivity results, not independent validation and were not used to select a deployment roster.",
+      "accuracy": 0.83736,
+      "balanced_accuracy": 0.837760960012,
+      "primary_score": 0.837760960012,
+      "scenario_count": 50,
+      "checkpoint_count_note": "E22-B baseline uses all 89 checkpoints; E25 budget and checkpoint/cluster removal results are in docs/e29a.md.",
+      "mean_scenario_results": {
+        "E22-B-89": {
+          "independent_ba": 0.776862,
+          "true_group_hungarian_ba": 0.841866,
+          "frozen_E19D_subset_hungarian_ba": 0.837761
+        },
+        "E25-60": {
+          "independent_ba": 0.693374,
+          "true_group_hungarian_ba": 0.764593,
+          "frozen_E19D_subset_hungarian_ba": 0.760382
+        },
+        "E25-40": {
+          "independent_ba": 0.653808,
+          "true_group_hungarian_ba": 0.711111,
+          "frozen_E19D_subset_hungarian_ba": 0.706565
+        },
+        "E25-30": {
+          "independent_ba": 0.632378,
+          "true_group_hungarian_ba": 0.694234,
+          "frozen_E19D_subset_hungarian_ba": 0.689393
+        },
+        "E25-25": {
+          "independent_ba": 0.635206,
+          "true_group_hungarian_ba": 0.691421,
+          "frozen_E19D_subset_hungarian_ba": 0.689554
+        },
+        "E25-20": {
+          "independent_ba": 0.63444,
+          "true_group_hungarian_ba": 0.698467,
+          "frozen_E19D_subset_hungarian_ba": 0.695607
+        }
+      }
     }
   ],
   "display_catalog_version": "1.0.0",
