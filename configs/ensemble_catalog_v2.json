@@ -1053,6 +1053,72 @@
       ]
     },
     {
+      "id": "E28-E",
+      "name": "E13-B fixed deployment roster + external Hungarian",
+      "category": "External grouping with learned checkpoint router",
+      "description": "Replay the packaged E13-B v037 CatBoost router with its exact fixed 15-checkpoint roster; compare E19-F-C, E19-F-A and E19-D grouping with Hungarian assignment.",
+      "status": "Scored (fixed deployment replay)",
+      "trust_list_version": "trust-list-2-v037",
+      "checkpoint_count": 15,
+      "checkpoints_used": 15,
+      "checkpoint_roster": [
+        "N0110",
+        "N0054",
+        "N0008",
+        "N0127",
+        "N0082",
+        "N0065",
+        "N0124",
+        "N0117",
+        "N0133",
+        "N0097",
+        "N0120",
+        "N0033",
+        "N0059",
+        "N0113",
+        "N0071"
+      ],
+      "accuracy": 0.7736198592071137,
+      "balanced_accuracy": 0.7735321899080289,
+      "primary_variant": "E19-D + Hungarian",
+      "baseline_accuracy": 0.6539459058910708,
+      "baseline_balanced_accuracy": 0.6538702460850112,
+      "kaggle_baseline_public_score": 0.606,
+      "scenario_mean_balanced_accuracy": 0.7064728002811058,
+      "scenario_balanced_accuracy_range": [
+        0.6617717693394561,
+        0.7522918851104989
+      ],
+      "scenario_count": 50,
+      "result_source": "artifacts/analysis/e28_fixed_roster/results.json",
+      "documentation": "docs/e28.md",
+      "script": "scripts/run_e28_fixed_roster.py",
+      "evaluation_note": "Frozen packaged router and reliability statistics were fit using V0 development data; this is a deployment replay, not an untouched holdout estimate.",
+      "grouping_variants": {
+        "E19-F-C": {
+          "accuracy": 0.7450907743608745,
+          "balanced_accuracy": 0.7450086999751429,
+          "corrected": 348,
+          "introduced": 102,
+          "changed": 620
+        },
+        "E19-F-A": {
+          "accuracy": 0.7713968136346795,
+          "balanced_accuracy": 0.771307481978623,
+          "corrected": 453,
+          "introduced": 136,
+          "changed": 767
+        },
+        "E19-D": {
+          "accuracy": 0.7736198592071137,
+          "balanced_accuracy": 0.7735321899080289,
+          "corrected": 453,
+          "introduced": 130,
+          "changed": 768
+        }
+      }
+    },
+    {
       "id": "E29-A",
       "name": "E25 checkpoint pruning stability on randomized V0 groups",
       "category": "Checkpoint pruning robustness",
