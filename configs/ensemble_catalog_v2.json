@@ -1471,6 +1471,201 @@
       "validation_dataset": "V0 five prompt-group folds and 50 v0_group scenarios",
       "primary_metric": "Three-label and whole-dataset balanced accuracy",
       "v0_exposure_note": "The fixed E13-B roster was historically selected using V0. v0_group reuses V0 rows and is correlated sensitivity analysis, not independent validation."
+    },
+    {
+      "id": "E32",
+      "name": "E31 fixed 40-checkpoint roster expanded to 60",
+      "category": "E13-B family-max checkpoint router",
+      "description": "Preserve E31\u2019s fixed 40-checkpoint roster, add 20 checkpoints using the E31 prompt-disjoint greedy selection procedure, fit one fixed 60-checkpoint CatBoost router, evaluate four prediction modes on the same 50 v0_group scenarios, and benchmark 4,000-row inference locally.",
+      "status": "Scored",
+      "baseline_experiment": "E31",
+      "baseline_checkpoint_count": 40,
+      "target_checkpoint_count": 60,
+      "checkpoint_count": 60,
+      "checkpoints_used": 60,
+      "training_dataset": "V0-trained E13-B family-max router",
+      "validation_dataset": "Five prompt-group folds and 50 v0_group scenarios (V0 rows reused)",
+      "primary_metric": "Mean E19-D Hungarian balanced accuracy across 50 v0_group scenarios",
+      "trust_list_version": "trust-list-2-v037",
+      "selection_folds": 5,
+      "selection_inner_folds": 4,
+      "current_stage": "Complete",
+      "progress_source": "artifacts/analysis/e32/e32_manifest.json",
+      "documentation": "docs/e32.md",
+      "inference_benchmark": "docs/e32_inference_benchmark.md",
+      "result_source": "artifacts/analysis/e32/e32_manifest.json",
+      "scenario_count": 50,
+      "v0_exposure_note": "All 50 scenarios reuse V0 responses. Treat results as correlated robustness diagnostics, not independent validation.",
+      "primary_variant": "E32 60-checkpoint E13-B router + E19-D Hungarian",
+      "primary_score": 0.742414112989787,
+      "balanced_accuracy": 0.742414112989787,
+      "scenario_results": {
+        "Independent": {
+          "E31-40": {
+            "mean_balanced_accuracy": 0.6828343200444782
+          },
+          "E32-60": {
+            "mean_balanced_accuracy": 0.6787283620231787,
+            "minimum_balanced_accuracy": 0.6382622355283335,
+            "p10_balanced_accuracy": 0.6514679475856638,
+            "maximum_balanced_accuracy": 0.7200642224297936,
+            "std_balanced_accuracy": 0.0207142520963213,
+            "scenarios_improved_vs_E31_40": 14,
+            "scenarios_regressed_vs_E31_40": 36
+          }
+        },
+        "E19-F-A": {
+          "E31-40": {
+            "mean_balanced_accuracy": 0.7141790513826567
+          },
+          "E32-60": {
+            "mean_balanced_accuracy": 0.7091502406609215,
+            "minimum_balanced_accuracy": 0.6413091113489412,
+            "p10_balanced_accuracy": 0.6598083750274841,
+            "maximum_balanced_accuracy": 0.7759540955420365,
+            "std_balanced_accuracy": 0.03943165858316972,
+            "scenarios_improved_vs_E31_40": 13,
+            "scenarios_regressed_vs_E31_40": 37
+          }
+        },
+        "E19-F-C": {
+          "E31-40": {
+            "mean_balanced_accuracy": 0.7139331430869603
+          },
+          "E32-60": {
+            "mean_balanced_accuracy": 0.708831602557882,
+            "minimum_balanced_accuracy": 0.6452379781810339,
+            "p10_balanced_accuracy": 0.6642979475959475,
+            "maximum_balanced_accuracy": 0.7735993983453653,
+            "std_balanced_accuracy": 0.03651758994052309,
+            "scenarios_improved_vs_E31_40": 15,
+            "scenarios_regressed_vs_E31_40": 35
+          }
+        },
+        "E19-D": {
+          "E31-40": {
+            "mean_balanced_accuracy": 0.7466713879236394
+          },
+          "E32-60": {
+            "mean_balanced_accuracy": 0.742414112989787,
+            "minimum_balanced_accuracy": 0.7019053695861259,
+            "p10_balanced_accuracy": 0.7187273668191054,
+            "maximum_balanced_accuracy": 0.7781097734307756,
+            "std_balanced_accuracy": 0.01849178579789637,
+            "scenarios_improved_vs_E31_40": 20,
+            "scenarios_regressed_vs_E31_40": 30
+          }
+        }
+      },
+      "added_checkpoint_ids": [
+        "N0048",
+        "N0104",
+        "N0035",
+        "N0007",
+        "N0029",
+        "N0036",
+        "N0101",
+        "N0083",
+        "N0046",
+        "N0038",
+        "N0093",
+        "N0039",
+        "N0070",
+        "N0121",
+        "N0085",
+        "N0032",
+        "N0005",
+        "N0034",
+        "N0115",
+        "N0116"
+      ],
+      "inference_benchmark_local_seconds": {
+        "40": 1587.0605697820429,
+        "60": 1931.2495124530979
+      },
+      "kaggle_estimated_seconds": {
+        "40": 815.3122693803161,
+        "60": 985.4632707361598
+      }
+    },
+    {
+      "id": "E32-GR-OR16",
+      "name": "V2.GR.OR16 five-model training suite",
+      "category": "Supervised classifiers",
+      "description": "Sequentially train SVC, CatBoost + Stylometry, MPNet-base, EmbeddingGemma 2 and Granite 4.0 350M on the external-only V2.GR.OR16 dataset after successful E32 completion; select checkpoints using full-V0 balanced accuracy.",
+      "status": "Running",
+      "baseline_experiment": "E32",
+      "training_dataset": "v2.GR.OR16",
+      "training_dataset_rows": 231036,
+      "training_dataset_sha256": "9373bbd85f03de1f384cb8ae3b6f9b2b27d576629b8fcf0ab344d966fa266a0a",
+      "validation_dataset": "v0 (all 2,699 rows)",
+      "primary_metric": "V0 balanced accuracy; best checkpoint per model",
+      "current_stage": "running",
+      "progress_source": "artifacts/training_queues/e32_gr_or16_models_20261124T022231Z/queue.json",
+      "documentation": "docs/e32_gr_or16_training.md",
+      "queue_id": "e32_gr_or16_models_20261124T022231Z",
+      "job_order": [
+        "svc",
+        "catboost_stylometry",
+        "mpnet_base",
+        "embeddinggemma2",
+        "granite4_350m"
+      ],
+      "checkpoint_selection": "highest validation balanced accuracy",
+      "e32_dependency": "artifacts/analysis/e32/e32_manifest.json",
+      "job_results": [
+        {
+          "index": 1,
+          "model": "svc",
+          "status": "completed",
+          "experiment_id": "svc_v2.GR.OR16_valv0_data5cf9c6ef_split421e6ba8_seed2026_cfg66dc1893_code996b0b9",
+          "training_duration_seconds": 658.697996718809,
+          "queue_wall_seconds": 675.32,
+          "validation_balanced_accuracy": 0.4693214019388516,
+          "selected_checkpoint": "artifacts/runs/svc_v2.GR.OR16_valv0_data5cf9c6ef_split421e6ba8_seed2026_cfg66dc1893_code996b0b9/checkpoints/svc_foldvalidation.joblib"
+        },
+        {
+          "index": 2,
+          "model": "catboost_stylometry",
+          "status": "completed",
+          "experiment_id": "catboost_stylometry_v2.GR.OR16_valv0_data5cf9c6ef_split421e6ba8_seed2026_cfga1d56f56_code996b0b9",
+          "training_duration_seconds": 1.091445880010724,
+          "queue_wall_seconds": 279.43,
+          "validation_balanced_accuracy": 0.1711533681332339,
+          "selected_checkpoint": "artifacts/runs/catboost_stylometry_v2.GR.OR16_valv0_data5cf9c6ef_split421e6ba8_seed2026_cfga1d56f56_code996b0b9/checkpoints/catboost_stylometry_foldvalidation"
+        },
+        {
+          "index": 3,
+          "model": "mpnet_base",
+          "status": "completed",
+          "experiment_id": "mpnet_base_v2.GR.OR16_valv0_data5cf9c6ef_split421e6ba8_seed2026_cfg4d404e9a_code996b0b9",
+          "training_duration_seconds": 3537.275174647104,
+          "queue_wall_seconds": 3599.17,
+          "validation_balanced_accuracy": 0.4867909520258513,
+          "selected_checkpoint": "artifacts/runs/mpnet_base_v2.GR.OR16_valv0_data5cf9c6ef_split421e6ba8_seed2026_cfg4d404e9a_code996b0b9/checkpoints/mpnet_base_foldvalidation"
+        },
+        {
+          "index": 4,
+          "model": "embeddinggemma2",
+          "status": "running",
+          "experiment_id": null,
+          "training_duration_seconds": null,
+          "queue_wall_seconds": null,
+          "validation_balanced_accuracy": null,
+          "selected_checkpoint": null
+        },
+        {
+          "index": 5,
+          "model": "granite4_350m",
+          "status": "queued",
+          "experiment_id": null,
+          "training_duration_seconds": null,
+          "queue_wall_seconds": null,
+          "validation_balanced_accuracy": null,
+          "selected_checkpoint": null
+        }
+      ],
+      "updated_at_utc": "2026-11-24T03:38:25+00:00"
     }
   ],
   "display_catalog_version": "1.0.0",

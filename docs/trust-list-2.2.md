@@ -1,8 +1,8 @@
 # Trust List 2.2
 
-Version: `trust-list-2.2-v0013`. This list contains checkpoint-label scores only for checkpoints whose recorded training dataset is a V2.x dataset.
+Version: `trust-list-2.2-v0016`. This list contains checkpoint-label scores only for checkpoints whose recorded training dataset is a V2.x dataset.
 
-Source: [trust-list-2-v039](../docs/trust-list-2-v039.csv) (90 checkpoints, 1,620 rows).
+Source: [trust-list-2-v042](../docs/trust-list-2-v042.csv) (93 checkpoints, 1,674 rows).
 Validation: 2,699 full V0 rows; SHA-256 `40a22ce8d88c5f46feb4637a099db815bef5f713ffe53e89dbe1b7b21de77707`.
 
 The source Trust List 2 files remain unchanged. The dashboard reads the Trust List 2.2 latest pointer and does not display Trust List 1 or the general Trust List 2.
@@ -29,5 +29,5 @@ The source Trust List 2 files remain unchanged. The dashboard reads the Trust Li
 - Included checkpoints: 32
 - Checkpoint-label rows: 576
 - Rule-eligible rows: 565
-- Excluded checkpoints: 58
+- Excluded checkpoints: 61
 - Precision, recall, and support values are copied from Trust List 2; the existing eligibility threshold and sort order are reapplied.

@@ -2,6 +2,31 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import PurePosixPath
+
+
+def ensure_binary_logistic_predict_proba_compat(estimator):
+    """Restore the legacy sklearn attribute needed by 1.6 binary predict_proba.
+
+    E19-F-C's fitted binary LogisticRegression was serialized under sklearn
+    1.9, where ``multi_class`` is no longer stored. Kaggle's offline image uses
+    sklearn 1.6 and still reads that attribute. ``auto`` is the legacy default
+    for the binary estimator and preserves its fitted probability behavior.
+    """
+    if (type(estimator).__name__ == "LogisticRegression"
+            and not hasattr(estimator, "multi_class")):
+        estimator.multi_class = "auto"
+    return estimator
+
+
+def checkpoint_bundle_relative_path(checkpoint_relative_path):
+    """Resolve catalog checkpoint paths beneath the inference bundle root."""
+    relative = PurePosixPath(str(checkpoint_relative_path))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"checkpoint path must be bundle-relative: {checkpoint_relative_path!r}")
+    if relative.parts and relative.parts[0] == "checkpoints":
+        return relative.as_posix()
+    return (PurePosixPath("checkpoints") / relative).as_posix()
 
 
 def estimated_seconds(checkpoint, runtime_by_id, batch_by_model, rows):

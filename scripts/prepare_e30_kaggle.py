@@ -164,6 +164,9 @@ def prepare():
                                     for r in bench["checkpoints"]}
     e28_package["runtime_by_id"]["__sample_rows__"] = int(bench["sample_rows"])
     e28_package["checkpoint_runtime_by_id"] = e28_package["runtime_by_id"]
+    e28_package["grouping_artifact"] = {"dataset_ref": DATASET_REF,
+        "flat_filename": "e19_f_c_external_grouper.joblib",
+        "size": (LOCAL / "e19_f_c_external_grouper.joblib").stat().st_size}
     from src.e28_deploy import distribute_checkpoints
     balanced_schedule = distribute_checkpoints(members, e28_package["runtime_by_id"],
         e28_package["inference_batch_by_checkpoint"], int(bench["sample_rows"]))
@@ -325,7 +328,7 @@ write_submission("E19-F-C","submission_e19_f_c.parquet",pred_c)'''
         KERNEL,
         strict_versions=strict_versions,
         required_distributions=required_distributions,
-        manifest_paths=[LOCAL / "e30_b_manifest.json"],
+        manifest_paths=[LOCAL / "e30_b_manifest.json", LOCAL / "e28_manifest.json"],
     )
     package_preflight = validate_kernel_package(KERNEL)
     return {"dataset_dir":str(LOCAL),"notebook_dir":str(KERNEL),"dataset_ref":DATASET_REF,

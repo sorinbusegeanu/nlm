@@ -9,7 +9,10 @@ from __future__ import annotations
 import argparse
 import ast
 import builtins
+import hashlib
 import importlib.metadata
+import io
+import inspect
 import json
 import os
 import re
@@ -17,10 +20,13 @@ import subprocess
 import sys
 import symtable
 import tempfile
+import tokenize
 from pathlib import Path
 from typing import Any
 
 import nbformat
+
+from src.sklearn_compat import patch_serialized_sklearn_estimators
 
 
 class PreflightError(RuntimeError):
@@ -68,6 +74,37 @@ def _strip_magics(source: str) -> tuple[str, list[str]]:
         else:
             output.append(line)
     return "\n".join(output), skipped
+
+
+def _rewrite_json_calls(source: str, aliases: set[str]) -> tuple[str, int]:
+    """Rewrite executable json.dump(s) calls without touching strings/comments."""
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+
+    def absolute(position: tuple[int, int]) -> int:
+        row, column = position
+        return offsets[row - 1] + column
+
+    ignored = {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+               tokenize.COMMENT, tokenize.ENCODING, tokenize.ENDMARKER}
+    tokens = [tok for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+              if tok.type not in ignored]
+    replacements: list[tuple[int, int, str]] = []
+    for i in range(len(tokens) - 3):
+        name, dot, method, opening = tokens[i:i + 4]
+        if (name.type == tokenize.NAME and name.string in aliases
+                and dot.type == tokenize.OP and dot.string == "."
+                and method.type == tokenize.NAME and method.string in {"dump", "dumps"}
+                and opening.type == tokenize.OP and opening.string == "("):
+            if i and tokens[i - 1].type == tokenize.OP and tokens[i - 1].string == ".":
+                continue
+            helper = "kaggle_json_dump" if method.string == "dump" else "kaggle_json_dumps"
+            replacements.append((absolute(name.start), absolute(method.end), helper))
+    for start, end, value in reversed(replacements):
+        source = source[:start] + value + source[end:]
+    return source, len(replacements)
 
 
 def notebook_code_issues(notebook: nbformat.NotebookNode) -> list[str]:
@@ -124,6 +161,75 @@ def notebook_code_issues(notebook: nbformat.NotebookNode) -> list[str]:
     return issues
 
 
+def _validate_embedded_worker_import(root: Path, metadata: dict[str, Any], notebook: nbformat.NotebookNode) -> dict[str, str] | None:
+    """Exercise an embedded dual-GPU worker's exact pinned inference import.
+
+    This catches package-name shadowing by another mounted ``src`` package,
+    which notebook compilation alone cannot detect.
+    """
+    source = "\n\n".join(_strip_magics(cell)[0] for cell in _code_cells(notebook))
+    module = ast.parse(source)
+    worker = None
+    for node in ast.walk(module):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "WORKER_CODE"
+                for target in node.targets):
+            try:
+                worker = ast.literal_eval(node.value)
+            except Exception as exc:
+                raise PreflightError(f"embedded WORKER_CODE is not a literal string: {exc}") from exc
+            break
+    if worker is None:
+        return None
+    if not isinstance(worker, str):
+        raise PreflightError("embedded WORKER_CODE is not a string")
+    compile(worker, "<embedded-worker>", "exec")
+    import_at = worker.find("from src.inference import predict_candidate")
+    pin_at = worker.find("sys.path.insert(0,str(runtime_root))")
+    env_at = worker.find('Path(os.environ["NLM_INFERENCE_RUNTIME"])')
+    if min(import_at, pin_at, env_at) < 0 or not (env_at < pin_at < import_at):
+        raise PreflightError("embedded GPU worker does not pin NLM_INFERENCE_RUNTIME before importing src.inference")
+    refs = metadata.get("dataset_sources", [])
+    runtime = None
+    for ref in refs:
+        slug = str(ref).split("/")[-1]
+        local_slugs = [slug, slug.replace("external-groupers", "groupers")]
+        for local_slug in local_slugs:
+            candidate = root.parent / local_slug / "runtime"
+            if (candidate / "src" / "inference.py").is_file():
+                runtime = candidate.resolve()
+                break
+        if runtime is not None:
+            break
+    if runtime is None:
+        raise PreflightError("embedded GPU worker has no locally packaged runtime/src/inference.py to validate")
+    # Execute the worker's exact import prologue in a clean interpreter while
+    # an intentionally incompatible src package shadows it on PYTHONPATH.
+    prologue_end = worker.find("tasks_path,out_dir,text_path,classes_path,go_path,ready_path=sys.argv[1:]")
+    if prologue_end < 0:
+        raise PreflightError("embedded GPU worker prologue boundary was not found")
+    prologue = worker[:prologue_end]
+    code = prologue + "\nprint('__NLM_INFERENCE_FILE__='+str(actual_inference))\n"
+    with tempfile.TemporaryDirectory(prefix="kaggle-worker-preflight-") as temp:
+        shadow = Path(temp)
+        (shadow / "src").mkdir()
+        (shadow / "src" / "__init__.py").write_text("")
+        (shadow / "src" / "inference.py").write_text("def predict_candidate(*args): return None\\n")
+        env = os.environ.copy()
+        env.update({"NLM_INFERENCE_RUNTIME": str(runtime), "PYTHONPATH": str(shadow)})
+        result = subprocess.run([sys.executable, "-c", code], cwd=shadow, env=env,
+                                text=True, capture_output=True, timeout=60)
+        if result.returncode:
+            raise PreflightError("embedded worker import smoke test failed: " +
+                                 (result.stderr.strip() or result.stdout.strip()))
+        marker = next((line for line in result.stdout.splitlines()
+                       if line.startswith("__NLM_INFERENCE_FILE__=")), None)
+        expected = (runtime / "src" / "inference.py").resolve()
+        if marker != f"__NLM_INFERENCE_FILE__={expected}":
+            raise PreflightError(f"embedded worker imported the wrong inference module: {marker!r}")
+    return {"runtime": str(runtime), "import_contract": "PASS", "shadow_package_test": "PASS"}
+
+
 def validate_kernel_package(kernel_dir: str | Path) -> dict[str, Any]:
     root = Path(kernel_dir)
     metadata_path = root / "kernel-metadata.json"
@@ -171,6 +277,7 @@ def validate_kernel_package(kernel_dir: str | Path) -> dict[str, Any]:
         except Exception as exc:
             raise PreflightError(f"invalid strict JSON file {path.relative_to(root)}: {exc}") from exc
         json_files.append(path.relative_to(root).as_posix())
+    worker_import = _validate_embedded_worker_import(root, metadata, notebook)
     return {
         "kernel_ref": metadata["id"],
         "code_file": metadata["code_file"],
@@ -178,6 +285,7 @@ def validate_kernel_package(kernel_dir: str | Path) -> dict[str, Any]:
         "dataset_sources": len(datasets),
         "model_sources": len(models),
         "json_files_checked": len(json_files),
+        "worker_import": worker_import,
         "status": "PASS",
     }
 
@@ -223,6 +331,57 @@ def _collect_dataset_assets(
         except Exception:
             continue
     return sorted(assets.values(), key=lambda x: (x["dataset_ref"], x["filename"]))
+
+
+def _audit_local_sklearn_artifacts(
+    kernel_dir: Path,
+    assets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Load available packaged joblib assets before upload and exercise repairs."""
+    joblib_assets = [asset for asset in assets
+                     if str(asset.get("filename", "")).lower().endswith(".joblib")]
+    if not joblib_assets:
+        return []
+
+    local_by_name: dict[str, list[Path]] = {}
+    for path in kernel_dir.parent.rglob("*.joblib"):
+        if any(part in {".git", ".venv", "venv"} for part in path.parts):
+            continue
+        local_by_name.setdefault(path.name, []).append(path)
+
+    import warnings
+
+    import joblib
+
+    records = []
+    for asset in joblib_assets:
+        name = Path(asset["filename"]).name
+        candidates = local_by_name.get(name, [])
+        if asset.get("size") is not None:
+            candidates = [path for path in candidates if path.stat().st_size == int(asset["size"])]
+        if not candidates:
+            records.append({"filename": name, "dataset_ref": asset["dataset_ref"],
+                            "local_asset": "not available; remote runtime preflight required"})
+            continue
+        duplicate_paths = []
+        if len(candidates) > 1:
+            digests = {hashlib.sha256(path.read_bytes()).hexdigest() for path in candidates}
+            if len(digests) > 1:
+                raise PreflightError(f"ambiguous local sklearn artifact {name} has different contents: {candidates}")
+            duplicate_paths = [str(path) for path in sorted(candidates)[1:]]
+        path = sorted(candidates)[0]
+        try:
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                estimator_bundle = joblib.load(path)
+            audit = patch_serialized_sklearn_estimators(estimator_bundle)
+        except Exception as exc:
+            raise PreflightError(f"local sklearn artifact preflight failed for {path}: {type(exc).__name__}: {exc}") from exc
+        records.append({"filename": name, "dataset_ref": asset["dataset_ref"],
+                        "local_path": str(path),
+                        "identical_duplicate_paths": duplicate_paths,
+                        "warnings": [str(warning.message) for warning in captured], **audit})
+    return records
 
 
 def validate_remote_sources(kernel_dir: str | Path) -> dict[str, Any]:
@@ -284,10 +443,11 @@ def validate_remote_sources(kernel_dir: str | Path) -> dict[str, Any]:
 
 def runtime_preflight_code(spec: dict[str, Any]) -> str:
     literal = json.dumps(to_json_safe(spec), ensure_ascii=True, separators=(",", ":"))
-    return f'''# Generated by scripts/kaggle_preflight.py. Runs before any model inference.
+    code = f'''# Generated by scripts/kaggle_preflight.py. Runs before any model inference.
 import importlib.metadata as _kpm, json as _kpjson, os as _kpos, sys as _kpsys
 from pathlib import Path as _KP
 _KAGGLE_PREFLIGHT_SPEC = _kpjson.loads({literal!r})
+# __KAGGLE_SKLEARN_COMPAT_HELPER__
 def _kp_to_json_safe(_obj):
     if _obj is None or isinstance(_obj,(str,bool,int)): return _obj
     if isinstance(_obj,float):
@@ -301,8 +461,26 @@ def _kp_to_json_safe(_obj):
     raise TypeError(f"Object of type {{type(_obj).__name__}} is not JSON serializable")
 def kaggle_json_dumps(_obj,*_args,**_kwargs): return _kpjson.dumps(_kp_to_json_safe(_obj),*_args,**_kwargs)
 def kaggle_json_dump(_obj,_file,*_args,**_kwargs): return _kpjson.dump(_kp_to_json_safe(_obj),_file,*_args,**_kwargs)
-_kp_errors=[]; _kp_report={{"python":_kpsys.version,"packages":{{}},"dataset_mounts":{{}},"model_mounts":{{}}}}
-_kp_input=_KP("/kaggle/input")
+_kp_errors=[]; _kp_report={{"python":_kpsys.version,"packages":{{}},"dataset_mounts":{{}},"model_mounts":{{}},"sklearn_artifacts":[],"local_sklearn_artifact_audit":_KAGGLE_PREFLIGHT_SPEC.get("local_sklearn_artifact_audit",[])}}
+_kp_joblib_assets=[_a for _a in _KAGGLE_PREFLIGHT_SPEC.get("required_dataset_files",[]) if str(_a.get("filename","")).lower().endswith(".joblib")]
+if _kp_joblib_assets:
+    import warnings as _kpwarnings, joblib as _kpjoblib
+    _kp_original_joblib_load=_kpjoblib.load
+    _kp_joblib_cache={{}}
+    def _kp_compatible_joblib_load(_file,*_args,**_kwargs):
+        try: _key=str(_KP(_file).resolve())
+        except (TypeError,OSError): _key=None
+        if _key is not None and _key in _kp_joblib_cache: return _kp_joblib_cache[_key]
+        with _kpwarnings.catch_warnings(record=True) as _caught:
+            _kpwarnings.simplefilter("always")
+            _obj=_kp_original_joblib_load(_file,*_args,**_kwargs)
+        _audit=patch_serialized_sklearn_estimators(_obj)
+        _record={{"path":str(_file),"warnings":[str(_w.message) for _w in _caught],**_audit}}
+        _kp_report["sklearn_artifacts"].append(_record)
+        if _key is not None: _kp_joblib_cache[_key]=_obj
+        return _obj
+    _kpjoblib.load=_kp_compatible_joblib_load
+_kp_input=_KP(_kpos.environ.get("NLM_KAGGLE_INPUT_DIR","/kaggle/input"))
 if not _kp_input.is_dir(): _kp_errors.append("/kaggle/input is missing")
 for _pkg,_expected in _KAGGLE_PREFLIGHT_SPEC.get("strict_versions",{{}}).items():
     try: _actual=_kpm.version(_pkg)
@@ -323,21 +501,34 @@ for _ref in _KAGGLE_PREFLIGHT_SPEC.get("dataset_sources",[]):
             except Exception: pass
     if _found is None: _kp_errors.append(f"dataset source is not mounted: {{_ref}}")
     else: _kp_report["dataset_mounts"][_ref]=str(_found)
-_kp_asset_index={{}}
+_kp_asset_index={{}}; _kp_asset_paths={{}}
 for _ref,_root in _kp_report["dataset_mounts"].items():
-    _files={{}}
+    _files={{}}; _paths={{}}
     for _dir,_subdirs,_names in _kpos.walk(_root):
         for _name in _names:
             _p=_KP(_dir)/_name
-            try: _files.setdefault(_name,[]).append(_p.stat().st_size)
+            try:
+                _files.setdefault(_name,[]).append(_p.stat().st_size)
+                _paths.setdefault(_name,[]).append(_p)
             except OSError: pass
     _kp_asset_index[_ref]=_files
+    _kp_asset_paths[_ref]=_paths
 for _asset in _KAGGLE_PREFLIGHT_SPEC.get("required_dataset_files",[]):
     _ref=_asset["dataset_ref"]; _name=_KP(_asset["filename"]).name
     _sizes=_kp_asset_index.get(_ref,{{}}).get(_name,[])
     if not _sizes: _kp_errors.append(f"required checkpoint/input asset is missing: {{_ref}}/{{_name}}")
     elif _asset.get("size") is not None and int(_asset["size"]) not in _sizes:
         _kp_errors.append(f"asset size mismatch: {{_ref}}/{{_name}} expected {{_asset['size']}}, found {{_sizes}}")
+for _asset in _kp_joblib_assets:
+    _ref=_asset["dataset_ref"]; _name=_KP(_asset["filename"]).name
+    _candidates=list(_kp_asset_paths.get(_ref,{{}}).get(_name,[]))
+    if _asset.get("size") is not None:
+        _candidates=[_p for _p in _candidates if _p.stat().st_size==int(_asset["size"])]
+    if len(_candidates)!=1:
+        _kp_errors.append(f"scikit-learn artifact preflight expected one matching file for {{_ref}}/{{_name}}, found {{len(_candidates)}}")
+        continue
+    try: _kpjoblib.load(_candidates[0])
+    except Exception as _exc: _kp_errors.append(f"scikit-learn artifact preflight failed for {{_candidates[0]}}: {{type(_exc).__name__}}: {{_exc}}")
 for _ref in _KAGGLE_PREFLIGHT_SPEC.get("model_sources",[]):
     _parts=_ref.split("/"); _owner,_model,_framework,_instance,_version=_parts
     _path=_kp_input/"models"/_owner/_model/_framework.lower()/_instance/_version
@@ -361,11 +552,15 @@ if not _kp_errors and _KAGGLE_PREFLIGHT_SPEC.get("model_sources"):
                 _kp_report["model_configs"][_ref]["processor"]="ok"
     except Exception as _exc: _kp_errors.append(f"model config/tokenizer/processor compatibility check failed: {{type(_exc).__name__}}: {{_exc}}")
 _kp_report["status"]="FAIL" if _kp_errors else "PASS"; _kp_report["errors"]=_kp_errors
-_kp_out=_KP("/kaggle/working/kaggle_preflight.json")
+_kp_out=_KP(_kpos.environ.get("NLM_KAGGLE_WORKING_DIR","/kaggle/working"))/"kaggle_preflight.json"
 _kp_out.parent.mkdir(parents=True,exist_ok=True); _kp_out.write_text(_kpjson.dumps(_kp_report,indent=2)+"\\n")
 print("KAGGLE_PREFLIGHT",_kpjson.dumps(_kp_report,sort_keys=True))
 if _kp_errors: raise RuntimeError("Kaggle preflight failed before inference: "+"; ".join(_kp_errors))
 '''
+    return code.replace(
+        "# __KAGGLE_SKLEARN_COMPAT_HELPER__",
+        inspect.getsource(patch_serialized_sklearn_estimators).rstrip(),
+    )
 
 
 def embed_runtime_preflight(
@@ -383,14 +578,17 @@ def embed_runtime_preflight(
     notebook = nbformat.read(code_path, as_version=4)
     notebook.cells = [c for c in notebook.cells if "kaggle-preflight" not in c.metadata.get("tags", [])]
     insert_at = 1 if notebook.cells and notebook.cells[0].cell_type == "markdown" else 0
+    required_dataset_files = _collect_dataset_assets(
+        root, set(metadata.get("dataset_sources", [])), manifest_paths=manifest_paths)
+    local_sklearn_audit = _audit_local_sklearn_artifacts(root, required_dataset_files)
     spec = {
         "dataset_sources": metadata.get("dataset_sources", []),
         "model_sources": metadata.get("model_sources", []),
         "strict_versions": strict_versions or {},
         "required_distributions": required_distributions or [],
         "processor_sources": processor_sources or [],
-        "required_dataset_files": _collect_dataset_assets(
-            root, set(metadata.get("dataset_sources", [])), manifest_paths=manifest_paths),
+        "required_dataset_files": required_dataset_files,
+        "local_sklearn_artifact_audit": local_sklearn_audit,
     }
     write_json(root / "kaggle-preflight.json", spec)
     cell = nbformat.v4.new_code_cell(runtime_preflight_code(spec))
@@ -414,12 +612,8 @@ def embed_runtime_preflight(
     for code_cell in notebook.cells:
         if code_cell.cell_type != "code" or "kaggle-preflight" in code_cell.metadata.get("tags", []):
             continue
-        source = code_cell.source
-        for alias in sorted(json_aliases, key=len, reverse=True):
-            source, n_dumps = re.subn(rf"\b{re.escape(alias)}\.dumps\s*\(", "kaggle_json_dumps(", source)
-            source, n_dump = re.subn(rf"\b{re.escape(alias)}\.dump\s*\(", "kaggle_json_dump(", source)
-            rewritten += n_dumps + n_dump
-        code_cell.source = source
+        code_cell.source, count = _rewrite_json_calls(code_cell.source, json_aliases)
+        rewritten += count
     nbformat.validate(notebook)
     nbformat.write(notebook, code_path)
     return rewritten
@@ -469,6 +663,11 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     if not isinstance(labels, list):
         raise PreflightError("labels JSON must be a list or contain classes/labels")
     expected = _read_expected_ids(Path(args.expected_ids))
+    if any(name != "submission.parquet" for name in args.file):
+        raise PreflightError(
+            "Kaggle code submissions in this repository must use the canonical output filename "
+            "submission.parquet; package the selected variant under that name before submitting"
+        )
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     versioned_ref = f"{args.kernel.rstrip('/')}/{args.version}"

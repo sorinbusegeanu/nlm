@@ -29,8 +29,25 @@ OUT = E31 / "inference_benchmark.json"
 def _member(sid, table):
     row = table.loc[sid]
     exp = row.experiment_id
-    _, checkpoint = resolve_checkpoint(exp)
-    run = json.loads((ROOT / "artifacts/predictions" / f"{exp}_manifest.json").read_text())
+    try:
+        _, checkpoint = resolve_checkpoint(exp)
+    except FileNotFoundError:
+        # Some Trust List 2 entries, notably CatBoost two-stage checkpoints,
+        # keep their run manifest beside the checkpoint rather than under
+        # artifacts/predictions. The exported checkpoint_path is authoritative.
+        checkpoint = Path(row.checkpoint_path)
+        if not checkpoint.is_absolute():
+            checkpoint = ROOT / checkpoint
+        if not checkpoint.exists():
+            raise FileNotFoundError(f"Trust List checkpoint path missing for {sid}: {checkpoint}")
+    prediction_manifest = ROOT / "artifacts/predictions" / f"{exp}_manifest.json"
+    if prediction_manifest.is_file():
+        run = json.loads(prediction_manifest.read_text())
+    else:
+        run_manifest = checkpoint.parent / f"{exp}_manifest.json"
+        if not run_manifest.is_file():
+            run_manifest = checkpoint / "checkpoint_manifest.json"
+        run = json.loads(run_manifest.read_text()) if run_manifest.is_file() else {}
     return {"model": row.model, "experiment_id": exp, "config": run.get("config", {}),
             "model_revision": run.get("model_revision"),
             "calibration_temperature": run.get("calibration_temperature", 1.0)}, checkpoint
@@ -147,6 +164,14 @@ def main():
         "sample_policy": "Same deterministic 4,000-row sample used for E30: stratified across 50 v0_group scenarios by label and length bucket.",
         "roster": roster, "reused_E30_individual_measurements": sorted(set(roster) & set(reusable)),
         "checkpoints": []}
+    if OUT.is_file():
+        previous = json.loads(OUT.read_text())
+        if (previous.get("roster") == roster
+                and previous.get("sample_row_ids_sha256") == result["sample_row_ids_sha256"]
+                and previous.get("sample_text_sha256") == result["sample_text_sha256"]):
+            for record in previous.get("checkpoints", []):
+                if record.get("status") == "ok":
+                    measured[record["checkpoint_id"]] = record
     OUT.parent.mkdir(parents=True, exist_ok=True)
     for sid in roster:
         if sid in measured:

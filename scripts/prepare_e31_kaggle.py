@@ -7,9 +7,10 @@ from pathlib import Path
 import nbformat as nbf
 from huggingface_hub import snapshot_download
 
-from scripts.publish_kaggle_checkpoint_store import ROOT, build_checkpoint, sha256_file
+from scripts.publish_kaggle_checkpoint_store import ROOT, build_checkpoint, inference_files, sha256_file
 from scripts.prepare_e12_2_kaggle import _asset_ref, _remote_assets
 from scripts.prepare_e28_kaggle import _notebook_code, WORKER_CODE as E28_WORKER_CODE
+from scripts.kaggle_preflight import embed_runtime_preflight, validate_kernel_package
 
 LOCAL = ROOT / "artifacts/kaggle/e31-checkpoints-v001"
 KERNEL = ROOT / "artifacts/kaggle/e31-kernel"
@@ -69,10 +70,23 @@ def prepare():
         else:
             row = trust[sid]
             exp = row["experiment_id"]
-            local = build_checkpoint(exp)
-            pred = json.loads((ROOT / "artifacts/predictions" / f"{exp}_manifest.json").read_text())
             cp_path = Path(row["checkpoint_path"])
             if not cp_path.is_absolute(): cp_path = ROOT / cp_path
+            prediction_manifest = ROOT / "artifacts/predictions" / f"{exp}_manifest.json"
+            if prediction_manifest.is_file():
+                pred = json.loads(prediction_manifest.read_text())
+                local = build_checkpoint(exp)
+            else:
+                # Trust List 2 can include a checkpoint whose run manifest is
+                # stored beside its model payload (for example two-stage
+                # CatBoost), with no artifacts/predictions manifest.
+                run_manifest = cp_path.parent / f"{exp}_manifest.json"
+                if not run_manifest.is_file() or not cp_path.exists():
+                    raise FileNotFoundError(
+                        f"Cannot package {sid}: missing prediction and checkpoint-side manifests "
+                        f"for {exp} ({run_manifest})")
+                pred = json.loads(run_manifest.read_text())
+                local = {"files": inference_files(cp_path, row["model"])}
             member = {"candidate_id": sid, "experiment_id": exp, "model": row["model"],
                 "family": deployment["families"][deployment["roster"].index(sid)],
                 "config": pred.get("config", {}), "model_revision": pred.get("model_revision"),
@@ -155,6 +169,9 @@ def prepare():
                                     for r in bench["checkpoints"]}
     e28_package["runtime_by_id"]["__sample_rows__"] = int(bench["sample_rows"])
     e28_package["checkpoint_runtime_by_id"] = e28_package["runtime_by_id"]
+    e28_package["grouping_artifact"] = {"dataset_ref": DATASET_REF,
+        "flat_filename": "e19_f_c_external_grouper.joblib",
+        "size": (LOCAL / "e19_f_c_external_grouper.joblib").stat().st_size}
     from src.e28_deploy import distribute_checkpoints
     balanced_schedule = distribute_checkpoints(members, e28_package["runtime_by_id"],
         e28_package["inference_batch_by_checkpoint"], int(bench["sample_rows"]))
@@ -307,15 +324,19 @@ write_submission("E19-F-C","submission_e19_f_c.parquet",pred_c)'''
         metadata={"kernelspec":{"display_name":"Python 3","language":"python","name":"python3"}}), KERNEL / "e31.ipynb")
     source_refs = sorted({DATASET_REF, *[f["dataset_ref"] for m in members for f in m["files"]],
                           "zodrak/e13-b-checkpoints-v001", "zodrak/lc3-lc4-checkpoints-v035"})
-    (KERNEL / "kernel-metadata.json").write_text(json.dumps({"id":KERNEL_REF,"title":f"E31-40 {len(members)} Checkpoint E13-B with External Hungarian",
+    (KERNEL / "kernel-metadata.json").write_text(json.dumps({"id":KERNEL_REF,"title":f"E31-40 Checkpoint E13-B with External Hungarian",
         "code_file":"e31.ipynb","language":"python","kernel_type":"notebook","is_private":True,
         "enable_gpu":True,"enable_tpu":False,"enable_internet":False,
         "keywords":["name-that-llm","E31","Hungarian"],"dataset_sources":source_refs,
         "kernel_sources":[],"competition_sources":["name-that-llm"],
         "model_sources":model_sources,"machine_shape":"NvidiaTeslaT4"},indent=2)+"\n")
+    safe_json_calls = embed_runtime_preflight(
+        KERNEL, manifest_paths=[LOCAL / "e31_manifest.json", LOCAL / "e28_manifest.json"])
+    package_preflight = validate_kernel_package(KERNEL)
     return {"dataset_dir":str(LOCAL),"notebook_dir":str(KERNEL),"dataset_ref":DATASET_REF,
         "kernel_ref":KERNEL_REF,"roster":deployment["roster"],"new_files":len(new_assets),
-        "new_bytes":sum(x["size"] for x in new_assets.values()),"data_sources":source_refs}
+        "new_bytes":sum(x["size"] for x in new_assets.values()),"data_sources":source_refs,
+        "preflight":package_preflight,"runtime_json_calls_wrapped":safe_json_calls}
 
 
 if __name__ == "__main__":

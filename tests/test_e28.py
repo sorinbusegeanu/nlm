@@ -1,10 +1,39 @@
 import numpy as np
+from sklearn.linear_model import LogisticRegression
 
 from src import e13_reliability_router as e13
 from src import e20
 from src.e28 import family_max_label_scores, finite_assignment_scores, route_family_max
-from src.e28_deploy import distribute_checkpoints, intervals_overlap
+from src.e28_deploy import (
+    checkpoint_bundle_relative_path,
+    distribute_checkpoints,
+    ensure_binary_logistic_predict_proba_compat,
+    intervals_overlap,
+)
 from src.v2_checkpoint_trust import LABELS
+
+
+def test_binary_logistic_compat_restores_legacy_attribute_without_changing_scores():
+    rng = np.random.RandomState(17)
+    features = rng.normal(size=(80, 5)).astype(np.float32)
+    labels = (features[:, 0] + features[:, 1] > 0).astype(np.int64)
+    model = LogisticRegression(random_state=17).fit(features, labels)
+    expected = model.predict_proba(features)
+    if hasattr(model, "multi_class"):
+        del model.multi_class
+
+    assert ensure_binary_logistic_predict_proba_compat(model) is model
+    assert model.multi_class == "auto"
+    np.testing.assert_array_equal(model.predict_proba(features), expected)
+
+
+def test_checkpoint_paths_are_resolved_beneath_the_bundle_root():
+    assert checkpoint_bundle_relative_path("checkpoints/N0082/model.joblib") == "checkpoints/N0082/model.joblib"
+    assert checkpoint_bundle_relative_path("N0030") == "checkpoints/N0030"
+    assert checkpoint_bundle_relative_path("N0084/svc_foldvalidation.joblib") == "checkpoints/N0084/svc_foldvalidation.joblib"
+    import pytest
+    with pytest.raises(ValueError, match="bundle-relative"):
+        checkpoint_bundle_relative_path("../outside/model.cbm")
 
 
 def test_family_max_uses_max_within_family_then_mean_across_families():
