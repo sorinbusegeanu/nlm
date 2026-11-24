@@ -346,6 +346,20 @@ datasets:
     reports:
       - docs/v2.GR.OR16.md
 
+  - id: v3.0
+    name: V3.0 — Open Pool v16 excluding V0-EXT prompt groups
+    section: Training datasets
+    description: Open Pool v16 main parquet after removing all known V0-overlapping responses, the frozen 4,000-row V0-EXT set, and every response sharing a V0-EXT prompt group; original row schema and source metadata are preserved.
+    artifact: data/processed/dataset_v3.0.parquet
+    profile: data/processed/dataset_profile_v3.0.json
+    validation: External-only training dataset; evaluate on the complete V0 and frozen V0-EXT validation datasets in separate evaluation runs.
+    external_only: true
+    validation_datasets:
+      - v0
+      - v0_ext
+    reports:
+      - docs/v3.0.md
+
   - id: granite4_350m_v214_openpool16_v0w10
     name: Granite 4 350M V2.14 + Open Pool v16 + V0 weighted mix
     section: Training datasets
@@ -399,3 +413,15 @@ datasets:
     artifact: data/processed/dataset_v0_glm.parquet
     profile: data/processed/dataset_profile_v0_glm.json
     validation: Official V0 validation subset; 300 rows across 2 specialist labels.
+
+  - id: v0_ext
+    name: V0-EXT — frozen external validation
+    section: Validation datasets
+    description: Deterministic 4,000-response external validation set sampled from Open Pool v16 with all 18 labels, unequal class frequencies, 40–250 word passages, distinct known prompt groups, and broad contributor coverage; frozen with seed 2026.
+    artifact: data/processed/dataset_v0_ext.parquet
+    profile: data/processed/dataset_profile_v0_ext.json
+    validation: Frozen external validation only; use alongside V0 for robustness evaluation and never for training or checkpoint selection.
+    external_only: false
+    validation_only: true
+    reports:
+      - docs/v3.0.md

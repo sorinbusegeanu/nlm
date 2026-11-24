@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -30,6 +31,10 @@ class E31GreedySelector(E30GreedySelector):
     report.
     """
 
+    def __init__(self, *args, candidate_workers=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.candidate_workers = max(1, int(candidate_workers))
+
     def run(self, fold_definitions):
         fold_outputs = []
         event_records = []
@@ -50,7 +55,7 @@ class E31GreedySelector(E30GreedySelector):
             for step in range(1, self.steps + 1):
                 candidate_metrics = []
                 y_fit = self.truth[fit_rows]
-                for candidate_index, candidate in enumerate(available, 1):
+                def evaluate_candidate(candidate):
                     metric, pred = self.evaluate_roster(
                         fold_number, fit_rows, current + [candidate])
                     paired = _paired(y_fit, current_pred, pred)
@@ -60,6 +65,17 @@ class E31GreedySelector(E30GreedySelector):
                         "candidate_inner_oof_balanced_accuracy": metric["balanced_accuracy"],
                         "marginal_balanced_accuracy": metric["balanced_accuracy"] -
                             current_metric["balanced_accuracy"], **paired}
+                    return candidate, metric, pred, paired, record
+
+                if self.candidate_workers == 1:
+                    completed = [evaluate_candidate(candidate) for candidate in available]
+                else:
+                    # Evaluations are independent for a fixed roster step. The
+                    # results are reassembled in checkpoint-ID order, so tie
+                    # breaking and output ordering remain deterministic.
+                    with ThreadPoolExecutor(max_workers=self.candidate_workers) as pool:
+                        completed = list(pool.map(evaluate_candidate, available))
+                for candidate_index, (candidate, metric, pred, paired, record) in enumerate(completed, 1):
                     candidate_eval_records.append(record)
                     candidate_metrics.append((candidate, metric, pred, paired))
                     if candidate_index % 10 == 0 or candidate_index == len(available):

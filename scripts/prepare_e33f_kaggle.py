@@ -15,6 +15,7 @@ E31_DATA = ROOT / "artifacts/kaggle/e31-checkpoints-v001"
 E31_KERNEL = ROOT / "artifacts/kaggle/e31-kernel/e31.ipynb"
 DEPLOY = ROOT / "artifacts/analysis/e33"
 E19D = ROOT / "artifacts/analysis/e28/e19_d_external_grouper.joblib"
+QWEN_CALIBRATION = ROOT / "artifacts/analysis/e33/e33_qwen4b_batch_calibration.json"
 DATA = ROOT / "artifacts/kaggle/e33f-deployment-v001"
 KERNEL = ROOT / "artifacts/kaggle/e33f-kernel"
 DATA_REF = "zodrak/e33f-deployment-v001"
@@ -42,14 +43,25 @@ def _main_cell_source() -> str:
 
 # E33-F candidate correctness adjustment. The deployment model was trained
 # with 5-fold prompt-group OOF reliability features; no test labels are used.
-from src import e33
 from catboost import CatBoostClassifier
 E33ROOT=root_for("e33f_manifest.json")
 E33=json.loads((E33ROOT/"e33f_manifest.json").read_text())
 def e33asset(name):
     hits=[p for p in E33ROOT.rglob(name) if p.is_file()]
     return only(hits,name)
+import importlib.util, src
+e33_path=e33asset("e33.py")
+e33_spec=importlib.util.spec_from_file_location("src.e33",e33_path)
+if e33_spec is None or e33_spec.loader is None:
+    raise ImportError(f"Could not load packaged E33 runtime module: {e33_path}")
+e33=importlib.util.module_from_spec(e33_spec)
+sys.modules["src.e33"]=e33
+e33_spec.loader.exec_module(e33)
 reliability_file=e33asset("e33_final_reliability.npz")
+qwen_calibration=json.loads(e33asset("e33_qwen4b_batch_calibration.json").read_text())
+if (qwen_calibration["model_id"]!="Qwen/Qwen3.5-4B" or
+    int(qwen_calibration["max_new_tokens"])!=1024):
+    raise ValueError("E33 Qwen batch calibration does not match E19-D generation")
 with np.load(reliability_file,allow_pickle=False) as z: reliability={k:z[k] for k in z.files}
 schema=json.loads(e33asset("e33_final_feature_schema.json").read_text())
 if schema["checkpoint_order"]!=[m["candidate_id"] for m in members] or schema["class_order"]!=classes:
@@ -82,13 +94,23 @@ groups_c=cluster_f_candidates("E19-F-C",ids,ordered,pairs,features,grouper)'''
 
 # Reconstruct each test response's original prompt independently with the
 # attached Qwen3.5-4B model, then run the frozen external E19-D grouper.
-from transformers import AutoModelForMultimodalLM, AutoProcessor
+from transformers import AutoModelForMultimodalLM, AutoTokenizer
 from src import e19b_reconstruct, e19b_group, e27
+class TextOnlyQwenProcessor:
+    """Use Qwen's tokenizer chat template for text-only reconstruction."""
+    def __init__(self, tokenizer): self.tokenizer=tokenizer
+    def apply_chat_template(self, conversations, **kwargs):
+        processor_kwargs=kwargs.pop("processor_kwargs",{}) or {}
+        for key,value in processor_kwargs.items(): kwargs.setdefault(key,value)
+        return self.tokenizer.apply_chat_template(conversations,**kwargs)
+    def batch_decode(self,*args,**kwargs): return self.tokenizer.batch_decode(*args,**kwargs)
 qwen_markers=[p.parent for p in INPUT.rglob("config.json") if "qwen3-5-4b" in str(p.parent).casefold()]
 if not qwen_markers: raise FileNotFoundError("attached Qwen3.5-4B model is missing")
 qwen_root=only([p for p in qwen_markers if len(p.parts)==min(len(x.parts) for x in qwen_markers)],"Qwen3.5-4B model")
-processor=AutoProcessor.from_pretrained(qwen_root,local_files_only=True)
+qwen_load_started=time.time()
+processor=TextOnlyQwenProcessor(AutoTokenizer.from_pretrained(qwen_root,local_files_only=True))
 qwen=AutoModelForMultimodalLM.from_pretrained(qwen_root,device_map="auto",dtype="auto",local_files_only=True).eval()
+qwen_model_load_seconds=time.time()-qwen_load_started
 recon_path=Path("/kaggle/working/e33_d_reconstructed.json")
 if recon_path.is_file():
     recon_records=json.loads(recon_path.read_text())
@@ -98,7 +120,7 @@ if len(recon_records)>n or any(str(x.get("id"))!=str(ids[i]) for i,x in enumerat
 reconstructed=[]; topics=[]; details=[]; constraints=[]
 for start in range(0,len(recon_records),1):
     rec=recon_records[start]; reconstructed.append(rec["reconstructed_prompt"]); topics.append(rec["topic"]); details.append(rec["distinctive_details"]); constraints.append(rec["constraints"])
-batch_size=2; qwen_started=time.time()
+batch_size=int(qwen_calibration["effective_oom_safe_batch"]); qwen_started=time.time(); torch.cuda.reset_peak_memory_stats(); qwen_batches=[]
 while len(recon_records)<n:
     start=len(recon_records); take=min(batch_size,n-start)
     batch_texts=texts[start:start+take]
@@ -119,6 +141,7 @@ while len(recon_records)<n:
                       "distinctive_details":[],"constraints":[],"status":"fallback"}
             item["id"]=str(ids[start+j]); parsed.append(item)
         recon_records.extend(parsed)
+        qwen_batches.append({"start_row":start,"batch_size":take,"rows":take})
         temp=recon_path.with_suffix(".tmp.json"); temp.write_text(json.dumps(recon_records,ensure_ascii=False)); temp.replace(recon_path)
         reconstructed.extend(x["reconstructed_prompt"] for x in parsed); topics.extend(x["topic"] for x in parsed)
         details.extend(x["distinctive_details"] for x in parsed); constraints.extend(x["constraints"] for x in parsed)
@@ -128,6 +151,7 @@ while len(recon_records)<n:
         batch_size=max(1,take//2); torch.cuda.empty_cache()
 del qwen,processor; gc.collect(); torch.cuda.empty_cache()
 qwen_seconds=time.time()-qwen_started
+qwen_peak_allocated_bytes=int(torch.cuda.max_memory_allocated())
 if len(reconstructed)!=n or [x["id"] for x in recon_records]!=ids.tolist():
     raise ValueError("E19-D reconstruction output is not aligned to test order")
 
@@ -171,7 +195,7 @@ if len(groups_d)!=n or any(len(np.flatnonzero(groups_d==g))>18 for g in set(map(
     code = code.replace('write_submission("E19-F-C","submission_e19_f_c.parquet",pred_c)',
         'write_submission("E19-F-C","submission_e19_f_c.parquet",pred_c)\npred_d=hungarian(e33_scores,groups_d,ids)\nwrite_submission("E19-D","submission_e19_d.parquet",pred_d)')
     code = code.replace('"grouping_candidate_edges":len(pairs)',
-        '"e33_model":"e33_final.cbm","e33_adjustment":"E31_score * p_correct",\n    "e19d_reconstruction_seconds":qwen_seconds,"e19d_group_count":len(set(map(str,groups_d))),\n    "grouping_candidate_edges":len(pairs)')
+        '"e33_model":"e33_final.cbm","e33_adjustment":"E31_score * p_correct",\n    "e19d_qwen_batch_calibration":qwen_calibration,"e19d_qwen_batches":qwen_batches,\n    "e19d_model_load_seconds":qwen_model_load_seconds,"e19d_reconstruction_seconds":qwen_seconds,\n    "e19d_peak_gpu_allocated_bytes":qwen_peak_allocated_bytes,"e19d_group_count":len(set(map(str,groups_d))),\n    "grouping_candidate_edges":len(pairs)')
     # E33 adjustment must also be the independent output; the earlier
     # independent variable was replaced after computing the E31 audit baseline.
     code = code.replace('write_submission("independent_E13-B","submission.parquet",independent)',
@@ -193,8 +217,8 @@ def prepare():
     if DATA.exists(): shutil.rmtree(DATA)
     if KERNEL.exists(): shutil.rmtree(KERNEL)
     DATA.mkdir(parents=True); KERNEL.mkdir(parents=True)
-    required = [DEPLOY / "e33_final.cbm", DEPLOY / "e33_final_reliability.npz",
-                DEPLOY / "e33_final_feature_schema.json", E19D]
+    required = [ROOT / "src/e33.py", DEPLOY / "e33_final.cbm", DEPLOY / "e33_final_reliability.npz",
+                DEPLOY / "e33_final_feature_schema.json", E19D, QWEN_CALIBRATION]
     if any(not p.is_file() for p in required):
         raise FileNotFoundError(f"E33-F deployment assets missing: {[str(x) for x in required if not x.is_file()]}")
     assets = []
@@ -209,9 +233,13 @@ def prepare():
     manifest = {"schema_version":1,"experiment":"E33-F","trust_list_version":"trust-list-2-v037",
         "roster":e31["roster"],"class_order":e31["classes"],"assets":assets,
         "model":"e33_final.cbm","reliability":"e33_final_reliability.npz",
+        "runtime_module":"e33.py",
         "feature_schema":"e33_final_feature_schema.json","e19d_grouper":"e19_d_external_grouper.joblib",
         "e19d_threshold":0.35,"e19d_max_cluster_size":18,
         "qwen_model_revision":"851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        "qwen_batch_calibration":{"file":"e33_qwen4b_batch_calibration.json",
+            "effective_oom_safe_batch":json.loads(QWEN_CALIBRATION.read_text())["effective_oom_safe_batch"],
+            "oom_recovery":"halve batch until successful"},
         "output_files":["submission.parquet","submission_e19_f_a.parquet","submission_e19_f_c.parquet","submission_e19_d.parquet"]}
     (DATA/"e33f_manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
     (DATA/"dataset-metadata.json").write_text(json.dumps({"title":"E33-F E31-40 Deployment Artifacts",
@@ -227,6 +255,9 @@ def prepare():
         "dataset_sources":sorted(set(old_meta.get("dataset_sources",[]))|{DATA_REF}),
         "model_sources":sorted(set(old_meta.get("model_sources",[]))|{QWEN_MODEL}),
         "enable_gpu":True,"enable_internet":False,"machine_shape":"NvidiaTeslaT4x2"})
+    # Kaggle rejected these free-form labels as tags on save; omit them so
+    # subsequent version pushes stay warning-free.
+    old_meta.pop("keywords", None)
     (KERNEL/"kernel-metadata.json").write_text(json.dumps(old_meta,indent=2)+"\n")
     # Keep only E19-F-C and E19-D in the early sklearn compatibility allowlist;
     # unrelated serialized checkpoint joblibs remain unopened until runtime.

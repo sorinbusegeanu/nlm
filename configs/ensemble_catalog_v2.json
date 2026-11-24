@@ -1743,7 +1743,7 @@
       },
       "kaggle_deployment": {
         "variant": "E33-F",
-        "status": "Waiting for Kaggle GPU capacity",
+        "status": "Queued; corrected kernel version 5",
         "roster_source": "artifacts/analysis/e31/e31_manifest.json",
         "checkpoint_count": 40,
         "trust_list_version": "trust-list-2-v037",
@@ -1756,8 +1756,8 @@
           "E19-D + Hungarian"
         ],
         "kaggle_kernel": "zodrak/e33-f-e31-40-checkpoint-candidate-router",
-        "submission_status": "Not submitted",
-        "kernel_session": "No version created: Kaggle rejected launch at the 2-session limit",
+        "submission_status": "Not submitted; waiting for version 5 outputs",
+        "kernel_session": "Version 5 queued; v3 failed missing src/e33.py; v4 failed because the Qwen processor lacked a chat template",
         "deployment_dataset": "zodrak/e33f-deployment-v001",
         "deployment_assets": [
           "e33_final.cbm",
@@ -1769,10 +1769,20 @@
         "preflight_remote": "PASS",
         "required_manifest_assets_checked": 126,
         "processor_model_source": "limamateus/qwen3-5-4b/PyTorch/default/1",
-        "blocking_sessions": [
-          "zodrak/e28-e13-b-external-grouping-hungarian/10",
-          "zodrak/e30-b-17-checkpoint-e13-b-with-external-hungarian/6"
-        ]
+        "blocking_sessions": [],
+        "saved_kernel_version": 2,
+        "kernel_url": "https://www.kaggle.com/code/zodrak/e33-f-e31-40-checkpoint-candidate-router",
+        "saved_version_qwen_batch": 32,
+        "prepared_run_qwen_batch": 32,
+        "local_qwen_benchmark": "32 longest V0 responses: 46.60 s at batch 8; 9.56 GiB peak VRAM",
+        "qwen_batch_calibration": "artifacts/analysis/e33/e33_qwen4b_batch_calibration.json",
+        "qwen_calibration_max_successful_batch": 32,
+        "qwen_calibration_peak_allocated_mib": 14829.2,
+        "preparation_checklist_batch_rule": "Use matching precomputed max stable batch; calibrate exact model if missing",
+        "launched_kernel_version": 5,
+        "deployment_dataset_version": 2,
+        "deployed_runtime_module": "e33.py",
+        "qwen_text_processor": "TextOnlyQwenProcessor wrapping AutoTokenizer"
       }
     },
     {
@@ -1861,6 +1871,90 @@
       },
       "inference_benchmark_source": "artifacts/analysis/e34/inference_benchmark.json",
       "deployment_manifest": "artifacts/analysis/e34/e34_deployment_manifest.json"
+    },
+    {
+      "id": "E35",
+      "name": "E35 \u2014 v044 40-checkpoint negative evidence",
+      "category": "Trust List refreshed roster scoring",
+      "description": "Rebuild the 40-checkpoint E31-style roster using Trust List 2 v044, fit a new family_max router, and evaluate E33 negative-evidence variants.",
+      "status": "Running",
+      "current_stage": "E35 roster selected; fitting router and scoring variants",
+      "baseline_experiment": "E31/E33",
+      "trust_list_version": "trust-list-2-v044",
+      "checkpoint_count": 40,
+      "training_dataset": "No neural training; prompt-group cross-fit checkpoint selection/router/meta-classifier",
+      "validation_dataset": "50 v0_group scenarios reusing V0 rows (correlated robustness diagnostic)",
+      "primary_metric": "Mean balanced accuracy across 50 scenarios, independent and E19-F-A/F-C/D Hungarian",
+      "progress_source": "artifacts/analysis/e35/metrics.json",
+      "result_source": "artifacts/analysis/e35/metrics.json",
+      "documentation": "docs/e35.md",
+      "inference_benchmark_documentation": "docs/e36_inference_benchmark.md",
+      "scenario_count": 50,
+      "variants": [
+        "E35-A",
+        "E35-B",
+        "E35-C",
+        "E35-D",
+        "E35-E",
+        "E35-F"
+      ],
+      "baseline_roster_source": "Trust List 2 v044 pool plus E31/E32 greedy selection methodology",
+      "v0_exposure_note": "These scenarios reuse V0 responses; results are correlated robustness diagnostics, not independent validation."
+    },
+    {
+      "id": "E36",
+      "name": "E36 \u2014 v044 60-checkpoint negative evidence",
+      "category": "Trust List refreshed roster scoring",
+      "description": "Extend the v044-selected E35 40-checkpoint roster to 60 using E32 selection, fit a new family_max router, and evaluate E34 variants.",
+      "status": "Running",
+      "current_stage": "Roster selection",
+      "baseline_experiment": "E32/E34",
+      "trust_list_version": "trust-list-2-v044",
+      "checkpoint_count": 60,
+      "training_dataset": "No neural training; prompt-group cross-fit checkpoint selection/router/meta-classifier",
+      "validation_dataset": "50 v0_group scenarios reusing V0 rows (correlated robustness diagnostic)",
+      "primary_metric": "Mean balanced accuracy across 50 scenarios, independent and E19-F-A/F-C/D Hungarian",
+      "progress_source": "artifacts/analysis/e36/metrics.json",
+      "result_source": "artifacts/analysis/e36/metrics.json",
+      "documentation": "docs/e36.md",
+      "inference_benchmark_documentation": "docs/e36_inference_benchmark.md",
+      "scenario_count": 50,
+      "variants": [
+        "E36-A",
+        "E36-B",
+        "E36-C",
+        "E36-D",
+        "E36-E",
+        "E36-F"
+      ],
+      "baseline_roster_source": "Trust List 2 v044 pool plus E31/E32 greedy selection methodology",
+      "v0_exposure_note": "These scenarios reuse V0 responses; results are correlated robustness diagnostics, not independent validation."
+    },
+    {
+      "id": "E37",
+      "name": "E37 \u2014 v044 40-checkpoint length-aware and full-candidate reliability",
+      "category": "E13-B family-max checkpoint router",
+      "description": "Compare fixed-roster E13-B reliability routing, passage-length-aware reliability, all-label candidate coverage, and their combination using cached Trust List 2 v044 probabilities.",
+      "status": "Running",
+      "current_stage": "Completed outer fold 4 of 5",
+      "baseline_experiment": "E35 40-checkpoint fixed roster",
+      "trust_list_version": "trust-list-2-v044",
+      "checkpoint_count": 40,
+      "training_dataset": "V0 prompt-group cross-fit router training; no base classifier training",
+      "validation_dataset": "V0 2,699 rows; five prompt-disjoint outer folds",
+      "primary_metric": "Five-fold out-of-fold balanced accuracy",
+      "progress_source": "artifacts/analysis/e37/evaluation_metrics.json",
+      "result_source": "artifacts/analysis/e37/evaluation_metrics.json",
+      "documentation": "docs/e37.md",
+      "variants": [
+        "E37-A",
+        "E37-B",
+        "E37-C",
+        "E37-D"
+      ],
+      "baseline_roster_source": "artifacts/analysis/e35/selection_results.json final_roster; fixed for all E37 variants",
+      "v0_exposure_note": "V0 labels train fold-local reliability routers; reported metrics are prompt-disjoint OOF development estimates. Trust List v044 roster development may also use V0.",
+      "error": "KeyError: 'predicted_label'"
     }
   ],
   "display_catalog_version": "1.0.0",
