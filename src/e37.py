@@ -61,6 +61,7 @@ def _catalog_update(*, status: str, stage: str, results=None, error=None):
     if error:
         entry["error"] = str(error)
     if results is not None:
+        entry.pop("error", None)
         entry["status"] = "Complete"
         entry["current_stage"] = "Complete"
         entry["result_source"] = "artifacts/analysis/e37/evaluation_metrics.json"
@@ -240,6 +241,40 @@ def _early_stop_split(rows, y, prompts):
     if set(prompts[train_rows]) & set(prompts[stop_rows]):
         raise AssertionError("E37 early-stop groups overlap")
     return train_rows, stop_rows
+
+
+def _save_nested_reliability_statistics(fold_number, outer_fit_rows, tensor, y,
+                                        prompts, ids, roster, output_dir):
+    """Persist each fitting-only reliability matrix used by cross-fit records."""
+    early_train_rows, _ = _early_stop_split(outer_fit_rows, y, prompts)
+    arrays = {"checkpoint_ids": np.asarray(roster),
+              "labels": np.asarray(LABELS)}
+    manifest = {"fold": int(fold_number), "training_inner_folds": {},
+                "early_stopping_inner_folds": {}}
+    for split_name, rows in (("early_stopping_inner_folds", early_train_rows),
+                             ("training_inner_folds", outer_fit_rows)):
+        for inner, (inner_fit_local, inner_valid_local) in enumerate(GroupKFold(n_splits=4).split(
+                rows, y[rows], groups=prompts[rows]), start=1):
+            fit_rows, valid_rows = rows[inner_fit_local], rows[inner_valid_local]
+            if set(prompts[fit_rows]) & set(prompts[valid_rows]):
+                raise AssertionError("Nested E37 reliability statistics leak prompt groups")
+            top = e13.reliability_statistics(tensor[:, fit_rows].argmax(axis=2), y[fit_rows], ALPHA)
+            candidate = _rank_precision(tensor[:, fit_rows], y[fit_rows])
+            prefix = ("early" if split_name.startswith("early") else "train") + f"_inner{inner}_"
+            for stat_name, value in top.items():
+                arrays[prefix + "top_" + stat_name] = value
+            for stat_name, value in candidate.items():
+                arrays[prefix + "candidate_" + stat_name] = value
+            manifest[split_name][str(inner)] = {
+                "fit_rows": int(len(fit_rows)), "validation_rows": int(len(valid_rows)),
+                "fit_row_ids_sha256": hashlib.sha256("\n".join(ids[fit_rows]).encode()).hexdigest(),
+                "fit_prompt_group_count": int(len(np.unique(prompts[fit_rows]))),
+                "validation_prompt_group_count": int(len(np.unique(prompts[valid_rows])))}
+    path = Path(output_dir).resolve() / f"fold{fold_number}_nested_reliability_statistics.npz"
+    np.savez_compressed(path, **arrays)
+    manifest["statistics_path"] = str(path.relative_to(ROOT))
+    manifest["statistics_sha256"] = _sha256(path)
+    return manifest
 
 
 def _new_router(iterations=None):
@@ -472,7 +507,7 @@ def _write_report(result, path):
             lines.append(label + "\t" + "\t".join(map(str, row)))
         lines.extend(["```", ""])
     lines.extend(["## Artifacts", "",
-        "`artifacts/analysis/e37/oof_predictions.parquet` has one row per V0 response, the four predicted labels, and four aligned 18-label probability vectors. `evaluation_metrics.json` contains aggregate and fold results, including confusion matrices and per-label precision/recall. Each outer-fold CatBoost model is saved as a `.cbm`; `foldN_reliability_statistics.npz` saves fitting-fold reliability arrays. `feature_schemas.json`, `manifest.json`, and `configuration.json` record feature order, checkpoint revisions/cache hashes, labels, folds, seed, and the CatBoost configuration.", ""])
+        "`artifacts/analysis/e37/oof_predictions.parquet` has one row per V0 response, the four predicted labels, and four aligned 18-label probability vectors. `evaluation_metrics.json` contains aggregate and fold results, including confusion matrices and per-label precision/recall. Each outer-fold CatBoost model is saved as a `.cbm`; `foldN_reliability_statistics.npz` saves outer-fit statistics and `foldN_nested_reliability_statistics.npz` saves the fitting-only statistics used to construct nested router training records. `feature_schemas.json`, `manifest.json`, and `configuration.json` record feature order, checkpoint revisions/cache hashes, labels, folds, seed, and the CatBoost configuration.", ""])
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -492,6 +527,8 @@ def run(*, root=ROOT, output_dir=OUT):
     _catalog_update(status="Running", stage="Inputs validated; outer fold 1 of 5")
     for fold_no, (fit_rows, held_rows) in enumerate(folds, start=1):
         fold_output = output_dir / f"fold{fold_no}"
+        nested_stats = _save_nested_reliability_statistics(fold_no, fit_rows,
+            tensor, y, prompts, ids, roster, fold_output)
         fitted, models, reliability = _run_fold(fold_no, fit_rows, held_rows,
             tensor, roster, families, y, prompts, texts, ids, fold_output)
         for name in METHODS:
@@ -504,6 +541,7 @@ def run(*, root=ROOT, output_dir=OUT):
                     if k not in ("fit_row_ids", "held_row_ids", "feature_schema", "model_sha256")}})
             router_metadata[name].append(models[name])
         fold_manifests.append({"fold": fold_no, **reliability,
+            "nested_reliability_statistics": nested_stats,
             "fit_prompt_groups": len(np.unique(prompts[fit_rows])),
             "held_prompt_groups": len(np.unique(prompts[held_rows])),
             "held_rows_sha256": hashlib.sha256(held_rows.tobytes()).hexdigest()})
@@ -557,6 +595,7 @@ def run(*, root=ROOT, output_dir=OUT):
     manifest = {"experiment":"E37", "trust_list_version":V044,
         "roster":roster,"labels":list(LABELS),"fold_routers":router_metadata,
         "fold_reliability_statistics":"reliability_statistics_manifest.json",
+        "nested_reliability_statistics":"foldN/foldN_nested_reliability_statistics.npz",
         "feature_schemas":"feature_schemas.json","oof_predictions":"oof_predictions.parquet",
         "oof_probability_matrices":"oof_probability_matrices.npz",
         "catboost":e13.CATBOOST_PARAMS,"seed":SEED,

@@ -333,6 +333,16 @@ datasets:
     reports:
       - docs/e26.md
 
+  - id: v3.0-baseline-candidates
+    name: V3.0 baseline-excluded contributor-label candidates
+    section: Research datasets
+    description: The remaining V3.0 rows after excluding all 1,000 response IDs assigned to V3.0-BASELINE; use this pool for subsequent contributor-label selection.
+    artifact: data/processed/dataset_v3.0_baseline_candidates.parquet
+    profile: data/processed/dataset_profile_v3.0_baseline_candidates.json
+    validation: Candidate construction pool only; baseline response IDs are excluded. Prompt-group siblings are retained as required for contributor-label candidate selection.
+    reports:
+      - docs/v3.0-baseline.md
+
   - id: v2.GR.OR16
     name: V2.GR.OR16 — Group-Ranking Open Pool v16
     section: Training datasets
@@ -425,3 +435,14 @@ datasets:
     validation_only: true
     reports:
       - docs/v3.0.md
+
+  - id: v3.0-baseline
+    name: V3.0-BASELINE — balanced contributor/prompt holdout
+    section: Validation datasets
+    description: Frozen 1,000-response balanced sample from V3.0 with all 18 canonical labels, one response per prompt group, and contributor-diverse sampling within each label; baseline IDs are excluded from the separately materialized V3.0 contributor-label candidate pool.
+    artifact: data/processed/dataset_v3.0_baseline.parquet
+    profile: data/processed/dataset_profile_v3.0_baseline.json
+    validation: Validation-only dataset; exactly 56 rows for ten labels and 55 rows for eight labels. Never include in candidate construction or training.
+    validation_only: true
+    reports:
+      - docs/v3.0-baseline.md

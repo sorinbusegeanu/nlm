@@ -1935,8 +1935,8 @@
       "name": "E37 \u2014 v044 40-checkpoint length-aware and full-candidate reliability",
       "category": "E13-B family-max checkpoint router",
       "description": "Compare fixed-roster E13-B reliability routing, passage-length-aware reliability, all-label candidate coverage, and their combination using cached Trust List 2 v044 probabilities.",
-      "status": "Running",
-      "current_stage": "Completed outer fold 4 of 5",
+      "status": "Complete",
+      "current_stage": "Complete",
       "baseline_experiment": "E35 40-checkpoint fixed roster",
       "trust_list_version": "trust-list-2-v044",
       "checkpoint_count": 40,
@@ -1954,7 +1954,19 @@
       ],
       "baseline_roster_source": "artifacts/analysis/e35/selection_results.json final_roster; fixed for all E37 variants",
       "v0_exposure_note": "V0 labels train fold-local reliability routers; reported metrics are prompt-disjoint OOF development estimates. Trust List v044 roster development may also use V0.",
-      "error": "KeyError: 'predicted_label'"
+      "balanced_accuracy": {
+        "E37-A": 0.6675988068605518,
+        "E37-B": 0.666112353964703,
+        "E37-C": 0.6479741486452897,
+        "E37-D": 0.6483445190156599
+      },
+      "accuracy": {
+        "E37-A": 0.6676546869210819,
+        "E37-B": 0.666172656539459,
+        "E37-C": 0.6480177843645795,
+        "E37-D": 0.6483882919599852
+      },
+      "artifact_directory": "artifacts/analysis/e37"
     }
   ],
   "display_catalog_version": "1.0.0",

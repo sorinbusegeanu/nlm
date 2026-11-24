@@ -71,7 +71,10 @@ WEIGHTED_SAMPLING_MODELS = ({
 } | FROZEN_BACKBONE_MODELS)
 
 # Dataset variants that change the training recipe while reusing immutable rows.
-DATASET_STORAGE_ALIASES = {"v2.14CW": "v2.14"}
+DATASET_STORAGE_ALIASES = {
+    "v2.14CW": "v2.14",
+    "v3.0-baseline": "v3.0_baseline",
+}
 
 
 def _dataset_storage_id(dataset):
