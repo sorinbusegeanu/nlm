@@ -414,6 +414,8 @@ def prepare():
     embed_runtime_preflight(
         KERNEL_DIR,
         manifest_paths=[MANIFEST_SOURCE, GROUPER_DIR / "e28_manifest.json"],
+        sklearn_compatibility_assets=[{"dataset_ref": GROUPER_REF,
+                                      "filename": "deployment/e19_f_c_external_grouper.joblib"}],
     )
     package_preflight = validate_kernel_package(KERNEL_DIR)
     return {"kernel_ref": KERNEL_REF, "groupers_ref": GROUPER_REF,

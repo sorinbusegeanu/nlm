@@ -1,5 +1,7 @@
 # E32 inference benchmark
 
+See [E34's candidate-rescoring benchmark](e34_inference_benchmark.md) for the measured E33-F and E34-F scoring overhead on this same 4,000-response workload, plus the updated end-to-end and dual-T4 estimates.
+
 ## Per-checkpoint measurements for the 20 additions
 
 Each checkpoint was timed over the same 4,000 responses selected for E31, on the local NVIDIA GeForce RTX 5070 Ti (16,303 MiB reported device memory). GPU batch sizes were found with the existing OOM-reducing benchmark. CPU-only CatBoost and SVC checkpoints have no GPU batch size or VRAM measurement; they are scored as one full 4,000-row CPU workload by the existing inference path.

@@ -1,11 +1,11 @@
 {
-  "version": "trust-v015",
-  "generated_at_utc": "2026-11-24T03:38:24+00:00",
+  "version": "trust-v017",
+  "generated_at_utc": "2026-11-24T10:16:52+00:00",
   "source_catalog": "docs/checkpoint_label_catalog.csv",
-  "source_catalog_sha256": "1cec3a2a44f058b842ca4de0b5639fa0ba46e2ace7d856b8956efcf3befbe9ac",
-  "rows": 1818,
-  "checkpoints": 101,
-  "eligible_rules": 1733,
+  "source_catalog_sha256": "85bda05526198155d42b95ca3d255e5d1bcc3697cf83cc494419556055a46df5",
+  "rows": 1854,
+  "checkpoints": 103,
+  "eligible_rules": 1767,
   "minimum_support": 10,
   "smoothing": "Beta(1,1): (true_positive + 1) / (prediction_count + 2)",
   "ordering": [

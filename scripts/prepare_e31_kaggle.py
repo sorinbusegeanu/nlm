@@ -331,7 +331,9 @@ write_submission("E19-F-C","submission_e19_f_c.parquet",pred_c)'''
         "kernel_sources":[],"competition_sources":["name-that-llm"],
         "model_sources":model_sources,"machine_shape":"NvidiaTeslaT4"},indent=2)+"\n")
     safe_json_calls = embed_runtime_preflight(
-        KERNEL, manifest_paths=[LOCAL / "e31_manifest.json", LOCAL / "e28_manifest.json"])
+        KERNEL, manifest_paths=[LOCAL / "e31_manifest.json", LOCAL / "e28_manifest.json"],
+        sklearn_compatibility_assets=[{"dataset_ref": DATASET_REF,
+                                      "filename": "e19_f_c_external_grouper.joblib"}])
     package_preflight = validate_kernel_package(KERNEL)
     return {"dataset_dir":str(LOCAL),"notebook_dir":str(KERNEL),"dataset_ref":DATASET_REF,
         "kernel_ref":KERNEL_REF,"roster":deployment["roster"],"new_files":len(new_assets),

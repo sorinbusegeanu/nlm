@@ -291,6 +291,40 @@ def test_runtime_spec_includes_manifest_outside_kernel_directory(tmp_path):
     assert "required checkpoint/input asset is missing" in nbformat.read(root / "main.ipynb", 4).cells[1].source
 
 
+def test_compatibility_audit_only_loads_explicit_runtime_joblibs(tmp_path):
+    root = _kernel(tmp_path)
+    metadata_path = root / "kernel-metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["sklearn_compatibility_assets"] = [{
+        "dataset_ref": "zodrak/test-data", "filename": "deployment/grouper.joblib"}]
+    write_json(metadata_path, metadata)
+    manifest = tmp_path / "published_bundle_manifest.json"
+    write_json(manifest, {"files": [
+        {"dataset_ref": "zodrak/test-data", "flat_filename": "deployment/grouper.joblib", "size": 9},
+        {"dataset_ref": "zodrak/test-data", "flat_filename": "unused/checkpoint.joblib", "size": 12},
+    ]})
+    embed_runtime_preflight(root, manifest_paths=[manifest])
+    spec = json.loads((root / "kaggle-preflight.json").read_text())
+    assert spec["sklearn_compatibility_assets"] == [
+        {"dataset_ref": "zodrak/test-data", "filename": "deployment/grouper.joblib", "size": 9}
+    ]
+    assert "_KAGGLE_PREFLIGHT_SPEC.get(\"sklearn_compatibility_assets\")" in runtime_preflight_code(spec)
+
+
+def test_explicit_compatibility_allowlist_survives_push_reembedding(tmp_path):
+    root = _kernel(tmp_path)
+    manifest = tmp_path / "published_bundle_manifest.json"
+    write_json(manifest, {"files": [
+        {"dataset_ref": "zodrak/test-data", "flat_filename": "grouper.joblib", "size": 10},
+        {"dataset_ref": "zodrak/test-data", "flat_filename": "checkpoint.joblib", "size": 12},
+    ]})
+    selected = [{"dataset_ref": "zodrak/test-data", "filename": "grouper.joblib"}]
+    embed_runtime_preflight(root, manifest_paths=[manifest], sklearn_compatibility_assets=selected)
+    embed_runtime_preflight(root, manifest_paths=[manifest])
+    spec = json.loads((root / "kaggle-preflight.json").read_text())
+    assert [x["filename"] for x in spec["sklearn_compatibility_assets"]] == ["grouper.joblib"]
+
+
 def test_submission_wrapper_fetches_exact_version_validates_and_submits(tmp_path, monkeypatch):
     expected_ids = tmp_path / "test.csv"
     pd.DataFrame({"id": ["r1", "r2"]}).to_csv(expected_ids, index=False)
@@ -318,7 +352,58 @@ def test_submission_wrapper_fetches_exact_version_validates_and_submits(tmp_path
     assert _cmd_submit(args) == 0
     assert calls[0][0][3] == "owner/kernel/7"
     assert calls[1][0][:4] == ["kaggle", "competitions", "submit", "name-that-llm"]
-    assert calls[1][1] == output_dir.resolve()
+    assert calls[1][0][calls[1][0].index("-f") + 1] == "submission.parquet"
+    assert calls[1][1] == output_dir.resolve() / "submit-1"
+    assert (output_dir / "submit-1/submission.parquet").is_file()
+
+
+def test_submission_wrapper_canonicalizes_each_variant_before_submit(tmp_path, monkeypatch):
+    expected_ids = tmp_path / "test.csv"
+    pd.DataFrame({"id": ["r1", "r2"]}).to_csv(expected_ids, index=False)
+    labels = tmp_path / "labels.json"
+    labels.write_text(json.dumps(["a", "b"]))
+    output_dir = tmp_path / "output"
+    calls = []
+
+    def fake_run(command, *args, **kwargs):
+        calls.append((command, kwargs.get("cwd")))
+        if command[1:3] == ["kernels", "output"]:
+            destination = Path(command[command.index("-p") + 1])
+            for filename, models in (("submission.parquet", ["a", "b"]),
+                                     ("submission_e19_f_a.parquet", ["b", "a"])):
+                pd.DataFrame({"id": ["r1", "r2"], "model": models}).to_parquet(
+                    destination / filename, index=False)
+            (destination / "kaggle_preflight.json").write_text(json.dumps({"status": "PASS", "errors": []}))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("scripts.kaggle_preflight.subprocess.run", fake_run)
+    args = SimpleNamespace(kernel="owner/kernel", version=9, competition="name-that-llm",
+        output_dir=str(output_dir), file=["submission.parquet", "submission.parquet"],
+        variant_source_file=["submission.parquet", "submission_e19_f_a.parquet"],
+        labels_json=str(labels), expected_ids=str(expected_ids), message="E33 {file}")
+    assert _cmd_submit(args) == 0
+    submit_calls = [item for item in calls if item[0][1:3] == ["competitions", "submit"]]
+    assert len(submit_calls) == 2
+    assert all(item[0][item[0].index("-f") + 1] == "submission.parquet" for item in submit_calls)
+    assert (output_dir / "submit-1/submission.parquet").is_file()
+    assert (output_dir / "submit-2/submission.parquet").is_file()
+
+
+def test_remote_model_preflight_accepts_unique_nested_config_and_processor(tmp_path, monkeypatch):
+    kernel = _kernel(tmp_path)
+    ref = "owner/nested-qwen/PyTorch/default/1"
+    (kernel / "kernel-metadata.json").write_text(json.dumps({
+        "id": "owner/test", "title": "test", "code_file": "test.ipynb",
+        "kernel_type": "notebook", "language": "python", "enable_gpu": True,
+        "dataset_sources": [], "model_sources": [ref]}))
+    (kernel / "kaggle-preflight.json").write_text(json.dumps({"processor_sources": [ref]}))
+    names = ["Qwen3.5-4B/config.json", "Qwen3.5-4B/tokenizer.json",
+             "Qwen3.5-4B/processor_config.json"]
+    monkeypatch.setattr("scripts.kaggle_preflight._run_json_command",
+        lambda command: [{"name": name, "size": 10} for name in names])
+    result = validate_remote_sources(kernel)
+    assert result["models"][ref]["model_subdirectory"] == "Qwen3.5-4B"
+    assert result["models"][ref]["has_processor_config"] is True
 
 
 def test_submission_wrapper_refuses_failed_runtime_preflight(tmp_path, monkeypatch):

@@ -329,6 +329,8 @@ write_submission("E19-F-C","submission_e19_f_c.parquet",pred_c)'''
         strict_versions=strict_versions,
         required_distributions=required_distributions,
         manifest_paths=[LOCAL / "e30_b_manifest.json", LOCAL / "e28_manifest.json"],
+        sklearn_compatibility_assets=[{"dataset_ref": DATASET_REF,
+                                      "filename": "e19_f_c_external_grouper.joblib"}],
     )
     package_preflight = validate_kernel_package(KERNEL)
     return {"dataset_dir":str(LOCAL),"notebook_dir":str(KERNEL),"dataset_ref":DATASET_REF,

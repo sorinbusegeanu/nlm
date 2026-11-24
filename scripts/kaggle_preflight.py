@@ -16,6 +16,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import symtable
@@ -406,16 +407,31 @@ def validate_remote_sources(kernel_dir: str | Path) -> dict[str, Any]:
         records = _run_json_command(["kaggle", "models", "instances", "versions", "files", ref,
                                      "--format", "json", "--page-size", "200"])
         names = {entry.get("name") for entry in records if isinstance(entry, dict)}
-        if "config.json" not in names:
-            raise PreflightError(f"Kaggle model source lacks root config.json: {ref}")
-        if not names.intersection({"tokenizer.json", "tokenizer.model", "vocab.txt"}):
-            raise PreflightError(f"Kaggle model source lacks a recognizable tokenizer: {ref}")
-        if ref in processor_sources and not names.intersection({"preprocessor_config.json", "processor_config.json"}):
-            raise PreflightError(f"Kaggle model source is marked as processor-backed but lacks processor config: {ref}")
-        models[ref] = {"file_count": len(names),
-                       "has_config": "config.json" in names,
-                       "has_tokenizer": bool(names.intersection({"tokenizer.json", "tokenizer.model", "vocab.txt"})),
-                       "has_processor_config": bool(names.intersection({"preprocessor_config.json", "processor_config.json"}))}
+        config_names = {name for name in names if isinstance(name, str)
+                        and Path(name).name == "config.json"}
+        if not config_names:
+            raise PreflightError(f"Kaggle model source lacks config.json: {ref}")
+        model_dirs = {str(Path(name).parent) for name in config_names}
+        tokenizer_names = {name for name in names if isinstance(name, str)
+                           and Path(name).name in {"tokenizer.json", "tokenizer.model", "vocab.txt"}}
+        viable_dirs = [directory for directory in model_dirs
+                       if any(str(Path(name).parent) == directory for name in tokenizer_names)]
+        # Kaggle model variations can store their payload under one top-level
+        # model directory. Accept a unique nested config/tokenizer pair and
+        # retain the discovered prefix for the runtime gate.
+        if not viable_dirs:
+            raise PreflightError(f"Kaggle model source lacks a config/tokenizer pair: {ref}")
+        if len(viable_dirs) != 1:
+            raise PreflightError(f"Kaggle model source has ambiguous model roots: {ref}: {viable_dirs}")
+        model_subdir = "" if viable_dirs[0] == "." else viable_dirs[0]
+        processor_names = {name for name in names if isinstance(name, str)
+                           and Path(name).name in {"preprocessor_config.json", "processor_config.json"}}
+        if ref in processor_sources and not any(str(Path(name).parent) == viable_dirs[0] for name in processor_names):
+            raise PreflightError(f"Kaggle model source lacks processor config: {ref}")
+        models[ref] = {"file_count": len(names), "has_config": True,
+                       "model_subdirectory": model_subdir,
+                       "has_tokenizer": bool(tokenizer_names),
+                       "has_processor_config": any(str(Path(name).parent) == viable_dirs[0] for name in processor_names)}
     expected_assets = _collect_dataset_assets(root, set(metadata.get("dataset_sources", [])))
     expected_assets.extend(extra.get("required_dataset_files", []))
     # Deduplicate exact source/basename pairs while retaining an expected size.
@@ -462,7 +478,9 @@ def _kp_to_json_safe(_obj):
 def kaggle_json_dumps(_obj,*_args,**_kwargs): return _kpjson.dumps(_kp_to_json_safe(_obj),*_args,**_kwargs)
 def kaggle_json_dump(_obj,_file,*_args,**_kwargs): return _kpjson.dump(_kp_to_json_safe(_obj),_file,*_args,**_kwargs)
 _kp_errors=[]; _kp_report={{"python":_kpsys.version,"packages":{{}},"dataset_mounts":{{}},"model_mounts":{{}},"sklearn_artifacts":[],"local_sklearn_artifact_audit":_KAGGLE_PREFLIGHT_SPEC.get("local_sklearn_artifact_audit",[])}}
-_kp_joblib_assets=[_a for _a in _KAGGLE_PREFLIGHT_SPEC.get("required_dataset_files",[]) if str(_a.get("filename","")).lower().endswith(".joblib")]
+_kp_joblib_assets=_KAGGLE_PREFLIGHT_SPEC.get("sklearn_compatibility_assets")
+if _kp_joblib_assets is None:
+    _kp_joblib_assets=[_a for _a in _KAGGLE_PREFLIGHT_SPEC.get("required_dataset_files",[]) if str(_a.get("filename","")).lower().endswith(".joblib")]
 if _kp_joblib_assets:
     import warnings as _kpwarnings, joblib as _kpjoblib
     _kp_original_joblib_load=_kpjoblib.load
@@ -535,15 +553,23 @@ for _ref in _KAGGLE_PREFLIGHT_SPEC.get("model_sources",[]):
     if not _path.is_dir():
         _kp_errors.append(f"model source is not mounted at expected path: {{_ref}} -> {{_path}}")
         continue
-    _files={{p.name for p in _path.iterdir() if p.is_file()}}
-    if "config.json" not in _files: _kp_errors.append(f"model source lacks config.json: {{_path}}")
-    if not _files.intersection({{"tokenizer.json","tokenizer.model","vocab.txt"}}): _kp_errors.append(f"model source lacks tokenizer files: {{_path}}")
+    _candidates=[p.parent for p in _path.rglob("config.json")]
+    _roots=[p for p in _candidates if any((p/name).is_file() for name in ("tokenizer.json","tokenizer.model","vocab.txt"))]
+    if not _roots: _kp_errors.append(f"model source lacks a config/tokenizer pair: {{_path}}")
+    else:
+        _depth=min(len(p.parts) for p in _roots); _roots=[p for p in _roots if len(p.parts)==_depth]
+        if len(_roots)!=1: _kp_errors.append(f"model source has ambiguous model roots: {{_path}} -> {{_roots[:5]}}")
+        else: _path=_roots[0]
     _kp_report["model_mounts"][_ref]=str(_path)
 if not _kp_errors and _KAGGLE_PREFLIGHT_SPEC.get("model_sources"):
     try:
         from transformers import AutoConfig as _KPAutoConfig, AutoTokenizer as _KPAutoTokenizer, AutoProcessor as _KPAutoProcessor
         for _ref in _KAGGLE_PREFLIGHT_SPEC["model_sources"]:
-            _parts=_ref.split("/"); _path=_kp_input/"models"/_parts[0]/_parts[1]/_parts[2].lower()/_parts[3]/_parts[4]
+            _parts=_ref.split("/"); _base=_kp_input/"models"/_parts[0]/_parts[1]/_parts[2].lower()/_parts[3]/_parts[4]
+            _roots=[p.parent for p in _base.rglob("config.json") if any((p.parent/name).is_file() for name in ("tokenizer.json","tokenizer.model","vocab.txt"))]
+            _depth=min(len(p.parts) for p in _roots); _roots=[p for p in _roots if len(p.parts)==_depth]
+            if len(_roots)!=1: raise RuntimeError(f"ambiguous model root for {{_ref}}: {{_roots[:5]}}")
+            _path=_roots[0]
             _cfg=_KPAutoConfig.from_pretrained(str(_path),local_files_only=True,trust_remote_code=True)
             _KPAutoTokenizer.from_pretrained(str(_path),local_files_only=True,trust_remote_code=True)
             _kp_report.setdefault("model_configs",{{}})[_ref]={{"model_type":getattr(_cfg,"model_type",None),"tokenizer":"ok"}}
@@ -570,6 +596,7 @@ def embed_runtime_preflight(
     required_distributions: list[str] | None = None,
     processor_sources: list[str] | None = None,
     manifest_paths: list[str | Path] | tuple[str | Path, ...] = (),
+    sklearn_compatibility_assets: list[dict[str, str]] | None = None,
 ) -> int:
     root = Path(kernel_dir)
     metadata_path = root / "kernel-metadata.json"
@@ -580,7 +607,20 @@ def embed_runtime_preflight(
     insert_at = 1 if notebook.cells and notebook.cells[0].cell_type == "markdown" else 0
     required_dataset_files = _collect_dataset_assets(
         root, set(metadata.get("dataset_sources", [])), manifest_paths=manifest_paths)
-    local_sklearn_audit = _audit_local_sklearn_artifacts(root, required_dataset_files)
+    # A mounted checkpoint dataset can contain unrelated serialized models.
+    # Only compatibility-smoke-test joblib files that this deployment actually
+    # loads (for example, a frozen external grouper), not every joblib file
+    # mentioned by a broad catalog manifest.
+    compatibility_assets = sklearn_compatibility_assets
+    if compatibility_assets is None:
+        compatibility_assets = metadata.get("sklearn_compatibility_assets")
+    if compatibility_assets is None:
+        compatibility_assets = [a for a in required_dataset_files
+                                if str(a.get("filename", "")).lower().endswith(".joblib")]
+    compat_keys = {(a["dataset_ref"], Path(a["filename"]).name) for a in compatibility_assets}
+    compatibility_assets = [a for a in required_dataset_files
+                            if (a["dataset_ref"], Path(a["filename"]).name) in compat_keys]
+    local_sklearn_audit = _audit_local_sklearn_artifacts(root, compatibility_assets)
     spec = {
         "dataset_sources": metadata.get("dataset_sources", []),
         "model_sources": metadata.get("model_sources", []),
@@ -588,8 +628,14 @@ def embed_runtime_preflight(
         "required_distributions": required_distributions or [],
         "processor_sources": processor_sources or [],
         "required_dataset_files": required_dataset_files,
+        "sklearn_compatibility_assets": compatibility_assets,
         "local_sklearn_artifact_audit": local_sklearn_audit,
     }
+    # Preserve this deployment-specific allowlist through later `push`
+    # invocations, which rebuild the runtime gate from kernel metadata.
+    if sklearn_compatibility_assets is not None:
+        metadata["sklearn_compatibility_assets"] = compatibility_assets
+        write_json(metadata_path, metadata)
     write_json(root / "kaggle-preflight.json", spec)
     cell = nbformat.v4.new_code_cell(runtime_preflight_code(spec))
     cell.metadata["tags"] = ["kaggle-preflight"]
@@ -666,12 +712,16 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     if any(name != "submission.parquet" for name in args.file):
         raise PreflightError(
             "Kaggle code submissions in this repository must use the canonical output filename "
-            "submission.parquet; package the selected variant under that name before submitting"
+            "submission.parquet; each selected variant will be validated, then copied to that "
+            "canonical basename before the competition API call"
         )
+    variant_sources = getattr(args, "variant_source_file", None) or ["submission.parquet"] * len(args.file)
+    if len(variant_sources) != len(args.file):
+        raise PreflightError("--variant-source-file must be supplied once per --file submission")
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     versioned_ref = f"{args.kernel.rstrip('/')}/{args.version}"
-    fetched_names = [*args.file, "kaggle_preflight.json"]
+    fetched_names = [*args.file, *variant_sources, "kaggle_preflight.json"]
     file_pattern = "^(?:" + "|".join(re.escape(name) for name in fetched_names) + ")$"
     fetch = subprocess.run(["kaggle", "kernels", "output", versioned_ref,
                             "-p", str(output_dir), "--force", "--file-pattern", file_pattern],
@@ -685,16 +735,23 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     if runtime_report.get("status") != "PASS":
         raise PreflightError(f"Kaggle runtime preflight did not pass: {runtime_report.get('errors', [])}")
     ids_by_file = []
-    for name in args.file:
-        path = output_dir / name
-        ids_by_file.append((name, validate_submission_file(path, labels=labels, expected_ids=expected)))
+    for source_name in variant_sources:
+        path = output_dir / source_name
+        ids_by_file.append((source_name, validate_submission_file(path, labels=labels, expected_ids=expected)))
     if ids_by_file and any(ids != ids_by_file[0][1] for _, ids in ids_by_file[1:]):
         raise PreflightError("submission variants do not have identical ordered IDs")
-    for name, _ in ids_by_file:
+    for index, (name, _) in enumerate(ids_by_file):
+        # Kaggle's code-submission endpoint requires the uploaded file basename
+        # to be exactly submission.parquet. Keep each variant in its own folder
+        # so the canonical name never overwrites another candidate.
+        source = output_dir / variant_sources[index]
+        submit_dir = output_dir / f"submit-{index + 1}"
+        submit_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, submit_dir / "submission.parquet")
         result = subprocess.run(
             ["kaggle", "competitions", "submit", args.competition, "-k", args.kernel,
-             "-v", str(args.version), "-f", name, "-m", args.message.format(file=name)],
-            cwd=output_dir,
+             "-v", str(args.version), "-f", "submission.parquet", "-m", args.message.format(file=name)],
+            cwd=submit_dir,
         )
         if result.returncode:
             raise PreflightError(f"Kaggle submission command failed for {name}")
@@ -724,6 +781,8 @@ def main(argv: list[str] | None = None) -> int:
     submit.add_argument("--competition", required=True)
     submit.add_argument("--output-dir", required=True)
     submit.add_argument("--file", action="append", required=True, help="output file name; repeat for variants")
+    submit.add_argument("--variant-source-file", action="append",
+                        help="validated completed-kernel output to submit as canonical submission.parquet; repeat once per --file")
     submit.add_argument("--message", required=True, help="submission message; may include {file}")
     submit.add_argument("--expected-ids", required=True, help="CSV/Parquet with the expected test id order")
     submit.add_argument("--labels-json", required=True, help="JSON label list or object with classes/labels")

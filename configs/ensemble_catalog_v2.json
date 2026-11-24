@@ -947,13 +947,14 @@
       "started_at": "2026-11-23",
       "accuracy": 0.6465357539829566,
       "balanced_accuracy": 0.6464653243847874,
-      "local_status": "Local evaluation complete; Kaggle kernel queued",
+      "local_status": "Kaggle v11 completed; competition submission 58827588 pending",
       "scenario_count": 50,
       "primary_local_variant": "E28-D",
       "local_result_source": "artifacts/analysis/e28/local_results.json",
       "kaggle_kernel": "zodrak/e28-e13-b-external-grouping-hungarian",
-      "kaggle_kernel_version": 4,
-      "kaggle_submission_status": "Kernel v4 queued after fixing notebook worker source and PYTHONPATH"
+      "kaggle_kernel_version": 11,
+      "kaggle_submission_status": "PENDING",
+      "kaggle_submission_id": 58827588
     },
     {
       "id": "E28-A",
@@ -1300,7 +1301,8 @@
         }
       },
       "kaggle_kernel": "zodrak/e30-b-17-checkpoint-e13-b-with-external-hungarian",
-      "kaggle_kernel_version": 2
+      "kaggle_kernel_version": 6,
+      "kaggle_submission_status": "Kernel v6 queued; not yet submitted"
     },
     {
       "id": "E30-A",
@@ -1435,7 +1437,8 @@
       "inference_benchmark": "docs/e31_inference_benchmark.md",
       "result_source": "artifacts/analysis/e31/selection_results.json",
       "scenario_count": 50,
-      "kaggle_preparation_status": "Local package preparation pending; competition submission disabled."
+      "kaggle_preparation_status": "Local package and remote asset preflight PASS; waiting for GPU session",
+      "kaggle_submission_status": "Not submitted"
     },
     {
       "id": "E31-Confusion",
@@ -1593,14 +1596,14 @@
       "name": "V2.GR.OR16 five-model training suite",
       "category": "Supervised classifiers",
       "description": "Sequentially train SVC, CatBoost + Stylometry, MPNet-base, EmbeddingGemma 2 and Granite 4.0 350M on the external-only V2.GR.OR16 dataset after successful E32 completion; select checkpoints using full-V0 balanced accuracy.",
-      "status": "Running",
+      "status": "Scored",
       "baseline_experiment": "E32",
       "training_dataset": "v2.GR.OR16",
       "training_dataset_rows": 231036,
       "training_dataset_sha256": "9373bbd85f03de1f384cb8ae3b6f9b2b27d576629b8fcf0ab344d966fa266a0a",
       "validation_dataset": "v0 (all 2,699 rows)",
       "primary_metric": "V0 balanced accuracy; best checkpoint per model",
-      "current_stage": "running",
+      "current_stage": "completed",
       "progress_source": "artifacts/training_queues/e32_gr_or16_models_20261124T022231Z/queue.json",
       "documentation": "docs/e32_gr_or16_training.md",
       "queue_id": "e32_gr_or16_models_20261124T022231Z",
@@ -1647,25 +1650,26 @@
         {
           "index": 4,
           "model": "embeddinggemma2",
-          "status": "running",
-          "experiment_id": null,
-          "training_duration_seconds": null,
-          "queue_wall_seconds": null,
-          "validation_balanced_accuracy": null,
-          "selected_checkpoint": null
+          "status": "completed",
+          "experiment_id": "embeddinggemma2_v2.GR.OR16_valv0_data5cf9c6ef_split421e6ba8_seed2026_cfgcf7064ea_code996b0b9",
+          "training_duration_seconds": 17022.251797524048,
+          "queue_wall_seconds": 17081.83,
+          "validation_balanced_accuracy": 0.47195873726075077,
+          "selected_checkpoint": "artifacts/runs/embeddinggemma2_v2.GR.OR16_valv0_data5cf9c6ef_split421e6ba8_seed2026_cfgcf7064ea_code996b0b9/checkpoints/embeddinggemma2_foldvalidation"
         },
         {
           "index": 5,
           "model": "granite4_350m",
-          "status": "queued",
-          "experiment_id": null,
-          "training_duration_seconds": null,
-          "queue_wall_seconds": null,
-          "validation_balanced_accuracy": null,
-          "selected_checkpoint": null
+          "status": "completed",
+          "experiment_id": "granite4_350m_v2.GR.OR16_valv0_data5cf9c6ef_split421e6ba8_seed2026_cfgf6c5aa37_codef5d96d5",
+          "training_duration_seconds": 6765.265733260196,
+          "queue_wall_seconds": 6826.0,
+          "validation_balanced_accuracy": 0.5193636589609745,
+          "selected_checkpoint": "artifacts/runs/granite4_350m_v2.GR.OR16_valv0_data5cf9c6ef_split421e6ba8_seed2026_cfgf6c5aa37_codef5d96d5/checkpoints/granite4_350m_foldvalidation"
         }
       ],
-      "updated_at_utc": "2026-11-24T03:38:25+00:00"
+      "updated_at_utc": "2026-11-24T10:16:53+00:00",
+      "completed_at_utc": "2026-11-24T10:16:53+00:00"
     },
     {
       "id": "E33",
@@ -1736,7 +1740,127 @@
           "E19-F-C": 0.7479351658147741,
           "E19-D": 0.7821736183458807
         }
+      },
+      "kaggle_deployment": {
+        "variant": "E33-F",
+        "status": "Waiting for Kaggle GPU capacity",
+        "roster_source": "artifacts/analysis/e31/e31_manifest.json",
+        "checkpoint_count": 40,
+        "trust_list_version": "trust-list-2-v037",
+        "classifier_source": "artifacts/analysis/e33/e33_final.cbm",
+        "reliability_source": "artifacts/analysis/e33/e33_final_reliability.npz",
+        "target_configurations": [
+          "Independent",
+          "E19-F-A + Hungarian",
+          "E19-F-C + Hungarian",
+          "E19-D + Hungarian"
+        ],
+        "kaggle_kernel": "zodrak/e33-f-e31-40-checkpoint-candidate-router",
+        "submission_status": "Not submitted",
+        "kernel_session": "No version created: Kaggle rejected launch at the 2-session limit",
+        "deployment_dataset": "zodrak/e33f-deployment-v001",
+        "deployment_assets": [
+          "e33_final.cbm",
+          "e33_final_reliability.npz",
+          "e33_final_feature_schema.json",
+          "e19_d_external_grouper.joblib"
+        ],
+        "preflight_local": "PASS",
+        "preflight_remote": "PASS",
+        "required_manifest_assets_checked": 126,
+        "processor_model_source": "limamateus/qwen3-5-4b/PyTorch/default/1",
+        "blocking_sessions": [
+          "zodrak/e28-e13-b-external-grouping-hungarian/10",
+          "zodrak/e30-b-17-checkpoint-e13-b-with-external-hungarian/6"
+        ]
       }
+    },
+    {
+      "id": "E34",
+      "name": "Negative Evidence and Learned Candidate Scoring with 60 Checkpoints",
+      "category": "E32 fixed-roster scoring ablation",
+      "description": "Apply the six E33 negative-evidence and candidate-scoring variants to E32\u2019s frozen 60-checkpoint roster and router; compare on the identical 50 v0_group scenarios and E19-F-A/F-C/D grouping assignments.",
+      "status": "Scored",
+      "baseline_experiment": "E32",
+      "checkpoint_count": 60,
+      "training_dataset": "No base-model training; E34-F meta-classifier uses prompt-group cross-fit cached V0 predictions",
+      "validation_dataset": "50 v0_group scenarios reusing V0 rows (correlated robustness diagnostic)",
+      "primary_metric": "Mean balanced accuracy across 50 scenarios for independent, E19-F-A, E19-F-C, E19-D decoders",
+      "current_stage": "Complete",
+      "progress_source": "artifacts/analysis/e34/metrics.json",
+      "documentation": "docs/e34.md",
+      "result_source": "artifacts/analysis/e34/metrics.json",
+      "scenario_count": 50,
+      "variants": [
+        "E34-A",
+        "E34-B",
+        "E34-C",
+        "E34-D",
+        "E34-E",
+        "E34-F"
+      ],
+      "baseline_roster_source": "artifacts/analysis/e32/e32_manifest.json",
+      "v0_exposure_note": "The 50 scenarios reuse V0 responses. Results are correlated robustness diagnostics, not independent validation.",
+      "benchmark_documentation": "docs/e34_inference_benchmark.md",
+      "error": "AttributeError: 'DataFrame' object has no attribute 'configuration'",
+      "scenario_results": {
+        "E31 baseline": {
+          "Independent": 0.6828343200444782,
+          "E19-F-A": 0.7141790513826567,
+          "E19-F-C": 0.7139331430869603,
+          "E19-D": 0.7466713879236394
+        },
+        "E33-F": {
+          "Independent": 0.7164834095343834,
+          "E19-F-A": 0.7498602681034879,
+          "E19-F-C": 0.7479351658147741,
+          "E19-D": 0.7821736183458807
+        },
+        "E32 baseline": {
+          "Independent": 0.6787283620231787,
+          "E19-F-A": 0.7091502406609215,
+          "E19-F-C": 0.708831602557882,
+          "E19-D": 0.742414112989787
+        },
+        "E34-A": {
+          "Independent": 0.6707707786392716,
+          "E19-F-A": 0.6972159395446158,
+          "E19-F-C": 0.6984780980873231,
+          "E19-D": 0.7265705153331904
+        },
+        "E34-B": {
+          "Independent": 0.6778269222797683,
+          "E19-F-A": 0.7082030714267686,
+          "E19-F-C": 0.7079166336337073,
+          "E19-D": 0.7414279799656711
+        },
+        "E34-C": {
+          "Independent": 0.6787283620231787,
+          "E19-F-A": 0.7091502406609215,
+          "E19-F-C": 0.708831602557882,
+          "E19-D": 0.742414112989787
+        },
+        "E34-D": {
+          "Independent": 0.6761384094725438,
+          "E19-F-A": 0.7051267371253335,
+          "E19-F-C": 0.7047017805563658,
+          "E19-D": 0.7372245253406084
+        },
+        "E34-E": {
+          "Independent": 0.6604687440697713,
+          "E19-F-A": 0.6845627739425331,
+          "E19-F-C": 0.6832240696597812,
+          "E19-D": 0.7115898251519037
+        },
+        "E34-F": {
+          "Independent": 0.7127930814187061,
+          "E19-F-A": 0.7474710621783751,
+          "E19-F-C": 0.7456655244489828,
+          "E19-D": 0.7798211957094161
+        }
+      },
+      "inference_benchmark_source": "artifacts/analysis/e34/inference_benchmark.json",
+      "deployment_manifest": "artifacts/analysis/e34/e34_deployment_manifest.json"
     }
   ],
   "display_catalog_version": "1.0.0",
