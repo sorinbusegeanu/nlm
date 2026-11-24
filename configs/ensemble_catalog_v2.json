@@ -1666,6 +1666,77 @@
         }
       ],
       "updated_at_utc": "2026-11-24T03:38:25+00:00"
+    },
+    {
+      "id": "E33",
+      "name": "Negative Evidence and Candidate Label Elimination",
+      "category": "E31 fixed-roster scoring ablation",
+      "description": "Evaluate six candidate-label negative-evidence variants (single-checkpoint, family consensus, E31-conditional, weighted penalties, combined positive/negative reliability, and learned CatBoost elimination) against the fixed E31 40-checkpoint ensemble across the same 50 v0_group scenarios and four existing decoders.",
+      "status": "Scored",
+      "baseline_experiment": "E31",
+      "checkpoint_count": 40,
+      "training_dataset": "None; classifier meta-training uses prompt-group folds of cached V0 checkpoint predictions",
+      "validation_dataset": "50 v0_group scenarios reusing V0 rows (correlated robustness diagnostic)",
+      "primary_metric": "Mean balanced accuracy across 50 scenarios; four decoder variants",
+      "current_stage": "Complete",
+      "progress_source": "artifacts/analysis/e33/metrics.json",
+      "documentation": "docs/e33.md",
+      "result_source": "artifacts/analysis/e33/metrics.json",
+      "scenario_count": 50,
+      "variants": [
+        "E33-A",
+        "E33-B",
+        "E33-C",
+        "E33-D",
+        "E33-E",
+        "E33-F"
+      ],
+      "baseline_roster_source": "artifacts/analysis/e31/e31_manifest.json",
+      "v0_exposure_note": "The 50 scenarios reuse V0 responses. Results are not independent validation.",
+      "scenario_results": {
+        "E31 baseline": {
+          "Independent": 0.6828343200444782,
+          "E19-F-A": 0.7141790513826567,
+          "E19-F-C": 0.7139331430869603,
+          "E19-D": 0.7466713879236394
+        },
+        "E33-A": {
+          "Independent": 0.6751372649816342,
+          "E19-F-A": 0.704099839370998,
+          "E19-F-C": 0.7047523224409394,
+          "E19-D": 0.7335481024691657
+        },
+        "E33-B": {
+          "Independent": 0.6828343200444782,
+          "E19-F-A": 0.7139915083629111,
+          "E19-F-C": 0.7136679195261721,
+          "E19-D": 0.7465709991535588
+        },
+        "E33-C": {
+          "Independent": 0.6828343200444782,
+          "E19-F-A": 0.7141790513826567,
+          "E19-F-C": 0.7139331430869603,
+          "E19-D": 0.7466713879236394
+        },
+        "E33-D": {
+          "Independent": 0.6801465922459756,
+          "E19-F-A": 0.7107504644784032,
+          "E19-F-C": 0.7117687681147744,
+          "E19-D": 0.7437350258722517
+        },
+        "E33-E": {
+          "Independent": 0.6662102771113702,
+          "E19-F-A": 0.6884822375235387,
+          "E19-F-C": 0.6876547888541782,
+          "E19-D": 0.7143352688329457
+        },
+        "E33-F": {
+          "Independent": 0.7164834095343834,
+          "E19-F-A": 0.7498602681034879,
+          "E19-F-C": 0.7479351658147741,
+          "E19-D": 0.7821736183458807
+        }
+      }
     }
   ],
   "display_catalog_version": "1.0.0",
