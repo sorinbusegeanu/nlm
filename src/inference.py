@@ -146,8 +146,22 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
             model_name == "modernbert_large" and attention_backend) else {}
         if code_revision:
             model_kwargs["code_revision"] = code_revision
-        network = AutoModelForSequenceClassification.from_pretrained(
-            checkpoint, local_files_only=True, trust_remote_code=True, **model_kwargs)
+        enhancement_manifest = checkpoint_metadata.get("ultrabert_enhancements")
+        if model_name == "ultrabert380" and enhancement_manifest is not None:
+            checkpoint_classes = checkpoint_metadata.get("classes")
+            if checkpoint_classes is not None and list(checkpoint_classes) != list(classes):
+                raise ValueError("enhanced UltraBERT checkpoint label ordering does not match inference classes")
+            from .model_factory import build_ultrabert_enhanced_classifier
+            backbone = AutoModel.from_pretrained(checkpoint, local_files_only=True,
+                trust_remote_code=True, **model_kwargs)
+            network = build_ultrabert_enhanced_classifier(backbone, classes,
+                supervised_contrastive=enhancement_manifest.get("supervised_contrastive"),
+                multi_layer_aggregation=enhancement_manifest.get("multi_layer_aggregation"),
+                state_dir=checkpoint,
+                selected_layer_indices=enhancement_manifest.get("selected_layer_indices"))
+        else:
+            network = AutoModelForSequenceClassification.from_pretrained(
+                checkpoint, local_files_only=True, trust_remote_code=True, **model_kwargs)
         if model_name == "gte_large":
             from .model_factory import ensure_gte_transformers_compatibility
             network = ensure_gte_transformers_compatibility(network)

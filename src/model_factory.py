@@ -223,6 +223,115 @@ class GroupAwareBatchSampler:
         return len(batches)
 
 
+class LabelAwareBatchSampler:
+    """Expose every row once while forming as many same-label positive pairs as possible."""
+    def __init__(self, labels, prompt_ids=None, *, batch_size, seed=2026, initial_epoch=0):
+        self.labels = list(map(str, labels))
+        self.prompt_ids = (list(map(str, prompt_ids)) if prompt_ids is not None else
+                           [f"__row_{i}" for i in range(len(self.labels))])
+        if len(self.labels) != len(self.prompt_ids) or not self.labels:
+            raise ValueError("label-aware sampling requires aligned nonempty labels and prompt IDs")
+        self.batch_size = int(batch_size)
+        if self.batch_size < 1:
+            raise ValueError("label-aware batch size must be positive")
+        self.seed = int(seed)
+        self.next_epoch = max(0, int(initial_epoch))
+        self.epoch_records = []
+
+    def _make_epoch(self, epoch):
+        rng = random.Random(self.seed + int(epoch))
+        remaining = {}
+        for index, label in enumerate(self.labels):
+            remaining.setdefault(label, []).append(index)
+        for indices in remaining.values():
+            rng.shuffle(indices)
+        batches, batch_records = [], []
+
+        def available_labels(minimum=1):
+            return [label for label, rows in remaining.items() if len(rows) >= minimum]
+
+        def take_pair(label, selected):
+            rows = remaining[label]
+            # Different prompts form stronger positives. When possible, align one
+            # prompt with another class already in this batch to create hard negatives.
+            pairs = [(i, j) for pos, i in enumerate(rows) for j in rows[pos + 1:]]
+            if not pairs:
+                return None
+            selected_prompts = {self.prompt_ids[i] for i in selected}
+            def score(pair):
+                a, b = pair
+                return (int(self.prompt_ids[a] != self.prompt_ids[b]),
+                        int(bool(selected_prompts.intersection((self.prompt_ids[a], self.prompt_ids[b])))),
+                        rng.random())
+            pair = max(pairs, key=score)
+            for index in pair:
+                rows.remove(index)
+            return list(pair)
+
+        while any(remaining.values()):
+            batch = []
+            # Fill with label pairs first. A short final batch is permitted.
+            while self.batch_size - len(batch) >= 2:
+                candidates = available_labels(2)
+                if not candidates:
+                    break
+                rng.shuffle(candidates)
+                label = max(candidates, key=lambda item: (
+                    max(int(self.prompt_ids[a] != self.prompt_ids[b])
+                        for pos, a in enumerate(remaining[item]) for b in remaining[item][pos + 1:]),
+                    len(remaining[item]), rng.random()))
+                pair = take_pair(label, batch)
+                if pair is None:
+                    break
+                batch.extend(pair)
+            # Fill any remaining slots with new labels where possible, preferring
+            # prompt IDs already present so different labels become hard negatives.
+            while len(batch) < self.batch_size and any(remaining.values()):
+                candidates = [label for label, rows in remaining.items() if rows]
+                if not candidates:
+                    break
+                present_labels = {self.labels[i] for i in batch}
+                present_prompts = {self.prompt_ids[i] for i in batch}
+                rng.shuffle(candidates)
+                label = max(candidates, key=lambda item: (
+                    int(item not in present_labels),
+                    int(any(self.prompt_ids[i] in present_prompts for i in remaining[item])),
+                    len(remaining[item]), rng.random()))
+                rows = remaining[label]
+                index = max(rows, key=lambda i: (int(self.prompt_ids[i] in present_prompts), rng.random()))
+                rows.remove(index)
+                batch.append(index)
+            if not batch:
+                raise RuntimeError("label-aware sampler failed to make progress")
+            rng.shuffle(batch)
+            label_counts = {}
+            for index in batch:
+                label_counts[self.labels[index]] = label_counts.get(self.labels[index], 0) + 1
+            positive_anchors = sum(count for count in label_counts.values() if count > 1)
+            hard_negatives = sum(1 for i, left in enumerate(batch) for right in batch[i + 1:]
+                                 if self.labels[left] != self.labels[right]
+                                 and self.prompt_ids[left] == self.prompt_ids[right])
+            batches.append(batch)
+            batch_records.append({"rows": len(batch), "positive_anchor_rows": positive_anchors,
+                                  "hard_negative_pairs": hard_negatives})
+        return batches, batch_records
+
+    def __iter__(self):
+        epoch = self.next_epoch
+        self.next_epoch += 1
+        batches, records = self._make_epoch(epoch)
+        self.epoch_records.append({"epoch": epoch + 1, "seed": self.seed + epoch,
+            "sampled_examples": sum(map(len, batches)), "each_row_once": True,
+            "batch_count": len(batches), "batches_with_positive_pairs": sum(
+                int(item["positive_anchor_rows"] > 0) for item in records),
+            "positive_anchor_rows": sum(item["positive_anchor_rows"] for item in records),
+            "hard_negative_pairs": sum(item["hard_negative_pairs"] for item in records)})
+        return iter(batches)
+
+    def __len__(self):
+        return len(self._make_epoch(self.next_epoch)[0])
+
+
 def _make_group_training_collator(data_collator, group_batch_sampler):
     """Attach the current epoch's rank-group IDs to a normal model batch."""
     import torch
@@ -345,6 +454,51 @@ def _group_ranking_trainer(base, class_weights, group_ranking_lambda, group_batc
     return GroupRankingTrainer
 
 
+def _supervised_contrastive_trainer(base, class_weights, contrastive_config):
+    """Trainer loss for independently enabled weighted CE and supervised contrastive learning."""
+    import torch
+
+    ordered_weights = (torch.tensor(list(class_weights.values()), dtype=torch.float32)
+                       if class_weights is not None else None)
+    weight = float(contrastive_config["weight"])
+    temperature = float(contrastive_config["temperature"])
+
+    class SupervisedContrastiveTrainer(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.model_accepts_loss_kwargs = False
+            self._contrastive_loss_accumulator = {"classification": 0.0, "contrastive": 0.0, "batches": 0}
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            if not model.training:
+                clean = {key: value for key, value in inputs.items() if key not in {"row_index"}}
+                return super().compute_loss(model, clean, return_outputs=return_outputs,
+                                            num_items_in_batch=num_items_in_batch)
+            batch = dict(inputs)
+            labels = batch.pop("labels")
+            batch.pop("row_index", None)
+            outputs = model(**batch, return_training_features=True)
+            total, classification, contrastive = supervised_contrastive_objective(
+                outputs["logits"], outputs["contrastive_embeddings"], labels,
+                contrastive_weight=weight, temperature=temperature,
+                class_weight_tensor=ordered_weights)
+            self._contrastive_loss_accumulator["classification"] += float(classification.detach().item())
+            self._contrastive_loss_accumulator["contrastive"] += float(contrastive.detach().item())
+            self._contrastive_loss_accumulator["batches"] += 1
+            return (total, {"logits": outputs["logits"]}) if return_outputs else total
+
+        def log(self, logs, start_time=None):
+            logs = dict(logs)
+            if "loss" in logs and self._contrastive_loss_accumulator["batches"]:
+                count = self._contrastive_loss_accumulator["batches"]
+                logs["train_classification_loss"] = self._contrastive_loss_accumulator["classification"] / count
+                logs["train_supervised_contrastive_loss"] = self._contrastive_loss_accumulator["contrastive"] / count
+                self._contrastive_loss_accumulator = {"classification": 0.0, "contrastive": 0.0, "batches": 0}
+            return super().log(logs, start_time=start_time)
+
+    return SupervisedContrastiveTrainer
+
+
 def _save_lora_epoch_checkpoint(backbone, tokenizer, classifier, checkpoint_dir, metadata,
                                 validation_metrics=None):
     """Write the adapter, classifier head, tokenizer and manifest for one LoRA epoch."""
@@ -382,6 +536,292 @@ def normalize_class_weights(class_weights, classes):
                 or not minimum <= value <= maximum):
             raise ValueError("class_weights values must be positive finite float32 weights")
     return {label: float(class_weights.get(label, 1.0)) for label in classes}
+
+
+def normalize_supervised_contrastive_config(config=None):
+    """Validate and complete the optional UltraBERT supervised-contrastive settings."""
+    config = {} if config is None else config
+    if not isinstance(config, Mapping):
+        raise ValueError("supervised_contrastive must be a mapping")
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("supervised_contrastive.enabled must be boolean")
+    weight = float(config.get("weight", 0.1))
+    temperature = float(config.get("temperature", 0.07))
+    projection_dim = int(config.get("projection_dim", 128))
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError("supervised_contrastive.weight must be finite and nonnegative")
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("supervised_contrastive.temperature must be finite and positive")
+    if projection_dim < 1:
+        raise ValueError("supervised_contrastive.projection_dim must be positive")
+    return {"enabled": enabled, "weight": weight, "temperature": temperature,
+            "projection_dim": projection_dim}
+
+
+def normalize_multi_layer_aggregation_config(config=None):
+    """Validate and complete the optional UltraBERT multi-layer readout settings."""
+    config = {} if config is None else config
+    if not isinstance(config, Mapping):
+        raise ValueError("multi_layer_aggregation must be a mapping")
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("multi_layer_aggregation.enabled must be boolean")
+    num_layers = int(config.get("num_layers", 4))
+    pooling = str(config.get("pooling", "mean"))
+    aggregation = str(config.get("aggregation", "learned_weighted_sum"))
+    if num_layers < 1:
+        raise ValueError("multi_layer_aggregation.num_layers must be positive")
+    if pooling != "mean":
+        raise ValueError("multi_layer_aggregation.pooling currently supports only 'mean'")
+    if aggregation != "learned_weighted_sum":
+        raise ValueError("multi_layer_aggregation.aggregation must be 'learned_weighted_sum'")
+    return {"enabled": enabled, "num_layers": num_layers, "pooling": pooling,
+            "aggregation": aggregation}
+
+
+def supervised_contrastive_loss(embeddings, labels, *, temperature=0.07):
+    """Stable supervised-contrastive loss; anchors without positives are ignored."""
+    import torch
+    import torch.nn.functional as functional
+
+    if embeddings.ndim != 2 or labels.ndim != 1 or len(embeddings) != len(labels):
+        raise ValueError("supervised contrastive loss expects embeddings [rows, dim] and aligned labels")
+    temperature = float(temperature)
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and positive")
+    if len(labels) == 0:
+        return embeddings.float().sum() * 0.0
+    labels = labels.to(embeddings.device)
+    features = functional.normalize(embeddings.float(), p=2, dim=1, eps=1e-12)
+    similarity = torch.matmul(features, features.T) / temperature
+    diagonal = torch.eye(len(labels), dtype=torch.bool, device=labels.device)
+    positive = labels[:, None].eq(labels[None, :]) & ~diagonal
+    valid_anchors = positive.any(dim=1)
+    if not bool(valid_anchors.any()):
+        return embeddings.float().sum() * 0.0
+    # Exclude self-comparisons from both the numerator and denominator. logsumexp
+    # and float32 arithmetic keep the objective finite under autocast.
+    logits = similarity.masked_fill(diagonal, -torch.inf)
+    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+    positive_count = positive.sum(dim=1).clamp_min(1)
+    per_anchor = -(log_prob.masked_fill(~positive, 0.0).sum(dim=1) / positive_count)
+    return per_anchor[valid_anchors].mean()
+
+
+def supervised_contrastive_objective(logits, embeddings, labels, *, contrastive_weight=0.1,
+                                      temperature=0.07, class_weight_tensor=None):
+    """Classification CE plus supervised-contrastive loss for one batch."""
+    import torch.nn.functional as functional
+
+    labels = labels.to(logits.device)
+    weights = class_weight_tensor.to(device=logits.device, dtype=torch.float32) if class_weight_tensor is not None else None
+    classification = functional.cross_entropy(logits.float(), labels, weight=weights)
+    contrastive = supervised_contrastive_loss(embeddings, labels, temperature=temperature)
+    total = classification + float(contrastive_weight) * contrastive
+    return total, classification, contrastive
+
+
+def evenly_spaced_layer_indices(layer_count, num_layers=4):
+    """Choose stable zero-based indices, spanning the backbone and including its final block."""
+    layer_count, num_layers = int(layer_count), int(num_layers)
+    if layer_count < 1 or num_layers < 1 or num_layers > layer_count:
+        raise ValueError("num_layers must be between one and the configured transformer layer count")
+    if num_layers == 1:
+        return [layer_count - 1]
+    return sorted({int(round(float(value))) for value in np.linspace(0, layer_count - 1, num_layers)})
+
+
+def _configured_transformer_layers(backbone):
+    """Find UltraBERT/Transformers layer blocks without retaining hidden states."""
+    config = getattr(backbone, "config", None)
+    text_config = getattr(config, "text_config", None)
+    layer_count = (getattr(config, "num_hidden_layers", None) or
+                   getattr(text_config, "num_hidden_layers", None))
+    paths = ("encoder.layer", "encoder.layers", "transformer.layer", "transformer.layers",
+             "model.encoder.layer", "model.encoder.layers", "model.layers", "layers", "h")
+    for path in paths:
+        value = backbone
+        try:
+            for part in path.split("."):
+                value = getattr(value, part)
+        except AttributeError:
+            continue
+        if isinstance(value, (list, tuple)) or value.__class__.__name__ == "ModuleList":
+            if layer_count is None or len(value) == int(layer_count):
+                return list(value), int(layer_count or len(value)), path
+    if layer_count is None:
+        raise ValueError("backbone configuration does not expose num_hidden_layers")
+    raise ValueError(f"could not locate {layer_count} transformer blocks for multi-layer aggregation")
+
+
+def build_ultrabert_enhanced_classifier(backbone, classes, *, supervised_contrastive=None,
+                                        multi_layer_aggregation=None, state_dir=None,
+                                        selected_layer_indices=None):
+    """Wrap a base UltraBERT backbone with optional multi-layer and contrastive heads.
+
+    The block hooks capture only the selected layers; the backbone is called with its
+    normal output mode, avoiding retention of every layer through ``hidden_states``.
+    """
+    import torch
+    from torch import nn
+
+    contrastive = normalize_supervised_contrastive_config(supervised_contrastive)
+    aggregation = normalize_multi_layer_aggregation_config(multi_layer_aggregation)
+    config = getattr(backbone, "config", None)
+    text_config = getattr(config, "text_config", None)
+    hidden_size = (getattr(config, "hidden_size", None) or getattr(config, "dim", None) or
+                   getattr(text_config, "hidden_size", None) or getattr(text_config, "dim", None))
+    if hidden_size is None:
+        raise ValueError("UltraBERT backbone config must provide hidden_size or dim")
+    if aggregation["enabled"]:
+        layers, layer_count, layer_path = _configured_transformer_layers(backbone)
+        computed_indices = evenly_spaced_layer_indices(layer_count, aggregation["num_layers"])
+        if selected_layer_indices is not None and list(map(int, selected_layer_indices)) != computed_indices:
+            raise ValueError("checkpoint layer indices do not match the current backbone configuration")
+        indices = computed_indices
+        if any(index < 0 or index >= len(layers) for index in indices):
+            raise ValueError("selected transformer layer index is outside the located layer stack")
+    else:
+        layers, layer_count, layer_path, indices = [], None, None, []
+
+    class EnhancedOutput(dict):
+        __getattr__ = dict.__getitem__
+
+    class UltraBERTEnhancedClassifier(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = backbone
+            self.config = getattr(backbone, "config", None)
+            self.classifier = nn.Linear(int(hidden_size), len(classes))
+            self.supervised_contrastive = contrastive
+            self.multi_layer_aggregation = aggregation
+            self.selected_layer_indices = list(indices)
+            self.layer_path = layer_path
+            self._layer_captures = {}
+            self._collecting_layers = False
+            if aggregation["enabled"]:
+                # Softmax(0,...,0) gives equal weights at initialization.
+                self.aggregation_logits = nn.Parameter(torch.zeros(len(indices), dtype=torch.float32))
+                self._layer_hook_handles = []
+                for index in indices:
+                    self._layer_hook_handles.append(layers[index].register_forward_hook(
+                        self._capture_layer(index)))
+            else:
+                self.register_parameter("aggregation_logits", None)
+                self._layer_hook_handles = []
+            if contrastive["enabled"]:
+                self.projection_head = nn.Sequential(
+                    nn.Linear(int(hidden_size), int(hidden_size)), nn.GELU(),
+                    nn.Linear(int(hidden_size), contrastive["projection_dim"]))
+            else:
+                self.projection_head = None
+
+        def _capture_layer(self, index):
+            def capture(_module, _inputs, output):
+                if not self._collecting_layers:
+                    return
+                value = output[0] if isinstance(output, (tuple, list)) else output
+                if not torch.is_tensor(value):
+                    value = getattr(value, "last_hidden_state", None)
+                if value is None or value.ndim != 3:
+                    raise RuntimeError(f"transformer block {index} did not return [batch, tokens, hidden]")
+                self._layer_captures[index] = value
+            return capture
+
+        def _mean_pool(self, hidden, attention_mask):
+            mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+            return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+
+        def pooled_representation(self, input_ids, attention_mask):
+            self._layer_captures = {}
+            self._collecting_layers = bool(aggregation["enabled"])
+            try:
+                output = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+                if aggregation["enabled"]:
+                    missing = [index for index in indices if index not in self._layer_captures]
+                    if missing:
+                        raise RuntimeError(f"selected hidden-layer hooks did not fire: {missing}")
+                    pooled = [self._mean_pool(self._layer_captures[index], attention_mask) for index in indices]
+                    weights = torch.softmax(self.aggregation_logits.float(), dim=0)
+                    return torch.stack(pooled, dim=0).float().mul(weights[:, None, None]).sum(dim=0)
+                return self._mean_pool(output.last_hidden_state, attention_mask)
+            finally:
+                self._collecting_layers = False
+                self._layer_captures = {}
+
+        def forward(self, input_ids, attention_mask, labels=None,
+                    return_training_features=False):
+            pooled = self.pooled_representation(input_ids, attention_mask)
+            logits = self.classifier(pooled.float())
+            result = EnhancedOutput(logits=logits)
+            if contrastive["enabled"] and (self.training or return_training_features):
+                embedding = torch.nn.functional.normalize(
+                    self.projection_head(pooled.float()).float(), p=2, dim=1, eps=1e-12)
+                result["contrastive_embeddings"] = embedding
+            if labels is not None:
+                labels = labels.to(logits.device)
+                ce = torch.nn.functional.cross_entropy(logits.float(), labels)
+                if self.training and contrastive["enabled"]:
+                    con = supervised_contrastive_loss(
+                        result["contrastive_embeddings"], labels,
+                        temperature=contrastive["temperature"])
+                    result["loss"] = ce + contrastive["weight"] * con
+                else:
+                    result["loss"] = ce
+            return result
+
+        def enhancement_metadata(self):
+            return {"supervised_contrastive": dict(contrastive),
+                    "multi_layer_aggregation": dict(aggregation),
+                    "selected_layer_indices": list(indices),
+                    "layer_count": layer_count,
+                    "layer_module_path": layer_path,
+                    "pooled_representation": "attention_mask_mean",
+                    "aggregation_initialization": "equal_softmax_weights" if aggregation["enabled"] else None}
+
+        def save_pretrained(self, save_directory, safe_serialization=True, **_kwargs):
+            save_directory = Path(save_directory)
+            save_directory.mkdir(parents=True, exist_ok=True)
+            self.backbone.save_pretrained(save_directory, safe_serialization=safe_serialization)
+            torch.save({key: value.detach().cpu() for key, value in self.classifier.state_dict().items()},
+                       save_directory / "classifier.pt")
+            if self.projection_head is not None:
+                torch.save({key: value.detach().cpu() for key, value in self.projection_head.state_dict().items()},
+                           save_directory / "contrastive_projection.pt")
+            if self.aggregation_logits is not None:
+                torch.save(self.aggregation_logits.detach().cpu(), save_directory / "aggregation_logits.pt")
+            manifest_path = save_directory / "checkpoint_manifest.json"
+            existing = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+            existing["ultrabert_enhancements"] = self.enhancement_metadata()
+            existing["classes"] = list(classes)
+            manifest_path.write_text(json.dumps(existing, indent=2) + "\n")
+
+    model = UltraBERTEnhancedClassifier()
+    model.ultrabert_enhancements = model.enhancement_metadata()
+    model._batch_probe_model_id = "ultrabert380-enhanced:" + hashlib.sha256(
+        json.dumps(model.ultrabert_enhancements, sort_keys=True).encode()).hexdigest()[:12]
+    if state_dir is not None:
+        state_dir = Path(state_dir)
+        classifier_path = state_dir / "classifier.pt"
+        if not classifier_path.is_file():
+            raise FileNotFoundError(f"enhanced UltraBERT checkpoint is missing {classifier_path.name}")
+        model.classifier.load_state_dict(torch.load(classifier_path, map_location="cpu", weights_only=True))
+        if contrastive["enabled"]:
+            projection_path = state_dir / "contrastive_projection.pt"
+            if not projection_path.is_file():
+                raise FileNotFoundError(f"enhanced UltraBERT checkpoint is missing {projection_path.name}")
+            model.projection_head.load_state_dict(torch.load(projection_path, map_location="cpu", weights_only=True))
+        if aggregation["enabled"]:
+            aggregation_path = state_dir / "aggregation_logits.pt"
+            if not aggregation_path.is_file():
+                raise FileNotFoundError(f"enhanced UltraBERT checkpoint is missing {aggregation_path.name}")
+            saved_weights = torch.load(aggregation_path, map_location="cpu", weights_only=True)
+            if tuple(saved_weights.shape) != tuple(model.aggregation_logits.shape):
+                raise ValueError("saved aggregation weights do not match selected layer count")
+            with torch.no_grad():
+                model.aggregation_logits.copy_(saved_weights)
+    return model
 
 
 def classification_loss_with_optional_weights(logits, labels, class_weight_tensor, *, training):
@@ -1143,7 +1583,7 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
                               validation_labels=None, early_stopping_rounds=100,
                               feature_recipe=None, feature_matrices=None, init_model=None,
                               checkpoint_metadata=None, checkpoint_selection_metric="balanced_accuracy",
-                              stop_file=None):
+                              stop_file=None, validation_sample_weights=None):
     """Fit CatBoost on deterministic row-local style statistics; no validation fitting."""
     try:
         from catboost import CatBoostClassifier
@@ -1162,7 +1602,8 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         x_train = np.asarray(x_train, dtype=np.float64)
         x_validation = np.asarray(x_validation, dtype=np.float64)
         feature_names = list(feature_names)
-    metric = _BalancedAccuracyMetric(classes) if checkpoint_selection_metric == "balanced_accuracy" else "Accuracy"
+    metric = ("Accuracy" if validation_sample_weights is not None else
+              _BalancedAccuracyMetric(classes) if checkpoint_selection_metric == "balanced_accuracy" else "Accuracy")
     model = CatBoostClassifier(iterations=int(iterations), depth=int(depth),
         learning_rate=float(learning_rate), l2_leaf_reg=float(l2_leaf_reg),
         loss_function="MultiClass", eval_metric=metric, auto_class_weights="Balanced",
@@ -1184,7 +1625,14 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
     if init_model is not None:
         fit_kwargs["init_model"] = str(init_model)
     if validation_labels is not None:
-        fit_kwargs.update({"eval_set": (x_validation, list(validation_labels)),
+        eval_set = (x_validation, list(validation_labels))
+        if validation_sample_weights is not None:
+            from catboost import Pool
+            weights = np.asarray(validation_sample_weights, dtype=np.float64)
+            if weights.shape != (len(validation_labels),) or not np.isfinite(weights).all() or np.any(weights <= 0):
+                raise ValueError("validation_sample_weights must be finite positive weights aligned to validation labels")
+            eval_set = Pool(x_validation, list(validation_labels), weight=weights)
+        fit_kwargs.update({"eval_set": eval_set,
                            "use_best_model": True,
                            "early_stopping_rounds": int(early_stopping_rounds)})
     startup_seconds = time.perf_counter() - start
@@ -2032,6 +2480,11 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                        training_views=None, training_view_ids=None, stop_file=None,
                        weighted_sampling=False, sampling_weights=None,
                        class_weights=None,
+                       supervised_contrastive=None, multi_layer_aggregation=None,
+                       label_prompt_ids=None,
+                       validation_dataset_tags=None,
+                       validation_sample_weights=None,
+                       validation_batch_size=None,
                        group_aware_sampling=False, group_ranking_lambda=0.0,
                        group_prompt_ids=None, ranking_rotation_indices=None,
                        resume_optimizer_state_with_lr_override=False,
@@ -2052,6 +2505,13 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     label_map = {label: i for i, label in enumerate(classes)}
     y_indices = np.asarray([label_map[y] for y in y_train], dtype=np.int64)
     normalized_class_weights = normalize_class_weights(class_weights, classes)
+    contrastive_config = normalize_supervised_contrastive_config(supervised_contrastive)
+    aggregation_config = normalize_multi_layer_aggregation_config(multi_layer_aggregation)
+    enhancements_enabled = contrastive_config["enabled"] or aggregation_config["enabled"]
+    if enhancements_enabled and (group_aware_sampling or weighted_sampling):
+        raise ValueError("UltraBERT enhancements use label-aware batches and cannot be combined with group_aware_sampling or weighted_sampling")
+    if contrastive_config["enabled"] and label_prompt_ids is not None and len(label_prompt_ids) != len(train_text):
+        raise ValueError("label_prompt_ids must align with training rows")
     group_ranking_lambda = float(group_ranking_lambda)
     if not math.isfinite(group_ranking_lambda) or group_ranking_lambda < 0:
         raise ValueError("group_ranking_lambda must be a finite nonnegative number")
@@ -2062,8 +2522,12 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     if group_aware_sampling and (len(group_prompt_ids) != len(train_text)
             or len(ranking_rotation_indices) != len(train_text)):
         raise ValueError("group-aware metadata must align with every training response")
-    model_source = str(_trainer_resume_checkpoint or resume_checkpoint or checkpoint)
-    model_revision = None if (_trainer_resume_checkpoint or resume_checkpoint) else revision
+    # Continue Trainer optimizer state from its checkpoint after rebuilding the
+    # same enhanced architecture from the durable parent/base checkpoint.
+    model_source = (str(resume_checkpoint or checkpoint) if enhancements_enabled else
+                    str(_trainer_resume_checkpoint or resume_checkpoint or checkpoint))
+    model_revision = (None if (resume_checkpoint or
+        (_trainer_resume_checkpoint is not None and not enhancements_enabled)) else revision)
     tokenizer = tr.AutoTokenizer.from_pretrained(model_source, revision=model_revision, trust_remote_code=True,
                                                   local_files_only=local_files_only)
     if attention_backend not in {None, "sdpa", "flash_attention_2"}:
@@ -2071,17 +2535,50 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     model_load_kwargs = {"attn_implementation": attention_backend} if attention_backend else {}
     if code_revision is not None:
         model_load_kwargs["code_revision"] = code_revision
-    model = tr.AutoModelForSequenceClassification.from_pretrained(
-        model_source, revision=model_revision, num_labels=len(classes),
-        id2label=dict(enumerate(classes)), label2id=label_map, trust_remote_code=True,
-        local_files_only=local_files_only, dtype=torch.float32, **model_load_kwargs)
-    if code_revision is not None:
-        model = ensure_gte_transformers_compatibility(model)
+    source_manifest_path = Path(model_source) / "checkpoint_manifest.json"
+    source_manifest = json.loads(source_manifest_path.read_text()) if source_manifest_path.is_file() else {}
+    saved_enhancements = source_manifest.get("ultrabert_enhancements")
+    if saved_enhancements is not None and not enhancements_enabled:
+        raise ValueError("continuing an enhanced UltraBERT checkpoint requires its enhancement configuration to remain enabled")
+    if saved_enhancements is not None:
+        saved_contrastive = normalize_supervised_contrastive_config(saved_enhancements.get("supervised_contrastive"))
+        saved_aggregation = normalize_multi_layer_aggregation_config(saved_enhancements.get("multi_layer_aggregation"))
+        if saved_contrastive != contrastive_config or saved_aggregation != aggregation_config:
+            raise ValueError("continued UltraBERT enhancement settings must match the checkpoint manifest")
+        backbone = tr.AutoModel.from_pretrained(model_source, revision=model_revision,
+            trust_remote_code=True, local_files_only=local_files_only, dtype=torch.float32,
+            **model_load_kwargs)
+        model = build_ultrabert_enhanced_classifier(backbone, classes,
+            supervised_contrastive=contrastive_config,
+            multi_layer_aggregation=aggregation_config, state_dir=model_source,
+            selected_layer_indices=saved_enhancements.get("selected_layer_indices"))
+    else:
+        pretrained_classifier = tr.AutoModelForSequenceClassification.from_pretrained(
+            model_source, revision=model_revision, num_labels=len(classes),
+            id2label=dict(enumerate(classes)), label2id=label_map, trust_remote_code=True,
+            local_files_only=local_files_only, dtype=torch.float32, **model_load_kwargs)
+        if code_revision is not None:
+            pretrained_classifier = ensure_gte_transformers_compatibility(pretrained_classifier)
+        if enhancements_enabled:
+            backbone = getattr(pretrained_classifier, "base_model", None)
+            if backbone is None:
+                raise ValueError("enhanced UltraBERT requires a sequence classifier exposing its base_model")
+            model = build_ultrabert_enhanced_classifier(backbone, classes,
+                supervised_contrastive=contrastive_config,
+                multi_layer_aggregation=aggregation_config)
+            pretrained_head = getattr(pretrained_classifier, "classifier", None)
+            if (pretrained_head is not None and
+                    pretrained_head.weight.shape == model.classifier.weight.shape and
+                    pretrained_head.bias.shape == model.classifier.bias.shape):
+                model.classifier.load_state_dict(pretrained_head.state_dict())
+            del pretrained_classifier
+        else:
+            model = pretrained_classifier
     if gradient_checkpointing:
         _set_gradient_checkpointing(model, True)
     train = _TextDataset(train_text, y_indices, tokenizer, max_length,
                          training_views=training_views, training_view_ids=training_view_ids, seed=seed,
-                         include_indices=group_aware_sampling)
+                         include_indices=(group_aware_sampling or contrastive_config["enabled"]))
     if weighted_sampling and sampling_weights is None:
         raise ValueError("weighted_sampling requires sampling_weights for every training row")
     if sampling_weights is not None and len(sampling_weights) != len(train):
@@ -2091,6 +2588,10 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         labels=y_train) if weighted_sampling else None)
     val_indices = ([label_map[label] for label in validation_labels]
                    if validation_labels is not None else None)
+    if validation_dataset_tags is not None and len(validation_dataset_tags) != len(validation_text):
+        raise ValueError("validation_dataset_tags must align with validation rows")
+    if validation_sample_weights is not None and len(validation_sample_weights) != len(validation_text):
+        raise ValueError("validation_sample_weights must align with validation rows")
     val = _TextDataset(validation_text, val_indices, tokenizer, max_length)
     data_collator = tr.DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
     def group_probe_collator(rows):
@@ -2100,7 +2601,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         result["labels"] = torch.stack([row["labels"] for row in rows])
         return result
 
-    train.collate_fn = group_probe_collator if group_aware_sampling else data_collator
+    label_aware_enabled = contrastive_config["enabled"]
+    train.collate_fn = group_probe_collator if (group_aware_sampling or label_aware_enabled) else data_collator
     val.collate_fn = data_collator
     requested_batch_size = int(batch_size)
     requested_inference_batch_size = max(1, int(inference_batch_size or batch_size))
@@ -2125,6 +2627,7 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     effective_batch_size, gradient_accumulation_steps = _resolve_batch_accumulation(
         effective_batch_size, gradient_accumulation_steps, target_effective_batch_size)
     group_batch_sampler = None
+    label_batch_sampler = None
     if group_aware_sampling:
         group_batch_sampler = GroupAwareBatchSampler(
             group_prompt_ids, y_train, ranking_rotation_indices,
@@ -2133,10 +2636,28 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
 
         training_data_collator = _make_group_training_collator(data_collator, group_batch_sampler)
         train.collate_fn = training_data_collator
+    elif label_aware_enabled:
+        label_batch_sampler = LabelAwareBatchSampler(
+            y_train, label_prompt_ids, batch_size=effective_batch_size, seed=seed,
+            initial_epoch=_resume_sampler_epoch(_trainer_resume_checkpoint))
+        def contrastive_collator(rows):
+            clean = [{key: value for key, value in row.items() if key != "row_index"} for row in rows]
+            return data_collator(clean)
+        training_data_collator = contrastive_collator
+        train.collate_fn = training_data_collator
     else:
         training_data_collator = data_collator
     checkpointing_enabled = _gradient_checkpointing_for_batch(
         gradient_checkpointing, effective_batch_size)
+    # Selected-layer hooks must retain differentiable activations from the
+    # original forward. Reentrant activation checkpointing executes those
+    # layers under no_grad and recomputes them later, after the capture window
+    # has closed. Disable it for this architecture variant to preserve the
+    # required gradients through every selected layer.
+    gradient_checkpointing_disabled_for_aggregation = bool(
+        checkpointing_enabled and aggregation_config["enabled"])
+    if gradient_checkpointing_disabled_for_aggregation:
+        checkpointing_enabled = False
     if gradient_checkpointing:
         _set_gradient_checkpointing(model, checkpointing_enabled)
     batch_probe.update({"requested_batch_size": requested_batch_size,
@@ -2147,6 +2668,8 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                         "gradient_accumulation_steps": int(gradient_accumulation_steps),
                         "gradient_checkpointing_enabled": checkpointing_enabled,
                         "gradient_checkpointing_disabled_for_batch_threshold": False,
+                        "gradient_checkpointing_disabled_for_multilayer_aggregation":
+                            gradient_checkpointing_disabled_for_aggregation,
                         "gradient_checkpointing_batch_policy": "configured_for_all_batch_sizes",
                         "padding_strategy": "dynamic", "pad_to_multiple_of": 8})
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -2164,8 +2687,18 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
             raise FloatingPointError("encoder validation produced non-finite logits; stopping before checkpoint selection")
         captured_validation_prediction["logits"] = np.asarray(logits, dtype=np.float32).copy()
         predictions = np.asarray(logits).argmax(axis=1)
-        return {"accuracy": float(accuracy_score(labels, predictions)),
-                "balanced_accuracy": float(balanced_accuracy_score(labels, predictions))}
+        metrics = {"accuracy": float(accuracy_score(labels, predictions)),
+                   "balanced_accuracy": float(balanced_accuracy_score(labels, predictions))}
+        if validation_dataset_tags is not None:
+            tags = _restore_prediction_order(np.asarray(validation_dataset_tags), validation_order)
+            parts = [float(balanced_accuracy_score(labels[tags == name], predictions[tags == name]))
+                     for name in sorted(set(tags.tolist()))]
+            if len(parts) != 2:
+                raise ValueError("equal-dataset checkpoint selection requires exactly two datasets")
+            metrics["balanced_accuracy"] = float(sum(parts) / len(parts))
+            metrics["v0_balanced_accuracy"] = parts[sorted(set(tags.tolist())).index("v0")]
+            metrics["v0_ext_balanced_accuracy"] = parts[sorted(set(tags.tolist())).index("v0_ext")]
+        return metrics
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     training_state_dir = out / "training_state"
@@ -2185,17 +2718,18 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
         eval_oom_fallbacks = 0
 
         def _get_train_sampler(self, train_dataset=None):
-            if group_batch_sampler is not None:
+            if group_batch_sampler is not None or label_batch_sampler is not None:
                 return None
             if weighted_sampler is not None:
                 return weighted_sampler
             return super()._get_train_sampler(train_dataset)
 
         def get_train_dataloader(self):
-            if group_batch_sampler is None:
+            if group_batch_sampler is None and label_batch_sampler is None:
                 return super().get_train_dataloader()
             from torch.utils.data import DataLoader
-            loader = DataLoader(self.train_dataset, batch_sampler=group_batch_sampler,
+            batch_sampler = group_batch_sampler if group_batch_sampler is not None else label_batch_sampler
+            loader = DataLoader(self.train_dataset, batch_sampler=batch_sampler,
                                 collate_fn=self.data_collator, num_workers=0,
                                 pin_memory=bool(self.args.dataloader_pin_memory))
             return self.accelerator.prepare(loader)
@@ -2358,8 +2892,9 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                     self.continuation_checkpoint_path = str(preserved)
             return control
 
-    batches_per_epoch = len(group_batch_sampler) if group_batch_sampler is not None else math.ceil(
-        len(train) / effective_batch_size)
+    batches_per_epoch = (len(group_batch_sampler) if group_batch_sampler is not None else
+                         len(label_batch_sampler) if label_batch_sampler is not None else
+                         math.ceil(len(train) / effective_batch_size))
     encoder_steps_per_epoch = math.ceil(batches_per_epoch / gradient_accumulation_steps)
     live_callback = _live_training_progress_callback(
         TrainerCallback, out, steps_per_epoch=encoder_steps_per_epoch, epochs=epochs,
@@ -2370,14 +2905,15 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     warmup_basis_epochs = min(int(epochs), int(warmup_epochs)) if warmup_epochs is not None else int(epochs)
     encoder_warmup_steps = math.ceil(float(warmup_ratio) * warmup_basis_epochs * encoder_steps_per_epoch)
     args = tr.TrainingArguments(output_dir=str(output_dir), num_train_epochs=epochs,
-        per_device_train_batch_size=effective_batch_size, per_device_eval_batch_size=effective_batch_size,
+        per_device_train_batch_size=effective_batch_size, per_device_eval_batch_size=(
+            max(1, int(validation_batch_size)) if validation_batch_size is not None else effective_batch_size),
         gradient_accumulation_steps=gradient_accumulation_steps, learning_rate=learning_rate,
         optim=optimizer, weight_decay=float(weight_decay), warmup_steps=encoder_warmup_steps,
         lr_scheduler_type=("constant" if learning_rate_decay is not None else (lr_scheduler_type or "linear")),
         seed=seed, data_seed=seed, save_strategy="epoch", save_total_limit=2,
         eval_strategy="epoch" if validation_labels is not None else "no", report_to=[],
         logging_strategy="epoch", fp16=use_fp16, bf16=use_bf16,
-        dataloader_num_workers=0, remove_unused_columns=not group_aware_sampling,
+        dataloader_num_workers=0, remove_unused_columns=not (group_aware_sampling or label_batch_sampler is not None),
         **_length_grouping_args(tr))
 
     trainer_type = OrderedValidationTrainer
@@ -2416,6 +2952,9 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     if group_aware_sampling:
         trainer_type = _group_ranking_trainer(trainer_type, normalized_class_weights,
                                                group_ranking_lambda, group_batch_sampler)
+    elif contrastive_config["enabled"]:
+        trainer_type = _supervised_contrastive_trainer(trainer_type, normalized_class_weights,
+                                                        contrastive_config)
     else:
         trainer_type = _class_weighted_trainer(trainer_type, label_map, normalized_class_weights)
     trainer = trainer_type(model=model, args=args, train_dataset=train,
@@ -2498,12 +3037,22 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
     checkpoint_started = time.perf_counter()
     model.save_pretrained(output_dir, safe_serialization=True)
     tokenizer.save_pretrained(output_dir)
-    if code_revision is not None or normalized_class_weights is not None:
-        (Path(output_dir) / "checkpoint_manifest.json").write_text(json.dumps({
-            "code_revision": code_revision, "model_revision": revision,
-            "trust_remote_code": True,
-            "class_weights": normalized_class_weights,
-        }, indent=2) + "\n")
+    if code_revision is not None or normalized_class_weights is not None or enhancements_enabled:
+        saved_manifest_path = Path(output_dir) / "checkpoint_manifest.json"
+        saved_manifest = json.loads(saved_manifest_path.read_text()) if saved_manifest_path.is_file() else {}
+        saved_manifest.update({"code_revision": code_revision, "model_revision": revision,
+            "trust_remote_code": True, "class_weights": normalized_class_weights,
+            "classes": list(classes),
+            "loss_config": {"training": (
+                "class_weighted_cross_entropy_plus_supervised_contrastive"
+                if contrastive_config["enabled"] and normalized_class_weights else
+                "cross_entropy_plus_supervised_contrastive" if contrastive_config["enabled"] else
+                "class_weighted_cross_entropy" if normalized_class_weights else "cross_entropy"),
+                "validation": "unweighted_cross_entropy",
+                "supervised_contrastive": dict(contrastive_config)}})
+        if enhancements_enabled:
+            saved_manifest["ultrabert_enhancements"] = model.enhancement_metadata()
+        saved_manifest_path.write_text(json.dumps(saved_manifest, indent=2) + "\n")
     checkpoint_save_seconds = time.perf_counter() - checkpoint_started
     probs = softmax(logits, axis=1)
     epoch_history = [dict(entry) for entry in trainer.state.log_history if "eval_accuracy" in entry]
@@ -2584,7 +3133,17 @@ def train_encoder_fold(train_text, y_train, validation_text, classes, *, checkpo
                 "epoch_records": list(group_batch_sampler.epoch_records)}),
             "group_ranking_lambda": group_ranking_lambda,
             "training_loss_components_by_epoch": [dict(item) for item in trainer.state.log_history
-                if "train_classification_loss" in item or "train_group_ranking_loss" in item],
+                if any(key in item for key in ("train_classification_loss", "train_group_ranking_loss",
+                                               "train_supervised_contrastive_loss"))],
+            "ultrabert_enhancements": (model.enhancement_metadata() if enhancements_enabled else {
+                "supervised_contrastive": dict(contrastive_config),
+                "multi_layer_aggregation": dict(aggregation_config),
+                "selected_layer_indices": []}),
+            "supervised_contrastive_sampling": (None if label_batch_sampler is None else {
+                "enabled": True,
+                "policy": "each training row once; same-label pairs with prompt diversity; same-prompt cross-label negatives prioritized",
+                "seed": int(seed), "batch_size": effective_batch_size,
+                "epoch_records": list(label_batch_sampler.epoch_records)}),
             "epoch_checkpoints": list(best_checkpoint_callback.epoch_checkpoints),
             "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None,
             "peak_gpu_memory_reserved_bytes": int(torch.cuda.max_memory_reserved()) if torch.cuda.is_available() else None}

@@ -223,6 +223,10 @@ def _run_variants(eid,roster,base_scores,base_pred,members,probabilities,ids,pro
     summary={};records=[]
     for sid,frame in frames:
         rows=np.asarray([lookup[str(x)] for x in frame.original_id],dtype=np.int64)
+        # The shared E33 evaluator consumes a `truth` field. The v0_group
+        # builder stores the canonical label under `model`.
+        frame=frame.copy()
+        frame["truth"]=frame["model"].astype(str)
         true=pd.Categorical(frame.model.astype(str),categories=LABELS).codes.astype(np.int64)
         base_res,base_records=e33._evaluate_scenario_scores(frame,lookup,base_scores,None,base_pred)
         base_pred_by_method={method:[] for method in METHODS}

@@ -81,6 +81,7 @@ The checklist now covers these observed failures:
 - JSON wrapper rewriting `json.dumps` inside embedded worker source strings; rewrite executable tokens only.
 - Missing Qwen processor metadata, unattached Llama base model, incompatible optional TorchAO, unregistered `smollm3_text_base`, NumPy values passed directly to JSON serialization, and E30's undefined `RUNTIME` notebook variable.
 - Kaggle's maximum of two concurrent GPU sessions, which can reject additional kernel launches.
+- Kaggle's daily competition-submission quota: after E30's three submissions and E33-F E19-D filled the four available slots, a later E33-F E19-F-A submission request returned HTTP 400. When the API reports zero remaining submissions, stop submit attempts, keep validated variants in the persistent queue, and retry after quota reset. Do not rerun inference or kernels to address a quota block.
 - E30 v6 launch was rejected because E28 v10/v11 occupied Kaggle's two-session allowance. Treat this as capacity rejection (not a submitted version); check active/queued kernel statuses and retry only after a slot frees.
 - Repeated status checks across kernel versions triggered Kaggle HTTP 429 rate limiting. Use one status refresh per interval and wait after a 429; do not poll each kernel/version in parallel.
 - Kernel-title/URL-slug mismatch when creating the E31 kernel.

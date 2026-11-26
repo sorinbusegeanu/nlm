@@ -31,6 +31,8 @@ from .feature_factory import load_or_fit, stylometry
 from .model_factory import (FROZEN_BACKBONE_MODELS, calculate_max_token_length,
                             _is_complete_trainer_checkpoint,
                             normalize_class_weights,
+                            normalize_supervised_contrastive_config,
+                            normalize_multi_layer_aggregation_config,
                             train_encoder_fold,
                             train_frozen_backbone_fold, train_qwen_lora_fold,
                             train_catboost_stylometry, train_svc,
@@ -1027,6 +1029,11 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             attention_backend=cfg.get("attention_backend"),
             code_revision=cfg.get("code_revision"),
             class_weights=cfg.get("class_weights"),
+            supervised_contrastive=cfg.get("supervised_contrastive"),
+            multi_layer_aggregation=cfg.get("multi_layer_aggregation"),
+            label_prompt_ids=(train.prompt_id.astype(str).tolist()
+                              if (cfg.get("supervised_contrastive") or {}).get("enabled")
+                              and "prompt_id" in train else None),
             group_aware_sampling=bool(cfg.get("group_aware_sampling", False)),
             group_ranking_lambda=cfg.get("group_ranking_lambda", 0.0),
             group_prompt_ids=(train.prompt_id.astype(str).tolist()
@@ -1683,14 +1690,31 @@ def train_models(dataset="v1", model="svc", data_dir="data/processed", artifact_
         "class_weights": cfg.get("class_weights"),
         "loss_config": {
             "training": ("cross_entropy_plus_group_ranking" if group_aware_sampling_result is not None else
-                         "class_weighted_cross_entropy" if cfg.get("class_weights") else "model_default"),
-            "validation": ("unweighted_cross_entropy" if group_aware_sampling_result is not None else
-                           "model_default_unweighted" if cfg.get("class_weights") else "model_default"),
+                         "class_weighted_cross_entropy_plus_supervised_contrastive"
+                         if (cfg.get("class_weights") and normalize_supervised_contrastive_config(
+                             cfg.get("supervised_contrastive"))["enabled"]) else
+                         "cross_entropy_plus_supervised_contrastive" if normalize_supervised_contrastive_config(
+                             cfg.get("supervised_contrastive"))["enabled"] else
+                         "class_weighted_cross_entropy" if cfg.get("class_weights") else
+                         "cross_entropy" if model == "ultrabert380" and (
+                             normalize_multi_layer_aggregation_config(cfg.get("multi_layer_aggregation"))["enabled"]
+                             or normalize_supervised_contrastive_config(cfg.get("supervised_contrastive"))["enabled"])
+                         else "model_default"),
+            "validation": ("unweighted_cross_entropy" if (group_aware_sampling_result is not None or
+                           normalize_supervised_contrastive_config(cfg.get("supervised_contrastive"))["enabled"]
+                           or cfg.get("class_weights")) else "model_default"),
             **({"classification_loss": "cross_entropy",
                 "group_ranking_loss": {"enabled": True,
                                        "lambda": float(cfg.get("group_ranking_lambda", 0.0))}}
                if group_aware_sampling_result is not None else {}),
+            **({"supervised_contrastive_loss": {
+                    "enabled": True,
+                    "weight": normalize_supervised_contrastive_config(cfg.get("supervised_contrastive"))["weight"],
+                    "temperature": normalize_supervised_contrastive_config(cfg.get("supervised_contrastive"))["temperature"]}}
+               if normalize_supervised_contrastive_config(cfg.get("supervised_contrastive"))["enabled"] else {}),
         },
+        "ultrabert_enhancements": result.get("ultrabert_enhancements"),
+        "supervised_contrastive_sampling": result.get("supervised_contrastive_sampling"),
         "group_aware_sampling": group_aware_sampling_result,
         "group_aware_sampling_artifact": str(group_sampling_path) if group_sampling_path else None,
         "training_loss_components_by_epoch": result.get("training_loss_components_by_epoch", []),
@@ -1882,6 +1906,7 @@ TRAINING_OVERRIDE_FIELDS = (
     "training_lineage",
     "epoch_checkpoint_style",
     "class_weights",
+    "supervised_contrastive", "multi_layer_aggregation",
     "resume_optimizer_state_with_lr_override",
     "group_aware_sampling", "group_ranking_lambda",
 )
@@ -1953,6 +1978,12 @@ def _validate_training_overrides(model, cfg):
         raise ValueError("no_validation runs must disable early_stopping")
     if cfg.get("group_aware_sampling") and cfg.get("weighted_sampling"):
         raise ValueError("group-aware sampling and WeightedRandomSampler cannot be combined")
+    contrastive = normalize_supervised_contrastive_config(cfg.get("supervised_contrastive"))
+    aggregation = normalize_multi_layer_aggregation_config(cfg.get("multi_layer_aggregation"))
+    if model != "ultrabert380" and (contrastive["enabled"] or aggregation["enabled"]):
+        raise ValueError("supervised_contrastive and multi_layer_aggregation are currently supported only for ultrabert380")
+    if contrastive["enabled"] and (cfg.get("group_aware_sampling") or cfg.get("weighted_sampling")):
+        raise ValueError("supervised contrastive learning uses a label-aware sampler and cannot be combined with group_aware_sampling or weighted_sampling")
     if ("resume_optimizer_state_with_lr_override" in cfg and
             not isinstance(cfg["resume_optimizer_state_with_lr_override"], bool)):
         raise ValueError("resume_optimizer_state_with_lr_override must be a boolean")
@@ -2476,6 +2507,11 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         early_stopping_patience=cfg.get("early_stopping_patience", 2),
         checkpoint_selection_metric=config_snapshot["checkpoint_selection_metric"],
         class_weights=config_snapshot.get("class_weights"),
+        supervised_contrastive=config_snapshot.get("supervised_contrastive"),
+        multi_layer_aggregation=config_snapshot.get("multi_layer_aggregation"),
+        label_prompt_ids=(train.prompt_id.astype(str).tolist()
+                          if (config_snapshot.get("supervised_contrastive") or {}).get("enabled")
+                          and "prompt_id" in train else None),
         resume_optimizer_state_with_lr_override=resume_state_with_lr_override,
         save_epoch_checkpoints=config_snapshot["save_epoch_checkpoints"],
         training_views=training_views, training_view_ids=training_view_ids,
@@ -2551,9 +2587,23 @@ def continue_encoder(dataset="v1", model="ultrabert380", data_dir="data/processe
         "training_view_sampling_artifact": str(sampling_path) if sampling_path else None,
         "class_weights": cfg.get("class_weights"),
         "loss_config": {
-            "training": "class_weighted_cross_entropy" if cfg.get("class_weights") else "model_default",
-            "validation": "model_default_unweighted" if cfg.get("class_weights") else "model_default",
+            "training": ("class_weighted_cross_entropy_plus_supervised_contrastive"
+                         if cfg.get("class_weights") and normalize_supervised_contrastive_config(
+                             cfg.get("supervised_contrastive"))["enabled"] else
+                         "cross_entropy_plus_supervised_contrastive"
+                         if normalize_supervised_contrastive_config(cfg.get("supervised_contrastive"))["enabled"]
+                         else "class_weighted_cross_entropy" if cfg.get("class_weights") else "model_default"),
+            "validation": ("unweighted_cross_entropy"
+                           if (cfg.get("class_weights") or normalize_supervised_contrastive_config(
+                               cfg.get("supervised_contrastive"))["enabled"]) else "model_default"),
+            **({"supervised_contrastive_loss": {
+                    "enabled": True,
+                    "weight": normalize_supervised_contrastive_config(cfg.get("supervised_contrastive"))["weight"],
+                    "temperature": normalize_supervised_contrastive_config(cfg.get("supervised_contrastive"))["temperature"]}}
+               if normalize_supervised_contrastive_config(cfg.get("supervised_contrastive"))["enabled"] else {}),
         },
+        "ultrabert_enhancements": result.get("ultrabert_enhancements"),
+        "supervised_contrastive_sampling": result.get("supervised_contrastive_sampling"),
         "weighted_sampling": weighted_sampling,
         "weighted_sampling_artifact": (str(run_dir / "weighted_sampling.json")
                                         if weighted_sampling_enabled else None),

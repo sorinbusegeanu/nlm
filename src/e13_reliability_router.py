@@ -94,17 +94,21 @@ def select_roster(hard, truth, families, ids, limit, exclude_ids=()):
     return retained, retained_steps
 
 
-def reliability_statistics(hard, truth, alpha=SMOOTHING):
+def reliability_statistics(hard, truth, alpha=SMOOTHING, sample_weights=None):
     """Fold-local smoothed precision, recall and directional confusion."""
     hard, truth = np.asarray(hard, dtype=np.int64), np.asarray(truth, dtype=np.int64)
     k = len(LABELS)
     if hard.ndim != 2 or hard.shape[1] != len(truth) or alpha <= 0:
         raise ValueError("Invalid reliability-statistic inputs")
-    support = np.bincount(truth, minlength=k)
+    weights = (np.ones(len(truth), dtype=np.float64) if sample_weights is None
+               else np.asarray(sample_weights, dtype=np.float64))
+    if weights.shape != (len(truth),) or not np.isfinite(weights).all() or np.any(weights <= 0):
+        raise ValueError("Reliability sample weights must be finite positive row weights")
     counts = np.stack([
-        np.bincount(truth * k + row, minlength=k * k).reshape(k, k)
+        np.bincount(truth * k + row, weights=weights, minlength=k * k).reshape(k, k)
         for row in hard
     ])
+    support = np.bincount(truth, weights=weights, minlength=k)
     tp = np.diagonal(counts, axis1=1, axis2=2)
     predicted_support = counts.sum(axis=1)
     precision = (tp + alpha) / (predicted_support + 2 * alpha)
@@ -129,7 +133,7 @@ def family_balanced_probabilities(probabilities, families):
 
 
 def build_feature_frame(probabilities, ids, families, truth_fit, fit_rows, target_rows,
-                        *, alpha=SMOOTHING):
+                        *, alpha=SMOOTHING, fit_sample_weights=None):
     """Build one row per selected-checkpoint/target-example pair."""
     p = np.asarray(probabilities, dtype=np.float64)
     if p.ndim != 3 or p.shape[0] != len(ids) or p.shape[0] != len(families):
@@ -147,7 +151,7 @@ def build_feature_frame(probabilities, ids, families, truth_fit, fit_rows, targe
         raise ValueError("Training labels and fitting rows do not align")
 
     fit_hard = p[:, fit_rows].argmax(axis=2)
-    stats = reliability_statistics(fit_hard, truth_fit, alpha)
+    stats = reliability_statistics(fit_hard, truth_fit, alpha, fit_sample_weights)
     target_prob = p[:, target_rows]
     n_checkpoints, n_rows, k = target_prob.shape
     top = target_prob.argmax(axis=2)
