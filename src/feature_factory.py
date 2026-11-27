@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import unicodedata
 from pathlib import Path
@@ -154,7 +155,128 @@ def _stylometry_record(raw):
     return base, extra
 
 
-def stylometry(texts, recipe=None, *, return_feature_names=False):
+def _load_reference_tokenizers(paths=None):
+    """Load the tokenizer set used by the reference fingerprint recipe."""
+    import tiktoken
+    from transformers import AutoTokenizer
+    cl = tiktoken.get_encoding("cl100k_base")
+    o2 = tiktoken.get_encoding("o200k_base")
+    paths = paths or {}
+    qwen = AutoTokenizer.from_pretrained(paths.get("qwen", "Qwen/Qwen3-Embedding-0.6B"), local_files_only=True)
+    gpt2 = AutoTokenizer.from_pretrained(paths.get("gpt2", "gpt2"), local_files_only=True)
+    return cl, o2, qwen, gpt2
+
+
+def tokenizer_fingerprint(texts, *, tokenizers=None, tokenizer_paths=None):
+    """Reference-compatible four-tokenizer fertility/compression features."""
+    cl, o2, qwen, gpt2 = tokenizers or _load_reference_tokenizers(tokenizer_paths)
+    out = np.zeros((len(texts), 16), dtype=np.float32)
+    for i, raw in enumerate(texts):
+        text = str(raw)
+        words, chars = max(1, len(_WORD_RE.findall(text))), max(1, len(text))
+        n_cl = max(1, len(cl.encode(text, disallowed_special=())))
+        n_o2 = max(1, len(o2.encode(text, disallowed_special=())))
+        n_qw = max(1, len(qwen.encode(text, add_special_tokens=False)))
+        n_gp = max(1, len(gpt2.encode(text, add_special_tokens=False)))
+        out[i] = [n_cl/words, n_o2/words, n_qw/words, n_gp/words,
+                  n_cl/chars, n_o2/chars, n_qw/chars, n_gp/chars,
+                  n_o2/n_cl, n_qw/n_cl, n_qw/n_o2, n_gp/n_cl,
+                  (n_qw-n_o2)/words, (n_cl-n_o2)/words,
+                  (n_gp-n_qw)/words, len(text.encode("utf-8"))/chars]
+    return out
+
+
+class EmpiricalSubwordStats:
+    """Training-corpus-only cl100k unigram/bigram reference statistics."""
+    def __init__(self, state=None, *, alpha=0.5, interpolation=0.72):
+        self.state = state
+        self.alpha = float(alpha)
+        self.interpolation = float(interpolation)
+
+    def fit(self, texts):
+        import tiktoken
+        from collections import Counter, defaultdict
+        enc = tiktoken.get_encoding("cl100k_base")
+        uni, bi = Counter(), defaultdict(Counter)
+        for text in texts:
+            ids = enc.encode(str(text), disallowed_special=())
+            uni.update(ids)
+            for a, b in zip(ids[:-1], ids[1:]):
+                bi[int(a)][int(b)] += 1
+        self.state = {"tokenizer": "cl100k_base", "unigram": dict(uni),
+                      "bigram": {str(a): dict(c) for a, c in bi.items()},
+                      "alpha": self.alpha, "interpolation": self.interpolation}
+        return self
+
+    def transform(self, texts):
+        if self.state is None:
+            raise ValueError("EmpiricalSubwordStats must be fitted on training texts")
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        uni = {int(k): int(v) for k, v in self.state["unigram"].items()}
+        bi = {int(a): {int(k): int(v) for k, v in c.items()}
+              for a, c in self.state["bigram"].items()}
+        total = max(1, sum(uni.values()))
+        ranked = sorted(uni, key=lambda k: (-uni[k], k))
+        rank = {tok: i for i, tok in enumerate(ranked)}
+        vocab = max(1, len(uni)); alpha = float(self.state.get("alpha", .5))
+        lam = float(self.state.get("interpolation", .72))
+        # Cache per-context ranks and entropy once per transform call.
+        context = {}
+        for a, counts in bi.items():
+            den = sum(counts.values())
+            order = sorted(counts, key=lambda k: (-counts[k], k))
+            probs = np.asarray([counts[k] / den for k in counts], dtype=np.float64)
+            context[a] = (den, {tok: i for i, tok in enumerate(order)},
+                          float(-(probs * np.log(np.maximum(probs, 1e-12))).sum()))
+        out = np.zeros((len(texts), 20), dtype=np.float32)
+        for i, text in enumerate(texts):
+            ids = enc.encode(str(text), disallowed_special=())
+            if len(ids) < 3: continue
+            nll, ents, ranks = [], [], []
+            for a, b in zip(ids[:-1], ids[1:]):
+                pu = (uni.get(b, 0) + alpha) / (total + alpha * vocab)
+                ctx = context.get(a)
+                if ctx and ctx[0] >= 3:
+                    den, rr, ent = ctx
+                    pb = bi[a].get(b, 0) / den
+                    p = lam * pb + (1-lam) * pu
+                    rrnk = rr.get(b, len(rr) + rank.get(b, vocab))
+                    ents.append(ent)
+                else:
+                    p, rrnk = pu, rank.get(b, vocab)
+                    ents.append(6.5)
+                nll.append(-math.log(max(p, 1e-9))); ranks.append(rrnk)
+            nll=np.asarray(nll); ents=np.asarray(ents); ranks=np.asarray(ranks); half=max(len(nll)//2,1)
+            ndiff=np.abs(np.diff(nll)) if len(nll)>1 else np.zeros(1)
+            out[i]=[nll.mean(),nll.std(),np.median(nll),np.percentile(nll,10),np.percentile(nll,25),
+                np.percentile(nll,75),np.percentile(nll,90),nll.max(),nll.var()/max(nll.mean(),1e-4),
+                ndiff.mean(),nll[:half].mean()-nll[half:].mean(),ents.mean(),ents.std(),
+                (nll-ents).mean(),np.mean(ranks==0),np.mean(ranks<5),np.mean(ranks<10),
+                np.mean(ranks<100),np.mean(ranks<1000),np.log1p(ranks).mean()]
+        return out
+
+
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as _ENGLISH_STOP_WORDS
+_DISTORT_FUNCTION_WORDS = set(_ENGLISH_STOP_WORDS) | {"however", "therefore", "furthermore", "moreover",
+        "consequently", "nevertheless", "nonetheless", "specifically", "ultimately", "additionally",
+        "meanwhile", "instead", "overall", "essentially", "particularly", "notably", "importantly",
+        "simpler", "thus", "hence", "whereas", "albeit", "Indeed", "Ultimately", "However"}
+
+
+def _distort_text(text):
+    def repl(match):
+        word=match.group(0)
+        if word.lower() in _DISTORT_FUNCTION_WORDS: return word.lower()
+        return f"<{('U' if word[0].isupper() else 'l')}{min(len(word),12)}>"
+    return re.sub(r"[A-Za-z]+(?:'[A-Za-z]+)?", repl, str(text))
+
+
+def _shape_preserve(text):
+    return "".join("X" if c.isupper() else "x" if c.islower() else "d" if c.isdigit() else c for c in str(text))
+
+
+def stylometry(texts, recipe=None, *, return_feature_names=False, feature_state=None):
     """Extract deterministic row-local CatBoost style features for a recipe.
 
     Recipe keys are baseline (one or more of length/case/punctuation/function_words),
@@ -175,6 +297,12 @@ def stylometry(texts, recipe=None, *, return_feature_names=False):
     if len(baseline_groups) != len(set(baseline_groups)) or len(groups) != len(set(groups)):
         raise ValueError("stylometry recipe groups must not be repeated")
     rows, names = [], None
+    extra_matrix = None
+    if "tokenizer_fingerprints" in recipe.get("features", []):
+        extra_matrix = tokenizer_fingerprint(texts, tokenizer_paths=recipe.get("tokenizer_paths"))
+    empirical = None
+    if "empirical_subword" in recipe.get("features", []):
+        empirical = EmpiricalSubwordStats(feature_state).transform(texts)
     for text in texts:
         base, extra = _stylometry_record(text)
         chosen = []
@@ -185,9 +313,14 @@ def stylometry(texts, recipe=None, *, return_feature_names=False):
             elif group == "function_words": chosen.extend(k for k in base if k.startswith("base_fw_"))
         for group in groups:
             chosen.extend(k for k in extra if k.startswith(group + "_"))
+        row = [base[k] if k in base else extra[k] for k in chosen]
+        if extra_matrix is not None:
+            row.extend(extra_matrix[len(rows)].tolist())
+        if empirical is not None:
+            row.extend(empirical[len(rows)].tolist())
         if names is None:
-            names = chosen
-        rows.append([base[k] if k in base else extra[k] for k in chosen])
+            names = chosen + ([f"tokenizer_{i:02d}" for i in range(16)] if extra_matrix is not None else []) + ([f"empirical_subword_{i:02d}" for i in range(20)] if empirical is not None else [])
+        rows.append(row)
     width = len(names or [])
     matrix = np.asarray(rows, dtype=np.float64).reshape(len(rows), width)
     if not np.isfinite(matrix).all():
@@ -208,7 +341,9 @@ def _shape(text: str) -> str:
 
 
 def _config_key(config):
-    payload = json.dumps({"version": FEATURE_VERSION, **config}, sort_keys=True).encode()
+    payload = json.dumps({"version": FEATURE_VERSION, **config}, sort_keys=True,
+                         default=lambda value: (value.__name__ if isinstance(value, type)
+                                                else str(value))).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -219,36 +354,56 @@ class FoldFeatures:
         self.vectorizers = {}
         self.scaler = None
         self.stylometry_feature_names = []
+        self.stylometry_feature_state = None
 
     def fit_transform(self, train_text):
         texts = [str(t) for t in train_text]
         matrices = []
         for view in self.config["views"]:
-            if view == "char":
-                vec = TfidfVectorizer(analyzer="char", ngram_range=(3, 5), min_df=2, sublinear_tf=True)
-                source = texts
-            elif view == "word":
-                vec = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=2, strip_accents="unicode", sublinear_tf=True)
-                source = texts
-            elif view == "punctuation":
-                vec = TfidfVectorizer(analyzer="char", ngram_range=(1, 3), min_df=2, sublinear_tf=True, token_pattern=None)
-                source = [re.sub(r"[\w\s]", " ", t) for t in texts]
-            elif view == "shape":
-                vec = TfidfVectorizer(analyzer="char", ngram_range=(2, 5), min_df=2, sublinear_tf=True)
-                source = [_shape(t) for t in texts]
+            options = dict(self.config.get("view_options", {}).get(view, {}))
+            if view in {"char", "char_wb", "word", "punctuation", "word_punct", "shape", "shape_preserve", "distort"}:
+                defaults = {
+                    "char": dict(analyzer="char", ngram_range=(3,5), min_df=2, sublinear_tf=True),
+                    "char_wb": dict(analyzer="char_wb", ngram_range=(2,5), min_df=5, max_features=55000, sublinear_tf=True, lowercase=False, dtype=np.float32),
+                    "word": dict(analyzer="word", ngram_range=(1,2), min_df=2, strip_accents="unicode", sublinear_tf=True),
+                    "punctuation": dict(analyzer="char", ngram_range=(1,3), min_df=2, sublinear_tf=True, token_pattern=None),
+                    "word_punct": dict(analyzer="word", token_pattern=r"\w+|[^\w\s]", ngram_range=(1,3), min_df=3, max_features=65000, sublinear_tf=True, lowercase=False, dtype=np.float32),
+                    "shape": dict(analyzer="char", ngram_range=(2,5), min_df=2, sublinear_tf=True),
+                    "shape_preserve": dict(analyzer="char", ngram_range=(2,5), min_df=5, max_features=30000, sublinear_tf=True, lowercase=False, dtype=np.float32),
+                    "distort": dict(analyzer="word", token_pattern=r"<[Ul]\d+>|\w+|[^\w\s]", ngram_range=(1,3), min_df=3, max_features=45000, sublinear_tf=True, lowercase=False, dtype=np.float32),
+                }
+                if view in {"char_wb", "word_punct", "shape_preserve", "distort"}:
+                    pass
+                defaults[view].update(options)
+                vec = TfidfVectorizer(**defaults[view])
+                source = ([_shape(t) for t in texts] if view == "shape" else
+                          [_shape_preserve(t) for t in texts] if view == "shape_preserve" else
+                          [_distort_text(t) for t in texts] if view == "distort" else
+                          [re.sub(r"[\w\s]", " ", t) for t in texts] if view == "punctuation" else texts)
             elif view == "stylometry":
                 self.scaler = StandardScaler()
                 matrices.append(csr_matrix(self.scaler.fit_transform(stylometry(texts))))
                 continue
             elif view == "stylometry_raw":
+                recipe = self.config.get("stylometry_recipe") or {}
+                if "empirical_subword" in recipe.get("features", []):
+                    self.stylometry_feature_state = EmpiricalSubwordStats(
+                        alpha=recipe.get("unigram_smoothing_alpha", .5),
+                        interpolation=recipe.get("bigram_interpolation_lambda", .72)
+                    ).fit(texts).state
                 matrix, names = stylometry(texts, self.config.get("stylometry_recipe"),
-                                           return_feature_names=True)
+                                           return_feature_names=True,
+                                           feature_state=self.stylometry_feature_state)
                 self.stylometry_feature_names = names
                 matrices.append(csr_matrix(matrix))
                 continue
             else:
                 raise ValueError(f"unknown feature view: {view}")
-            matrices.append(vec.fit_transform(source))
+            matrix = vec.fit_transform(source)
+            weight = float(self.config.get("view_weights", {}).get(view, 1.0))
+            if not np.isfinite(weight) or weight < 0:
+                raise ValueError(f"view weight for {view} must be finite and non-negative")
+            matrices.append(matrix.multiply(weight).tocsr() if weight != 1.0 else matrix)
             self.vectorizers[view] = vec
         if not matrices:
             raise ValueError("at least one feature view is required")
@@ -262,10 +417,16 @@ class FoldFeatures:
                 matrices.append(csr_matrix(self.scaler.transform(stylometry(texts))))
             elif view == "stylometry_raw":
                 matrices.append(csr_matrix(stylometry(
-                    texts, self.config.get("stylometry_recipe"))))
+                    texts, self.config.get("stylometry_recipe"),
+                    feature_state=self.stylometry_feature_state)))
             else:
-                source = [_shape(t) for t in texts] if view == "shape" else [re.sub(r"[\w\s]", " ", t) for t in texts] if view == "punctuation" else texts
-                matrices.append(self.vectorizers[view].transform(source))
+                source = ([_shape(t) for t in texts] if view == "shape" else
+                          [_shape_preserve(t) for t in texts] if view == "shape_preserve" else
+                          [_distort_text(t) for t in texts] if view == "distort" else
+                          [re.sub(r"[\w\s]", " ", t) for t in texts] if view == "punctuation" else texts)
+                matrix = self.vectorizers[view].transform(source)
+                weight = float(self.config.get("view_weights", {}).get(view, 1.0))
+                matrices.append(matrix.multiply(weight).tocsr() if weight != 1.0 else matrix)
         return hstack(matrices, format="csr")
 
 

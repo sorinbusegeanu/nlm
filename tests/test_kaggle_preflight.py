@@ -58,6 +58,20 @@ def test_local_package_preflight_passes_and_catches_undefined_bootstrap(tmp_path
         validate_kernel_package(root)
 
 
+def test_local_preflight_rejects_title_and_kernel_slug_mismatch(tmp_path):
+    root = _kernel(tmp_path)
+    metadata_path = root / "kernel-metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["title"] = "E42 E13-B Plus E41"
+    metadata["id"] = "zodrak/e42-e13b-plus-e41"
+    write_json(metadata_path, metadata)
+    with pytest.raises(PreflightError, match="kernel title resolves"):
+        validate_kernel_package(root)
+    metadata["id"] = "zodrak/e42-e13-b-plus-e41"
+    write_json(metadata_path, metadata)
+    assert validate_kernel_package(root)["status"] == "PASS"
+
+
 def test_worker_preflight_pins_and_smoke_tests_packaged_inference_import(tmp_path):
     worker = '''import inspect,os,sys
 from pathlib import Path
@@ -323,6 +337,19 @@ def test_explicit_compatibility_allowlist_survives_push_reembedding(tmp_path):
     embed_runtime_preflight(root, manifest_paths=[manifest])
     spec = json.loads((root / "kaggle-preflight.json").read_text())
     assert [x["filename"] for x in spec["sklearn_compatibility_assets"]] == ["grouper.joblib"]
+
+
+def test_runtime_dependency_requirements_survive_push_reembedding(tmp_path):
+    root = _kernel(tmp_path)
+    embed_runtime_preflight(
+        root, strict_versions={"scikit-learn": "1.9.1"},
+        required_distributions=["tiktoken", "catboost"],
+        processor_sources=["owner/model/Transformers/default/1"])
+    embed_runtime_preflight(root)
+    spec = json.loads((root / "kaggle-preflight.json").read_text())
+    assert spec["strict_versions"] == {"scikit-learn": "1.9.1"}
+    assert spec["required_distributions"] == ["tiktoken", "catboost"]
+    assert spec["processor_sources"] == ["owner/model/Transformers/default/1"]
 
 
 def test_submission_wrapper_fetches_exact_version_validates_and_submits(tmp_path, monkeypatch):

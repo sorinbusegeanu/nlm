@@ -59,10 +59,19 @@ def predict_catboost_stylometry(checkpoint, texts, classes, *, temperature=1.0):
         model.load_model(str(checkpoint / "model.cbm"))
         metadata_path = checkpoint / "stylometry.json"
         metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+        state_path = checkpoint / (metadata.get("feature_state_file") or "feature_state.json")
+        feature_state = json.loads(state_path.read_text()) if state_path.is_file() else None
     else:
         model.load_model(str(checkpoint))
         metadata = {}
-    raw = np.asarray(model.predict(stylometry(texts, metadata.get("feature_recipe")), prediction_type="RawFormulaVal"))
+        feature_state = None
+    recipe = metadata.get("feature_recipe")
+    if recipe and recipe.get("tokenizer_paths") and checkpoint.is_dir():
+        recipe = dict(recipe)
+        recipe["tokenizer_paths"] = {k: str((checkpoint / v).resolve()) if not Path(v).is_absolute() else v
+                                     for k, v in recipe["tokenizer_paths"].items()}
+    raw = np.asarray(model.predict(stylometry(texts, recipe,
+        feature_state=feature_state), prediction_type="RawFormulaVal"))
     model_classes = list(model.classes_)
     if raw.ndim == 1:
         raw = np.column_stack([-raw, raw])
@@ -95,6 +104,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     checkpoint_metadata_path = checkpoint / "checkpoint_manifest.json"
     checkpoint_metadata = (json.loads(checkpoint_metadata_path.read_text())
                            if checkpoint_metadata_path.is_file() else {})
+    batch_size = int(checkpoint_metadata.get("effective_inference_batch_size") or batch_size)
     code_revision = code_revision or checkpoint_metadata.get("code_revision")
     quantization = str(quantization or checkpoint_metadata.get("quantization") or "none").lower()
     attention_backend = attention_backend or checkpoint_metadata.get("attention_backend")
@@ -165,7 +175,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
         if model_name == "gte_large":
             from .model_factory import ensure_gte_transformers_compatibility
             network = ensure_gte_transformers_compatibility(network)
-    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen35_08b", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}:
+    elif model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen35_08b", "qwen35_4b", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}:
         backbone_path = checkpoint / "merged_backbone"
         if backbone_path.exists() and quantization != "qlora4":
             network = AutoModel.from_pretrained(backbone_path, local_files_only=True, torch_dtype=model_dtype,
@@ -205,6 +215,10 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                 network = AutoModel.from_pretrained(base_checkpoint, revision=revision, local_files_only=True,
                                                     torch_dtype=model_dtype, trust_remote_code=trust_remote_code,
                                                     **load_kwargs)
+            pruning_spec = checkpoint_metadata.get("layer_pruning")
+            if pruning_spec:
+                from .model_factory import apply_transformer_layer_pruning
+                apply_transformer_layer_pruning(network, pruning_spec)
             network = PeftModel.from_pretrained(network, checkpoint, local_files_only=True)
         state = torch.load(checkpoint / "classifier.pt", map_location="cpu", weights_only=True)
         classifier = torch.nn.Linear(int(state["weight"].shape[1]), len(classes))
@@ -228,6 +242,8 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
     else:
         network.to(device).eval()
     model_loading_seconds = time.perf_counter() - load_started
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     batches=[]; score_batches=[]
     batch_size = max(1, int(batch_size))
     next_batch_size = batch_size
@@ -249,7 +265,7 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                     tokenize=False, add_generation_prompt=False) for text in text_batch]
             try:
                 enc=tokenizer(text_batch,truncation=True,max_length=max_length,padding=True,return_tensors="pt")
-                if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen35_08b", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
+                if model_name in {"qwen06", "qwen06_best_epoch03", "qwen17", "qwen35_08b", "qwen35_4b", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "embeddinggemma2", "gemma4_e2b", "gemma4_e4b", "ministral3_3b", "phi35_mini"}: enc={k:v for k,v in enc.items() if k in {"input_ids","attention_mask"}}
                 enc={k:v.to(device) for k,v in enc.items()}
                 forward_started = time.perf_counter()
                 logits=network(**enc)
@@ -298,6 +314,10 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
                 "model_loading_seconds": model_loading_seconds,
                 "pure_inference_seconds": pure_inference_seconds,
                 "cleanup_seconds": cleanup_seconds,
+                "peak_gpu_memory_bytes": (int(torch.cuda.max_memory_allocated(device))
+                                          if device.type == "cuda" else None),
+                "peak_gpu_memory_reserved_bytes": (int(torch.cuda.max_memory_reserved(device))
+                                                   if device.type == "cuda" else None),
                 "call_total_seconds": time.perf_counter() - call_started,
             }
         return matrix, list(classes), raw_scores
@@ -308,6 +328,10 @@ def _predict_neural(model_name, checkpoint, texts, classes, *, batch_size=8, max
             "model_loading_seconds": model_loading_seconds,
             "pure_inference_seconds": pure_inference_seconds,
             "cleanup_seconds": cleanup_seconds,
+            "peak_gpu_memory_bytes": (int(torch.cuda.max_memory_allocated(device))
+                                      if device.type == "cuda" else None),
+            "peak_gpu_memory_reserved_bytes": (int(torch.cuda.max_memory_reserved(device))
+                                               if device.type == "cuda" else None),
             "call_total_seconds": time.perf_counter() - call_started,
         }
     return matrix, list(classes)

@@ -42,7 +42,7 @@ from .v2_0_chunks800 import main as build_v2_0_chunks800_dataset
 
 MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert380": "configs/models/ultrabert380.yaml",
     "phi35_mini": "configs/models/phi35_mini.yaml",
-    "qwen06": "configs/models/qwen06.yaml", "qwen17": "configs/models/qwen17.yaml", "qwen35_08b": "configs/models/qwen35_08b.yaml", "qwen4": "configs/models/qwen4.yaml",
+    "qwen06": "configs/models/qwen06.yaml", "qwen17": "configs/models/qwen17.yaml", "qwen35_08b": "configs/models/qwen35_08b.yaml", "qwen35_4b": "configs/models/qwen35_4b_qlora.yaml", "qwen4": "configs/models/qwen4.yaml",
     "qwen8": "configs/models/qwen8.yaml",
     "minicpm5_2b": "configs/models/minicpm5_2b.yaml",
     "hunyuan_1_8b": "configs/models/hunyuan_1_8b.yaml",
@@ -67,7 +67,7 @@ MODEL_CONFIGS = {"svc": "configs/models/svc.yaml", "ultrabert380": "configs/mode
 
 WEIGHTED_SAMPLING_MODELS = ({
     "ultrabert380", "modernbert_large", "deberta_v3_large", "electra_large", "gte_large",
-    "mpnet_base", "deberta_gemini", "deberta_glm", "qwen06", "qwen17", "qwen35_08b", "qwen4", "qwen8",
+    "mpnet_base", "deberta_gemini", "deberta_glm", "qwen06", "qwen17", "qwen35_08b", "qwen35_4b", "qwen4", "qwen8",
     "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b",
     "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "phi35_mini",
 } | FROZEN_BACKBONE_MODELS)
@@ -166,7 +166,7 @@ def _ensemble_member_labels(members):
     display_names = {"svc": "SVC", "ultrabert380": "UltraBERT-380M", "qwen06": "Qwen3-0.6B",
         "qwen06_best_epoch03": "Qwen3-0.6B best checkpoint (epoch 3)",
         "phi35_mini": "Phi-3.5 Mini",
-        "qwen17": "Qwen3-1.7B", "qwen35_08b": "Qwen3.5-0.8B", "qwen4": "Qwen3-4B", "qwen8": "Qwen3-8B QLoRA", "llama32_3b": "Llama-3.2-3B", "llama31_8b": "Llama-3.1-8B QLoRA",
+        "qwen17": "Qwen3-1.7B", "qwen35_08b": "Qwen3.5-0.8B", "qwen35_4b": "Qwen3.5-4B Base QLoRA", "qwen4": "Qwen3-4B", "qwen8": "Qwen3-8B QLoRA", "llama32_3b": "Llama-3.2-3B", "llama31_8b": "Llama-3.1-8B QLoRA",
         "minicpm5_2b": "MiniCPM5-2B-Base", "hunyuan_1_8b": "Hunyuan-1.8B-Pretrain",
         "smollm3_3b": "SmolLM3-3B",
         "granite4_h_micro": "Granite 4.0 H Micro Base",
@@ -176,7 +176,7 @@ def _ensemble_member_labels(members):
         "deberta_v3_large": "DeBERTa-v3-large",
         "electra_large": "ELECTRA-large-discriminator",
         "gte_large": "GTE-large-en-v1.5",
-        "mpnet_base": "MPNet-base", "qwen35_08b": "Qwen3.5-0.8B",
+        "mpnet_base": "MPNet-base", "qwen35_08b": "Qwen3.5-0.8B", "qwen35_4b": "Qwen3.5-4B Base QLoRA",
         "deberta_gemini": "DeBERTa-v3-base Gemini specialist",
         "deberta_glm": "DeBERTa-v3-base GLM specialist",
         "embeddinggemma2": "EmbeddingGemma 2", "gemma4_e2b": "Gemma 4 E2B", "gemma4_e4b": "Gemma 4 E4B",
@@ -913,6 +913,21 @@ def _model_cfg(model, config_path=None):
         raise ValueError(f"model config {path} needs positive epochs and batch_size")
     if model not in {"svc", "catboost_stylometry"} and int(cfg.get("inference_batch_size", cfg.get("batch_size", 1))) < 1:
         raise ValueError(f"model config {path} needs positive inference_batch_size")
+    pruning = cfg.get("layer_pruning")
+    if pruning:
+        variant = str(pruning.get("variant", "")).upper()
+        expected = {"qwen35_08b": ("E41-", 24, 16),
+                    "qwen35_4b": ("E42-", 32, 21)}.get(model)
+        if expected is None or cfg.get("training_mode") != "lora":
+            raise ValueError("layer pruning is supported only for configured Qwen3.5 LoRA models")
+        prefix, original_layers, retained_layers = expected
+        if not variant.startswith(prefix) or variant.rsplit("-", 1)[-1] not in {"A", "B", "C"}:
+            raise ValueError(f"{model} layer pruning requires {prefix[:-1]}-A, -B, or -C")
+        if (int(pruning.get("expected_num_layers", 0)) != original_layers
+                or int(pruning.get("expected_retained_layers", 0)) != retained_layers):
+            raise ValueError(f"{model} layer mask must retain {retained_layers} of {original_layers} layers")
+        if not cfg.get("auto_inference_batch_size"):
+            raise ValueError("E41 layer-pruned runs must calibrate inference batch size")
     if cfg.get("auto_batch_size") and (int(cfg.get("max_batch_size", cfg.get("batch_size", 1))) < 1
             or not 0 < float(cfg.get("batch_probe_safety_fraction", 0.95)) <= 1):
         raise ValueError(f"model config {path} needs max_batch_size >= 1 and batch_probe_safety_fraction in (0, 1]")
@@ -1001,6 +1016,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             stop_file=stop_file,
             feature_matrices=(x_train.toarray(), x_valid.toarray(),
                               feature_transform.stylometry_feature_names),
+            feature_state=feature_transform.stylometry_feature_state,
             checkpoint_selection_metric=checkpoint_selection_metric)
         result["cache_key"] = cache_key
         result["checkpoint"] = str(checkpoint)
@@ -1064,7 +1080,7 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             embedding_cache_dir=Path(cache_dir).parent / "frozen_embeddings",
             trust_remote_code=cfg.get("trust_remote_code", False))
         result["checkpoint"] = str(checkpoint)
-    elif model in ({"qwen06", "qwen17", "qwen35_08b", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "phi35_mini"}
+    elif model in ({"qwen06", "qwen17", "qwen35_08b", "qwen35_4b", "qwen4", "qwen8", "minicpm5_2b", "hunyuan_1_8b", "llama32_3b", "llama31_8b", "ministral3_8b", "smollm3_3b", "granite4_h_micro", "granite4_350m", "granite41_3b", "phi35_mini"}
                    | FROZEN_BACKBONE_MODELS):
         checkpoint = Path(output_dir) / "checkpoints" / f"{model}_fold{fold}"
         result = train_qwen_lora_fold(train.text.tolist(), train.model.tolist(),
@@ -1110,6 +1126,10 @@ def _train_fold(model, train, valid, classes, cfg, output_dir, seed, fold, cache
             save_epoch_checkpoints=cfg.get("save_epoch_checkpoints", False),
             class_weights=cfg.get("class_weights"),
             inference_batch_size=cfg.get("inference_batch_size"),
+            layer_pruning=cfg.get("layer_pruning"),
+            auto_inference_batch_size=cfg.get("auto_inference_batch_size", False),
+            max_inference_batch_size=cfg.get("max_inference_batch_size"),
+            inference_batch_probe_safety_fraction=cfg.get("inference_batch_probe_safety_fraction"),
             training_views=training_views, training_view_ids=training_view_ids,
             stop_file=stop_file)
         result["checkpoint"] = str(checkpoint)
@@ -2060,7 +2080,7 @@ def continue_qwen(dataset="v1", data_dir="data/processed", artifact_dir="artifac
                   allow_cross_dataset_source=False):
     """Continue a saved LoRA model and validate after every additional epoch."""
     from .model_factory import train_qwen_lora_fold
-    if model not in {"qwen06", "qwen17", "qwen35_08b", "qwen4", "qwen8", "granite4_350m", "granite4_h_micro", "minicpm5_2b", "hunyuan_1_8b"}:
+    if model not in {"qwen06", "qwen17", "qwen35_08b", "qwen35_4b", "qwen4", "qwen8", "granite4_350m", "granite4_h_micro", "minicpm5_2b", "hunyuan_1_8b"}:
         raise ValueError("LoRA continuation does not support this model")
     train, valid = _training_partitions(dataset, validation_dataset, data_dir)
     training_views = train.training_views.tolist() if "training_views" in train.columns else None
@@ -2951,12 +2971,12 @@ def main(argv=None):
     stop.add_argument("--no-wait",action="store_true",help="write the stop request and return immediately")
     cq=m.add_parser("continue-qwen",help="continue the latest Qwen LoRA checkpoint and validate after every epoch")
     cq.add_argument("--dataset",default="v1");cq.add_argument("--validation-dataset",default="v0");cq.add_argument("--epochs",type=int);cq.add_argument("--seed",type=int,default=2026)
-    cq.add_argument("--model",choices=["qwen06","qwen17","qwen35_08b","qwen4","qwen8","hunyuan_1_8b"],default="qwen06")
+    cq.add_argument("--model",choices=["qwen06","qwen17","qwen35_08b","qwen35_4b","qwen4","qwen8","hunyuan_1_8b"],default="qwen06")
     cq.add_argument("--from-experiment");cq.add_argument("--config");cq.add_argument("--accept-config-defaults",action="store_true")
     cq.add_argument("--refresh-prediction",action="store_true");cq.add_argument("--refresh-checkpoint-catalog",action="store_true")
     cl=m.add_parser("continue-lora",help="continue a saved Qwen, Granite, or MiniCPM LoRA checkpoint")
     cl.add_argument("--dataset",default="v1");cl.add_argument("--validation-dataset",default="v0");cl.add_argument("--epochs",type=int);cl.add_argument("--seed",type=int,default=2026)
-    cl.add_argument("--model",choices=["granite4_350m","granite4_h_micro","minicpm5_2b","qwen06","qwen17","qwen35_08b","qwen4","qwen8","hunyuan_1_8b"],required=True)
+    cl.add_argument("--model",choices=["granite4_350m","granite4_h_micro","minicpm5_2b","qwen06","qwen17","qwen35_08b","qwen35_4b","qwen4","qwen8","hunyuan_1_8b"],required=True)
     cl.add_argument("--allow-cross-dataset-source",action="store_true")
     cl.add_argument("--learning-rate",type=float)
     cl.add_argument("--from-experiment",required=True);cl.add_argument("--config");cl.add_argument("--accept-config-defaults",action="store_true")

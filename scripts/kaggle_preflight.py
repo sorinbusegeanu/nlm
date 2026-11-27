@@ -246,6 +246,14 @@ def validate_kernel_package(kernel_dir: str | Path) -> dict[str, Any]:
         raise PreflightError(f"kernel metadata missing fields: {missing}")
     if metadata["kernel_type"] != "notebook":
         raise PreflightError("only notebook kernels are supported by this preflight")
+    title = metadata.get("title")
+    if title:
+        owner, _, kernel_slug = str(metadata["id"]).partition("/")
+        title_slug = re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", str(title).casefold())).strip("-")
+        if not owner or not kernel_slug or title_slug != kernel_slug:
+            raise PreflightError(
+                f"kernel title resolves to {title_slug!r}, but metadata id is {metadata['id']!r}"
+            )
     code_path = root / metadata["code_file"]
     if not code_path.is_file():
         raise PreflightError(f"metadata code_file does not exist: {metadata['code_file']}")
@@ -601,6 +609,14 @@ def embed_runtime_preflight(
     root = Path(kernel_dir)
     metadata_path = root / "kernel-metadata.json"
     metadata = json.loads(metadata_path.read_text())
+    prior_spec_path = root / "kaggle-preflight.json"
+    prior_spec = json.loads(prior_spec_path.read_text()) if prior_spec_path.is_file() else {}
+    if strict_versions is None:
+        strict_versions = prior_spec.get("strict_versions", {})
+    if required_distributions is None:
+        required_distributions = prior_spec.get("required_distributions", [])
+    if processor_sources is None:
+        processor_sources = prior_spec.get("processor_sources", [])
     code_path = root / metadata["code_file"]
     notebook = nbformat.read(code_path, as_version=4)
     notebook.cells = [c for c in notebook.cells if "kaggle-preflight" not in c.metadata.get("tags", [])]
@@ -624,9 +640,9 @@ def embed_runtime_preflight(
     spec = {
         "dataset_sources": metadata.get("dataset_sources", []),
         "model_sources": metadata.get("model_sources", []),
-        "strict_versions": strict_versions or {},
-        "required_distributions": required_distributions or [],
-        "processor_sources": processor_sources or [],
+        "strict_versions": strict_versions,
+        "required_distributions": required_distributions,
+        "processor_sources": processor_sources,
         "required_dataset_files": required_dataset_files,
         "sklearn_compatibility_assets": compatibility_assets,
         "local_sklearn_artifact_audit": local_sklearn_audit,

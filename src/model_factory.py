@@ -943,6 +943,130 @@ def _largest_safe_batch_size(maximum, fits):
     return successful
 
 
+def _e41_layer_indices(layer_count, variant):
+    """Return deterministic retained indices for one-third E41/E42 layer masks."""
+    layer_count = int(layer_count)
+    if layer_count < 3:
+        raise ValueError("layer pruning requires at least three transformer layers")
+    variant = str(variant).upper()
+    removed_count = max(1, int(round(layer_count / 3)))
+    suffix = variant.rsplit("-", 1)[-1]
+    if not variant.startswith(("E41-", "E42-")) or suffix not in {"A", "B", "C"}:
+        raise ValueError(f"unknown layer-removal variant: {variant}")
+    if suffix == "A":
+        removed = set(range(layer_count - removed_count, layer_count))
+    elif suffix == "B":
+        start = (layer_count - removed_count) // 2
+        removed = set(range(start, start + removed_count))
+    elif suffix == "C":
+        # Even spacing starts at the third layer for a 24-layer backbone, and
+        # includes the last layer when 24 layers are present.
+        removed = {max(0, min(layer_count - 1,
+                              int(round((i + 1) * layer_count / removed_count)) - 1))
+                   for i in range(removed_count)}
+        while len(removed) < removed_count:
+            for index in range(1, layer_count - 1):
+                if index not in removed:
+                    removed.add(index)
+                    if len(removed) == removed_count:
+                        break
+    return tuple(i for i in range(layer_count) if i not in removed)
+
+
+def apply_transformer_layer_pruning(backbone, pruning_spec):
+    """Remove configured transformer blocks and update hybrid layer metadata.
+
+    The returned metadata is saved with LoRA checkpoints and can be passed back
+    here before loading the adapter for inference. Qwen3.5's per-layer
+    ``layer_types`` and cache indices are updated alongside its ModuleList.
+    """
+    if not pruning_spec:
+        return None
+    import copy
+    import torch
+
+    spec = dict(pruning_spec)
+    variant = str(spec.get("variant", "")).upper()
+    if not variant:
+        raise ValueError("layer_pruning requires a variant such as E41-A")
+    layers = None
+    owner = None
+    for candidate in (getattr(backbone, "language_model", None),
+                      getattr(backbone, "model", None), backbone):
+        candidate_layers = getattr(candidate, "layers", None)
+        if isinstance(candidate_layers, (torch.nn.ModuleList, list, tuple)):
+            layers, owner = candidate_layers, candidate
+            break
+    if layers is None:
+        raise ValueError(f"{backbone.__class__.__name__} exposes no supported transformer layers list")
+    original_count = len(layers)
+    if "expected_num_layers" in spec and int(spec["expected_num_layers"]) != original_count:
+        raise ValueError(f"{variant} expected {spec['expected_num_layers']} original layers, found {original_count}")
+    config = getattr(owner, "config", None) or getattr(backbone, "config", None)
+    if config is None:
+        raise ValueError("layer pruning requires a model config")
+    if hasattr(config, "num_hidden_layers") and int(config.num_hidden_layers) != original_count:
+        raise ValueError(f"model config declares {config.num_hidden_layers} layers, found {original_count}")
+    config_layer_types = getattr(config, "layer_types", None)
+    if config_layer_types is not None and len(config_layer_types) != original_count:
+        raise ValueError("hybrid layer_types length does not match the transformer layer count")
+    if "retained_layer_indices" in spec:
+        retained = tuple(map(int, spec["retained_layer_indices"]))
+        if (not retained or tuple(sorted(set(retained))) != retained
+                or retained[0] < 0 or retained[-1] >= original_count):
+            raise ValueError("saved retained_layer_indices are invalid for the loaded backbone")
+        expected_from_variant = _e41_layer_indices(original_count, variant)
+        if retained != expected_from_variant:
+            raise ValueError(f"saved layer indices do not match deterministic {variant} mask")
+    else:
+        retained = _e41_layer_indices(original_count, variant)
+    if int(spec.get("expected_retained_layers", len(retained))) != len(retained):
+        raise ValueError("retained layer count differs from the configured expectation")
+
+    old_types = list(config_layer_types) if config_layer_types is not None else None
+    new_types = [old_types[i] for i in retained] if old_types is not None else None
+    pruned_layers = [layers[i] for i in retained]
+    owner.layers = torch.nn.ModuleList(pruned_layers) if isinstance(layers, torch.nn.ModuleList) else pruned_layers
+    configs = [config]
+    outer_config = getattr(backbone, "config", None)
+    text_config = getattr(outer_config, "text_config", None)
+    if text_config is not None and text_config is not config:
+        configs.append(text_config)
+    for cfg in configs:
+        if hasattr(cfg, "num_hidden_layers"):
+            cfg.num_hidden_layers = len(retained)
+        if new_types is not None and hasattr(cfg, "layer_types"):
+            cfg.layer_types = list(new_types)
+        if hasattr(cfg, "use_cache"):
+            cfg.use_cache = False
+    for new_index, layer in enumerate(pruned_layers):
+        if new_types is not None and hasattr(layer, "block_type"):
+            layer.block_type = new_types[new_index]
+        for module_name in ("self_attn", "linear_attn"):
+            module = getattr(layer, module_name, None)
+            if module is not None and hasattr(module, "layer_idx"):
+                module.layer_idx = new_index
+            if module_name == "linear_attn" and module is not None and new_types is not None:
+                if hasattr(module, "layer_type"):
+                    module.layer_type = new_types[new_index]
+    if hasattr(backbone, "config") and hasattr(backbone.config, "use_cache"):
+        backbone.config.use_cache = False
+    architecture = {
+        "model_type": getattr(config, "model_type", None),
+        "original_num_hidden_layers": original_count,
+        "num_hidden_layers": len(retained),
+        "retained_layer_indices": list(retained),
+        "removed_layer_indices": [i for i in range(original_count) if i not in retained],
+        "original_layer_types": old_types,
+        "layer_types": new_types,
+        "hidden_size": getattr(config, "hidden_size", None),
+        "use_cache": False,
+    }
+    return {"variant": variant, "strategy": "remove_approximately_one_third",
+            "expected_num_layers": original_count, "expected_retained_layers": len(retained),
+            **architecture, "modified_architecture_config": copy.deepcopy(architecture)}
+
+
 def _batch_probe_memory_limit(base_reserved_bytes, free_bytes, usable_fraction,
                               explicit_reserve_bytes=0):
     """Return a memory ceiling while retaining the configured fraction of free VRAM."""
@@ -1582,6 +1706,7 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
                               thread_count=8, seed=2026,
                               validation_labels=None, early_stopping_rounds=100,
                               feature_recipe=None, feature_matrices=None, init_model=None,
+                              feature_state=None,
                               checkpoint_metadata=None, checkpoint_selection_metric="balanced_accuracy",
                               stop_file=None, validation_sample_weights=None):
     """Fit CatBoost on deterministic row-local style statistics; no validation fitting."""
@@ -1595,8 +1720,9 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
     feature_recipe = {"baseline": list(DEFAULT_STYLOMETRY_RECIPE["baseline"]),
                       "groups": [], **(feature_recipe or {})}
     if feature_matrices is None:
-        x_train, feature_names = stylometry(train_text, feature_recipe, return_feature_names=True)
-        x_validation = stylometry(validation_text, feature_recipe)
+        x_train, feature_names = stylometry(train_text, feature_recipe, return_feature_names=True,
+                                            feature_state=feature_state)
+        x_validation = stylometry(validation_text, feature_recipe, feature_state=feature_state)
     else:
         x_train, x_validation, feature_names = feature_matrices
         x_train = np.asarray(x_train, dtype=np.float64)
@@ -1682,6 +1808,7 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
         "feature_version": STYLOMETRY_VERSION,
         "feature_names": feature_names,
         "feature_recipe": feature_recipe,
+        "feature_state_file": "feature_state.json" if feature_state is not None else None,
         "feature_count": int(x_train.shape[1]),
         "validation_loss_raw": validation_loss,
         "selected_iteration": best_iteration,
@@ -1693,6 +1820,8 @@ def train_catboost_stylometry(train_text, y_train, validation_text, classes, *, 
             "thread_count": int(thread_count), "seed": int(seed),
             "feature_recipe": feature_recipe}
     }
+    if feature_state is not None:
+        (output_dir / "feature_state.json").write_text(json.dumps(feature_state, separators=(",", ":")) + "\n")
     metadata.update({"tree_count": int(model.tree_count_),
                      "added_iterations": int(iterations),
                      "parent_checkpoint": str(init_model) if init_model is not None else None})
@@ -3483,6 +3612,100 @@ def _probe_lora_batch_size(model, dataset, *, requested_batch_size, max_batch_si
     return int(selected), report
 
 
+def _probe_max_inference_batch_size(model, dataset, *, requested_batch_size, max_batch_size,
+                                    safety_fraction=0.95, use_bf16=False, use_fp16=False):
+    """Find the largest safe forward-only batch using longest validation rows."""
+    torch, _ = _require_neural()
+    requested = max(1, int(requested_batch_size))
+    maximum = max(1, min(int(max_batch_size or requested), len(dataset)))
+    report = {"enabled": True, "maximum_candidate_batch_size": maximum, "attempts": []}
+    if not torch.cuda.is_available():
+        report.update({"status": "gpu_unavailable", "selected_batch_size": requested})
+        return requested, report
+    device = torch.device("cuda", torch.cuda.current_device())
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    base_reserved = int(torch.cuda.memory_reserved(device))
+    max_allowed, reserve_bytes = _batch_probe_memory_limit(base_reserved, free_bytes, safety_fraction)
+    report.update({"status": "probing", "device": str(device),
+                   "free_memory_bytes_before_probe": int(free_bytes),
+                   "total_memory_bytes": int(total_bytes),
+                   "usable_free_vram_fraction": float(safety_fraction),
+                   "memory_reserve_bytes": int(reserve_bytes),
+                   "memory_limit_reserved_bytes": int(max_allowed),
+                   "baseline_reserved_bytes": int(base_reserved)})
+    lengths = getattr(dataset, "lengths", None)
+    order = (sorted(range(len(dataset)), key=lambda idx: lengths[idx], reverse=True)
+             if lengths is not None else list(range(len(dataset))))
+    collate_fn = getattr(dataset, "collate_fn", None)
+    attempts = report["attempts"]
+    if not getattr(model, "_qlora_quantized", False):
+        model.to(device)
+    was_training = bool(model.training)
+    model.eval()
+
+    def attempt(size):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        batch = None
+        started = time.perf_counter()
+        try:
+            examples = [dataset[i] for i in order[:size]]
+            if collate_fn is None:
+                batch = {key: torch.stack([row[key] for row in examples]).to(device)
+                         for key in examples[0] if key != "labels"}
+            else:
+                batch = {key: value.to(device) for key, value in collate_fn(examples).items()
+                         if key != "labels"}
+            actual_tokens = int(batch["attention_mask"].sum().item())
+            padded_tokens = int(batch["input_ids"].numel())
+            amp = (torch.autocast(device_type="cuda",
+                    dtype=torch.bfloat16 if use_bf16 else torch.float16,
+                    enabled=bool(use_bf16 or use_fp16)))
+            with torch.inference_mode(), amp:
+                result = model(**batch)
+            logits = result.logits if hasattr(result, "logits") else result
+            if not bool(torch.isfinite(logits).all().item()):
+                raise FloatingPointError("inference batch probe produced non-finite logits")
+            torch.cuda.synchronize(device)
+            peak_allocated = int(torch.cuda.max_memory_allocated(device))
+            peak_reserved = int(torch.cuda.max_memory_reserved(device))
+            fits = peak_reserved <= max_allowed
+            attempts.append({"batch_size": int(size), "fits": bool(fits),
+                "peak_allocated_bytes": peak_allocated, "peak_reserved_bytes": peak_reserved,
+                "padded_tokens": padded_tokens, "tokens": actual_tokens,
+                "duration_seconds": float(time.perf_counter() - started),
+                "reason": None if fits else "memory_reserve"})
+            return fits
+        except RuntimeError as exc:
+            if not _is_oom_error(exc):
+                raise
+            if size <= 1:
+                raise RuntimeError("inference batch size one exhausted CUDA memory") from exc
+            attempts.append({"batch_size": int(size), "fits": False,
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+                "reason": "cuda_oom"})
+            return False
+        finally:
+            del batch
+            torch.cuda.empty_cache()
+
+    try:
+        selected = _largest_safe_batch_size(maximum, attempt)
+        report.update({"status": "selected", "selection_policy": "largest_verified_safe_batch",
+                       "selected_batch_size": int(selected), "max_safe_batch_size": int(selected),
+                       "selected_peak_allocated_bytes": max(
+                           (item.get("peak_allocated_bytes", 0) or 0 for item in attempts
+                            if item.get("batch_size") == selected and item.get("fits")), default=0),
+                       "selected_peak_reserved_bytes": max(
+                           (item.get("peak_reserved_bytes", 0) or 0 for item in attempts
+                            if item.get("batch_size") == selected and item.get("fits")), default=0)})
+        return int(selected), report
+    finally:
+        model.train(was_training)
+        torch.cuda.empty_cache()
+
+
 def load_text_only_backbone(transformers_module, checkpoint, revision, *, torch_dtype,
                             local_files_only=True, trust_remote_code=False, **model_kwargs):
     """Load a multimodal checkpoint and retain its text tower only."""
@@ -3541,6 +3764,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                          weighted_sampling=False, sampling_weights=None, class_weights=None,
                          sampling_components=None,
                          training_lineage=None, epoch_checkpoint_style="hyphen",
+                         layer_pruning=None, auto_inference_batch_size=False,
+                         max_inference_batch_size=None, inference_batch_probe_safety_fraction=None,
                          _oom_recovery_context=None, _trainer_resume_checkpoint=None):
     """LoRA fine-tune causal hidden states with masked-mean classifier readout."""
     _force_huggingface_offline()
@@ -3619,6 +3844,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         backbone = tr.AutoModel.from_pretrained(checkpoint, revision=revision, torch_dtype=model_dtype,
                                                  local_files_only=local_files_only,
                                                  trust_remote_code=trust_remote_code, **load_kwargs)
+    layer_pruning_metadata = apply_transformer_layer_pruning(backbone, layer_pruning)
     if quantization == "qlora4":
         try:
             from peft import prepare_model_for_kbit_training
@@ -3749,6 +3975,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "lora_rank": int(lora_rank), "lora_alpha": int(lora_alpha),
         "lora_target_modules": list(lora_target_modules),
         "gradient_checkpointing": bool(gradient_checkpointing),
+        "layer_pruning": layer_pruning_metadata,
         "class_weights": normalized_class_weights,
         "training_view_sampling_policy": ("uniform one-view-per-original-response per epoch"
                                            if training_views is not None else None),
@@ -3924,11 +4151,14 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         def __len__(self): return len(self.order)
     data_collator=tr.DataCollatorWithPadding(tokenizer=tokenizer,pad_to_multiple_of=8)
     train_dataset.collate_fn=data_collator
+    validation_dataset_rows.collate_fn=data_collator
     use_bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     use_fp16=torch.cuda.is_available() and not use_bf16
     effective_batch_size=int(batch_size)
     requested_inference_batch_size=max(1,int(inference_batch_size or batch_size))
+    effective_inference_batch_size=requested_inference_batch_size
     batch_probe={"enabled": False, "selected_batch_size": effective_batch_size}
+    inference_batch_probe={"enabled": False, "selected_batch_size": effective_inference_batch_size}
     if auto_batch_size:
         if training_views is not None:
             train_dataset.set_probe_views()
@@ -3943,6 +4173,21 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         recovery_context["phase"] = "initialization"
         if training_views is not None:
             train_dataset.set_epoch(0, force=True)
+    if auto_inference_batch_size:
+        if validation_labels is None:
+            raise ValueError("auto_inference_batch_size requires a validation dataset")
+        recovery_context["phase"] = "inference_batch_probe"
+        effective_inference_batch_size, inference_batch_probe = _probe_max_inference_batch_size(
+            model, validation_dataset_rows, requested_batch_size=requested_inference_batch_size,
+            max_batch_size=max_inference_batch_size or requested_inference_batch_size,
+            safety_fraction=(inference_batch_probe_safety_fraction
+                             if inference_batch_probe_safety_fraction is not None
+                             else batch_probe_safety_fraction),
+            use_bf16=use_bf16, use_fp16=use_fp16)
+        recovery_context["phase"] = "initialization"
+    inference_batch_probe.update({"requested_batch_size": int(requested_inference_batch_size),
+        "effective_inference_batch_size": int(effective_inference_batch_size),
+        "auto_inference_batch_size": bool(auto_inference_batch_size)})
     effective_batch_size, gradient_accumulation_steps = _resolve_batch_accumulation(
         effective_batch_size, gradient_accumulation_steps, target_effective_batch_size)
     checkpointing_probe_batch_size = int(effective_batch_size)
@@ -3957,9 +4202,21 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                         "gradient_checkpointing_probe_mode":bool(checkpointing_requested),
                         "gradient_checkpointing_disabled_for_batch_threshold":checkpointing_disabled_for_batch,
                         "checkpointing_probe_batch_size":checkpointing_probe_batch_size,
+                        "inference_batch_size_probe": inference_batch_probe,
+                        "requested_inference_batch_size": int(requested_inference_batch_size),
+                        "effective_inference_batch_size": int(effective_inference_batch_size),
                         "padding_strategy":"dynamic",
                         "pad_to_multiple_of":8})
     (out/"batch_size_probe.json").write_text(json.dumps(batch_probe,indent=2)+"\n")
+    (out/"inference_batch_size_probe.json").write_text(json.dumps(inference_batch_probe,indent=2)+"\n")
+    checkpoint_metadata.update({"requested_inference_batch_size": int(requested_inference_batch_size),
+        "effective_inference_batch_size": int(effective_inference_batch_size),
+        "auto_inference_batch_size": bool(auto_inference_batch_size),
+        "max_inference_batch_size": int(max_inference_batch_size or requested_inference_batch_size),
+        "inference_batch_size_probe": inference_batch_probe})
+    if layer_pruning_metadata is not None:
+        (out / "pruned_architecture_config.json").write_text(
+            json.dumps(layer_pruning_metadata["modified_architecture_config"], indent=2) + "\n")
     print(f"LoRA batch-size selection: {json.dumps(batch_probe,sort_keys=True)}",flush=True)
     steps_per_epoch=_optimizer_steps_per_epoch(
         len(train_dataset),effective_batch_size,gradient_accumulation_steps)
@@ -3973,7 +4230,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     warmup_basis_epochs=min(int(epochs),int(warmup_epochs)) if warmup_epochs is not None else int(epochs)
     warmup_steps=math.ceil(float(warmup_ratio)*steps_per_epoch*warmup_basis_epochs)
     args=tr.TrainingArguments(output_dir=str(output_dir),num_train_epochs=epochs,
-        per_device_train_batch_size=effective_batch_size,per_device_eval_batch_size=requested_inference_batch_size,
+        per_device_train_batch_size=effective_batch_size,per_device_eval_batch_size=effective_inference_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,learning_rate=learning_rate,
         lr_scheduler_type="constant" if scheduler == "epoch_decay" else scheduler,
         warmup_steps=warmup_steps, optim=optimizer, weight_decay=float(weight_decay),
@@ -4009,6 +4266,9 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
                 torch.save(self.args, output / "training_args.bin")
                 (output / "checkpoint_manifest.json").write_text(
                     json.dumps(checkpoint_metadata, indent=2) + "\n")
+                if layer_pruning_metadata is not None:
+                    (output / "pruned_architecture_config.json").write_text(
+                        json.dumps(layer_pruning_metadata["modified_architecture_config"], indent=2) + "\n")
 
         def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
             model = model or self.model
@@ -4176,7 +4436,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     inference_stats=[]
     def predict_cached(dataset):
         scores, stats = _predict_cached_dataset(model, dataset,
-            batch_size=requested_inference_batch_size, data_collator=data_collator,
+            batch_size=effective_inference_batch_size, data_collator=data_collator,
             device=prediction_device, amp_dtype=amp_dtype, return_info=True)
         inference_stats.append(stats)
         return scores, stats
@@ -4220,7 +4480,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
     trainable=sum(p.numel() for p in model.parameters() if p.requires_grad)
     effective_post_inference_batch_size = min(
         (item["effective_inference_batch_size"] for item in inference_stats),
-        default=requested_inference_batch_size)
+        default=effective_inference_batch_size)
     return {"scores":logits,"probabilities":probs,"model":model,"tokenizer":tokenizer,
         "fit_seconds":time.perf_counter()-start,"inference_seconds":inference_seconds,
         "classes":list(classes),"trainable_parameters":trainable,
@@ -4258,6 +4518,7 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
             "best_checkpoint_restoration_seconds":float(best_checkpoint_restoration_seconds),
             "final_validation_inference_seconds":float(inference_seconds),
             "final_validation_rows_per_second":(final_inference_stats or {}).get("inference_rows_per_second"),
+            "requested_inference_batch_size": requested_inference_batch_size,
             "effective_inference_batch_size":effective_post_inference_batch_size,
             "inference_oom_fallbacks":sum(x.get("inference_oom_fallbacks",0) for x in inference_stats),
             "checkpoint_serialization_seconds":float(checkpoint_save_seconds+snapshot_callback.save_seconds),
@@ -4270,6 +4531,8 @@ def train_qwen_lora_fold(train_text, y_train, validation_text, classes, *, check
         "effective_optimizer_batch_size":effective_batch_size*int(gradient_accumulation_steps),
         "gradient_accumulation_steps":int(gradient_accumulation_steps),
         "requested_inference_batch_size":requested_inference_batch_size,
+        "effective_inference_batch_size":effective_post_inference_batch_size,
+        "inference_batch_size_probe":inference_batch_probe,
         "lr_scheduler_type":scheduler,"warmup_ratio":float(warmup_ratio),
         "batch_size_probe":batch_probe,
         "quantization":quantization,"quantization_config":quantization_config,
